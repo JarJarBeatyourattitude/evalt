@@ -83,6 +83,26 @@ class PartlyUnavailableTransport(FakeTransport):
         )
 
 
+class PolicyTransport(FakeTransport):
+    def __init__(self):
+        super().__init__()
+        self.performance_policies = []
+
+    def set_performance_policy(self, *, preferred_max_latency_seconds=None, provider_sort="price"):
+        self.performance_policies.append((preferred_max_latency_seconds, provider_sort))
+
+
+class SlowTransport(FakeTransport):
+    def complete(self, model, messages, *, max_tokens, response_schema=None):
+        result = super().complete(
+            model, messages, max_tokens=max_tokens, response_schema=response_schema
+        )
+        return Completion(
+            result.content, result.model, result.generation_id, result.cost_usd,
+            result.prompt_tokens, result.completion_tokens, 5_000,
+        )
+
+
 class FewShotTransport(FakeTransport):
     def complete(self, model, messages, *, max_tokens, response_schema=None):
         if response_schema and "Improve the current prompt" in messages[0]["content"]:
@@ -459,6 +479,46 @@ class SdkTests(unittest.TestCase):
             self.assertEqual(support_status["feedback_count"], 1)
             self.assertEqual(incident_status["feedback_count"], 1)
             self.assertNotEqual(support.prompt_version, incident.prompt_version)
+
+    def test_durable_route_persists_latency_policy_and_applies_provider_preference(self):
+        with TemporaryDirectory() as directory:
+            transport = PolicyTransport()
+            evalt = Evalt(transport=transport, state_path=Path(directory) / "evalt.db")
+            evalt.run(
+                "Return one label.", "hello", route="speed-sensitive",
+                price_usd=0.01, models=["cheap"], auto_maintain=False,
+                max_p90_latency_seconds=2.5,
+                latency_value_usd_per_second=0.0002,
+            )
+            status = evalt.route_status("speed-sensitive")
+            self.assertEqual(status["max_p90_latency_seconds"], 2.5)
+            self.assertEqual(status["latency_value_usd_per_second"], 0.0002)
+            self.assertEqual(transport.performance_policies[-1], (2.5, "latency"))
+            policy_events = [
+                item for item in status["decisions"]
+                if item["event_type"] == "routing_policy_configured"
+            ]
+            self.assertEqual(policy_events[-1]["detail"]["max_p90_latency_seconds"], 2.5)
+
+    def test_durable_maintenance_never_promotes_a_route_that_misses_latency_ceiling(self):
+        with TemporaryDirectory() as directory:
+            evalt = Evalt(transport=SlowTransport(), state_path=Path(directory) / "evalt.db")
+            cases = [("charged twice", "billing"), ("reset expired", "account"), ("app freezes", "technical"), ("charged again", "billing"), ("reset broken", "account")]
+            for input_text, approved in cases:
+                answer = evalt.run(
+                    "Write a helpful classification for this message.", input_text,
+                    route="latency-gated", price_usd=0.01, models=["cheap"],
+                    incumbent_model="cheap", min_feedback=5,
+                    max_p90_latency_seconds=1,
+                )
+                answer.correct(approved)
+            plan = select_role_plan([], maintenance_budget_usd=1, fallback_targets=["cheap"], fallback_designer="optimizer", fallback_judge="evaluator")
+            result = evalt.maintain("latency-gated", test_budget_usd=1, role_plan=plan, min_feedback=5)
+            self.assertIsNotNone(result)
+            self.assertFalse(result.winner.passed_latency_ceiling)
+            status = evalt.route_status("latency-gated")
+            self.assertNotEqual(status["decision_reason"], "qualified_cheapest_passing")
+            self.assertIn("maintenance_no_promotion", [item["event_type"] for item in status["decisions"]])
 
     def test_router_rejects_a_call_before_provider_use_when_request_cap_is_too_low(self):
         with TemporaryDirectory() as directory:

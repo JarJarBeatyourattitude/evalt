@@ -317,6 +317,8 @@ class DurableRouter:
                 ("test_budget_usd", "REAL NOT NULL DEFAULT 0"),
                 ("objective", "TEXT NOT NULL DEFAULT 'best_within_price'"),
                 ("test_budget_policy", "TEXT NOT NULL DEFAULT 'legacy'"),
+                ("max_p90_latency_seconds", "REAL DEFAULT NULL"),
+                ("latency_value_usd_per_second", "REAL NOT NULL DEFAULT 0"),
             ):
                 if name not in columns:
                     db.execute(f"ALTER TABLE routes ADD COLUMN {name} {declaration}")
@@ -393,6 +395,8 @@ class DurableRouter:
         objective: str = "best_within_price",
         test_budget_usd: float = 0.0,
         test_budget_policy: str = "explicit",
+        max_p90_latency_seconds: float | None = None,
+        latency_value_usd_per_second: float = 0.0,
         retest_after_calls: int = 500,
         min_feedback: int = 5,
         catalog_revision: str = "explicit-model-list",
@@ -401,6 +405,10 @@ class DurableRouter:
             raise ValueError("price_usd must be greater than 0 and no more than 10.")
         if objective not in {"match_baseline_at_lowest_cost", "best_within_price", "best_within_cost", "lowest_cost_at_accuracy", "cheapest_at_accuracy", "cheapest_passing", "constrained", "highest_quality"}:
             raise ValueError("objective is not a supported cost/accuracy policy.")
+        if max_p90_latency_seconds is not None and max_p90_latency_seconds <= 0:
+            raise ValueError("max_p90_latency_seconds must be positive when provided.")
+        if latency_value_usd_per_second < 0:
+            raise ValueError("latency_value_usd_per_second cannot be negative.")
         row = self._ensure_route(
             route=route,
             prompt=prompt,
@@ -410,10 +418,19 @@ class DurableRouter:
         )
         with self._db() as db:
             current = db.execute("SELECT * FROM routes WHERE route=?", (route,)).fetchone()
-            controls = (float(max_cost_per_run_usd), float(test_budget_usd), objective, test_budget_policy)
-            previous = (current["max_cost_per_run_usd"], current["test_budget_usd"], current["objective"], current["test_budget_policy"])
+            controls = (
+                float(max_cost_per_run_usd), float(test_budget_usd), objective,
+                test_budget_policy, max_p90_latency_seconds,
+                float(latency_value_usd_per_second),
+            )
+            previous = (
+                current["max_cost_per_run_usd"], current["test_budget_usd"],
+                current["objective"], current["test_budget_policy"],
+                current["max_p90_latency_seconds"],
+                current["latency_value_usd_per_second"],
+            )
             db.execute(
-                "UPDATE routes SET quality_threshold=?,max_cost_per_run_usd=?,test_budget_usd=?,objective=?,test_budget_policy=?,updated_at=? WHERE route=?",
+                "UPDATE routes SET quality_threshold=?,max_cost_per_run_usd=?,test_budget_usd=?,objective=?,test_budget_policy=?,max_p90_latency_seconds=?,latency_value_usd_per_second=?,updated_at=? WHERE route=?",
                 (float(target_accuracy), *controls, _now(), route),
             )
             if previous != controls:
@@ -423,8 +440,16 @@ class DurableRouter:
                     "test_budget_policy": test_budget_policy,
                     "target_accuracy": target_accuracy,
                     "objective": objective,
+                    "max_p90_latency_seconds": max_p90_latency_seconds,
+                    "latency_value_usd_per_second": latency_value_usd_per_second,
                 })
             row = db.execute("SELECT * FROM routes WHERE route=?", (route,)).fetchone()
+        set_performance_policy = getattr(self.client.transport, "set_performance_policy", None)
+        if callable(set_performance_policy):
+            set_performance_policy(
+                preferred_max_latency_seconds=max_p90_latency_seconds,
+                provider_sort=("latency" if latency_value_usd_per_second > 0 else "price"),
+            )
         input_text = _content(input)
         messages = [{"role": "system", "content": row["selected_prompt"]}, {"role": "user", "content": input_text}]
         estimate = self.client.transport.estimate_cost(row["selected_model"], messages, max_tokens=max_tokens)
@@ -556,15 +581,18 @@ class DurableRouter:
                 representative_output_tokens=representative_output_tokens,
                 incumbent_model=row["selected_model"],
                 adaptive_search=True,
+                max_p90_latency_seconds=row["max_p90_latency_seconds"],
+                latency_value_usd_per_second=row["latency_value_usd_per_second"],
             )
             winner = result.winner
             within_price = max_cost_per_run_usd is None or winner.estimated_production_cost_per_call_usd <= max_cost_per_run_usd + 1e-12
+            within_latency = winner.passed_latency_ceiling
             if objective == "match_baseline_at_lowest_cost":
                 baseline_quality = float(result.regression_suite["incumbent_baseline_holdout_pass_rate"])
                 accuracy_met = winner.holdout_pass_rate >= baseline_quality
             else:
                 accuracy_met = winner.holdout_pass_rate >= float(row["quality_threshold"])
-            promoted = within_price and (
+            promoted = within_price and within_latency and (
                 objective in {"best_within_price", "best_within_cost", "highest_quality"}
                 or accuracy_met
             )
@@ -582,6 +610,10 @@ class DurableRouter:
                     "promoted": promoted,
                     "target_accuracy_met": accuracy_met,
                     "production_price_ceiling_met": within_price,
+                    "p90_latency_seconds": winner.target_latency_p90_ms / 1000,
+                    "latency_ceiling_met": within_latency,
+                    "max_p90_latency_seconds": row["max_p90_latency_seconds"],
+                    "latency_value_usd_per_second": row["latency_value_usd_per_second"],
                     "representative_input_chars_p90": representative_input_chars,
                     "representative_output_tokens_p90": representative_output_tokens,
                 }
@@ -621,6 +653,8 @@ class DurableRouter:
             "test_budget_policy": row["test_budget_policy"],
             "target_accuracy": row["quality_threshold"],
             "objective": row["objective"],
+            "max_p90_latency_seconds": row["max_p90_latency_seconds"],
+            "latency_value_usd_per_second": row["latency_value_usd_per_second"],
             "total_calls": row["total_calls"],
             "feedback_count": row["feedback_count"],
             "maintenance_due": list(self._due(row, retest_after_calls=retest_after_calls, min_feedback=min_feedback)),

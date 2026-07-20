@@ -243,6 +243,8 @@ class Evalt:
         max_test_budget_usd: float = 1.00,
         target_accuracy: float = 0.95,
         objective: str = "lowest_cost_at_accuracy",
+        max_p90_latency_seconds: float | None = None,
+        latency_value_usd_per_second: float = 0.0,
         models: Iterable[str] | None = None,
         max_tokens: int = 600,
         budget_usd: float | None = None,
@@ -285,6 +287,10 @@ class Evalt:
             if target_accuracy != 0.95 and float(target_accuracy) != float(quality_threshold):
                 raise ValueError("Use target_accuracy; quality_threshold is only a backward-compatible alias.")
             target_accuracy = float(quality_threshold)
+        if max_p90_latency_seconds is not None and max_p90_latency_seconds <= 0:
+            raise ValueError("max_p90_latency_seconds must be positive when provided.")
+        if latency_value_usd_per_second < 0:
+            raise ValueError("latency_value_usd_per_second cannot be negative.")
         if maintenance_budget_usd is not None:
             if test_budget_usd != "auto" and float(test_budget_usd) != float(maintenance_budget_usd):
                 raise ValueError("Use test_budget_usd; maintenance_budget_usd is only a backward-compatible alias.")
@@ -326,6 +332,8 @@ class Evalt:
             objective=objective,
             test_budget_usd=resolved_test_budget_usd,
             test_budget_policy=test_budget_policy,
+            max_p90_latency_seconds=max_p90_latency_seconds,
+            latency_value_usd_per_second=latency_value_usd_per_second,
             retest_after_calls=retest_after_calls,
             min_feedback=min_feedback,
             catalog_revision=role_plan.catalog_revision,

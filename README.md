@@ -32,7 +32,7 @@ repository checkout:
 
 ```bash
 python -m venv .venv
-python -m pip install dist/evalt-0.8.13-py3-none-any.whl
+python -m pip install dist/evalt-0.8.14-py3-none-any.whl
 evalt --version
 ```
 
@@ -57,6 +57,8 @@ answer = evalt.run(
     ticket,
     route="support-routing",
     test_budget_usd="auto",
+    max_p90_latency_seconds=3.0,       # optional hard tail-latency contract
+    latency_value_usd_per_second=0.0,  # optional softer cost/speed tradeoff
 )
 
 send(answer.content)
@@ -121,11 +123,12 @@ approved final-test scenario passed on every configured repeat; it is not a guar
 about every future input. Reports show distinct scenario count and execution count
 separately.
 
-Speed can be part of the explicit production contract. Set
+Speed is durable route state, not a one-time benchmark option. Set
 `max_p90_latency_seconds` to require a measured tail-latency ceiling, or use the advanced
 `latency_value_usd_per_second` value-of-time term. Evalt reports measured p50 and p90 for
-every completed route. OpenRouter's provider price/latency/throughput preferences help
-search, but cannot replace those frozen-run measurements. The default deadline
+every completed route, persists both controls in SQLite, and refuses to promote a later
+maintenance winner that misses the route's latency ceiling. OpenRouter's provider
+price/latency/throughput preferences help search, but cannot replace those frozen-run measurements. The default deadline
 is 600 seconds per response, and complex or long-context suites can raise it explicitly
 up to 7200 seconds with `request_timeout_seconds` in the suite, with
 `Evalt(request_timeout_seconds=...)`, or with `evalt optimize --request-timeout ...`.
