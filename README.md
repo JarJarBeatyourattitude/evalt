@@ -33,7 +33,7 @@ repository checkout:
 
 ```bash
 python -m venv .venv
-python -m pip install dist/evalt-0.8.10-py3-none-any.whl
+python -m pip install dist/evalt-0.8.11-py3-none-any.whl
 evalt --version
 ```
 
