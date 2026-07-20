@@ -50,11 +50,14 @@ class Suite:
     max_parallel_models: int = 16
     max_parallel_scenarios: int = 32
     request_timeout_seconds: float = 600
+    max_p90_latency_seconds: float | None = None
+    latency_value_usd_per_second: float = 0.0
     minimum_meaningful_quality_gain: float = 0.03
     allow_few_shot: bool = True
     max_few_shot_examples: int = 3
     incumbent_model: str | None = None
     allowed_accuracy_regression: float = 0.0
+    adaptive_search: bool = True
     name: str = "evalt-suite"
 
     @classmethod
@@ -80,11 +83,17 @@ class Suite:
                 max_parallel_models=int(value.get("max_parallel_models", 16)),
                 max_parallel_scenarios=int(value.get("max_parallel_scenarios", 32)),
                 request_timeout_seconds=float(value.get("request_timeout_seconds", 600)),
+                max_p90_latency_seconds=(
+                    float(value["max_p90_latency_seconds"])
+                    if value.get("max_p90_latency_seconds") is not None else None
+                ),
+                latency_value_usd_per_second=float(value.get("latency_value_usd_per_second", 0.0)),
                 minimum_meaningful_quality_gain=float(value.get("minimum_meaningful_quality_gain", 0.03)),
                 allow_few_shot=bool(value.get("allow_few_shot", True)),
                 max_few_shot_examples=int(value.get("max_few_shot_examples", 3)),
                 incumbent_model=str(value["incumbent_model"]) if value.get("incumbent_model") else None,
                 allowed_accuracy_regression=float(value.get("allowed_accuracy_regression", 0.0)),
+                adaptive_search=bool(value.get("adaptive_search", True)),
             )
         except (KeyError, TypeError, ValueError) as error:
             raise ValueError(f"Invalid Evalt suite: {error}") from error
@@ -126,6 +135,10 @@ class Suite:
             raise ValueError("max_parallel_scenarios must be between 1 and 128.")
         if not 0 < self.request_timeout_seconds <= 7200:
             raise ValueError("request_timeout_seconds must be greater than zero and no more than 7200 seconds.")
+        if self.max_p90_latency_seconds is not None and self.max_p90_latency_seconds <= 0:
+            raise ValueError("max_p90_latency_seconds must be positive when provided.")
+        if self.latency_value_usd_per_second < 0:
+            raise ValueError("latency_value_usd_per_second cannot be negative.")
         _validate_evaluator_policy(dict(self.evaluator))
 
     def to_dict(self) -> dict[str, Any]:
@@ -146,11 +159,14 @@ class Suite:
             "max_parallel_models": self.max_parallel_models,
             "max_parallel_scenarios": self.max_parallel_scenarios,
             "request_timeout_seconds": self.request_timeout_seconds,
+            "max_p90_latency_seconds": self.max_p90_latency_seconds,
+            "latency_value_usd_per_second": self.latency_value_usd_per_second,
             "minimum_meaningful_quality_gain": self.minimum_meaningful_quality_gain,
             "allow_few_shot": self.allow_few_shot,
             "max_few_shot_examples": self.max_few_shot_examples,
             "incumbent_model": self.incumbent_model,
             "allowed_accuracy_regression": self.allowed_accuracy_regression,
+            "adaptive_search": self.adaptive_search,
         }
 
     def save(self, path: str | Path) -> None:
@@ -173,12 +189,14 @@ class Suite:
             "holdout_repeats": self.holdout_repeats,
             "max_parallel_models": self.max_parallel_models,
             "max_parallel_scenarios": self.max_parallel_scenarios,
+            "max_p90_latency_seconds": self.max_p90_latency_seconds,
+            "latency_value_usd_per_second": self.latency_value_usd_per_second,
             "minimum_meaningful_quality_gain": self.minimum_meaningful_quality_gain,
             "allow_few_shot": self.allow_few_shot,
             "max_few_shot_examples": self.max_few_shot_examples,
             "incumbent_model": self.incumbent_model,
             "allowed_accuracy_regression": self.allowed_accuracy_regression,
-            "adaptive_search": True,
+            "adaptive_search": self.adaptive_search,
         }
 
 
@@ -241,6 +259,13 @@ class Evalt:
             if isinstance(self.client.transport, OpenRouterTransport):
                 self.client.transport.set_timeout_seconds(
                     suite_or_prompt.request_timeout_seconds
+                )
+                self.client.transport.set_performance_policy(
+                    preferred_max_latency_seconds=suite_or_prompt.max_p90_latency_seconds,
+                    provider_sort=(
+                        "latency" if suite_or_prompt.latency_value_usd_per_second > 0
+                        else "price"
+                    ),
                 )
             return self.client.optimize(**suite_or_prompt.optimize_kwargs())
         if input is None:

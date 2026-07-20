@@ -24,16 +24,15 @@ input/reference pairs, offline, and reports everything it cannot honestly recons
 evalt import-openai-results results.jsonl --prompt-file system-prompt.txt --output evalt.json
 ```
 
-Read the [OpenAI Evals migration guide](https://github.com/JarJarBeatyourattitude/evalt/blob/main/docs/openai-evals-migration.md)
-before running an imported suite. Historical candidate outputs are never treated as
-approved answers.
+Read the [OpenAI Evals migration guide](docs/openai-evals-migration.md) before running
+an imported suite. Historical candidate outputs are never treated as approved answers.
 
 For an offline or pinned artifact install, use the verified versioned wheel from this
 repository checkout:
 
 ```bash
 python -m venv .venv
-python -m pip install dist/evalt-0.8.12-py3-none-any.whl
+python -m pip install dist/evalt-0.8.13-py3-none-any.whl
 evalt --version
 ```
 
@@ -45,7 +44,7 @@ package never creates a platform charge.
 
 - [Package on PyPI](https://pypi.org/project/evalt/)
 - [Source and issues on GitHub](https://github.com/JarJarBeatyourattitude/evalt)
-- [Hosted product and docs](https://evalt.dev/#sdk)
+- [Hosted documentation](https://evalt.dev/docs/)
 
 ## Production API
 
@@ -64,6 +63,20 @@ send(answer.content)
 answer.accept()                 # or answer.correct("billing")
 print(evalt.route_status("support-routing"))
 ```
+
+Use one stable route name per production task. A single `Evalt` instance can manage any
+number of independent routes; each route keeps its own prompt, approved or corrected
+examples, selected model, price ceiling, test budget, and maintenance history:
+
+```python
+support = evalt.run(support_prompt, ticket, route="support-routing")
+summary = evalt.run(summary_prompt, transcript, route="call-summary")
+fraud = evalt.run(risk_prompt, transaction, route="fraud-review")
+```
+
+Feedback on `support-routing` cannot enter the evaluation set for `call-summary` or
+`fraud-review`. Reusing a route name means “this is the same repeated task”; using a new
+name creates a separate optimization track in the same local state database.
 
 The first call uses the selected bootstrap route within the production price ceiling.
 Explicit feedback becomes the route-specific evaluation set. On a later call, Evalt can
@@ -96,18 +109,23 @@ workflows need no comparison model: their approved validation target is the bar.
 Reasoning effort is tested as part of the model configuration only when the current ZDR
 endpoint supports it. The adaptive search first runs one configuration across a broad
 price/intelligence frontier, then spends the remaining test budget on effort variants for
-models in the observed task-capability band. Reasoning configurations receive large,
-budget-reserved completion headroom (8,192 tokens without reasoning through 65,536 at
-high effort) so hidden reasoning cannot silently consume a tiny visible-response limit.
-An empty or explicitly truncated response gets one budget-checked retry with a real
-131,072-token ceiling where the provider supports it. Production cost uses the route's
-90th-percentile approved input and output lengths. The default quality floor is 95%, and
+models in the observed task-capability band. The first request receives large,
+reasoning-aware completion headroom: 32,768 tokens without reasoning, 65,536 at low,
+98,304 at medium, and up to 131,072 at high effort, always clamped to the provider's
+natural output limit and the remaining context. An empty or explicitly truncated
+response is retried only when a genuinely larger valid ceiling exists. Production cost
+uses measured 90th-percentile successful calls rather than pricing the entire safety
+ceiling. The default quality floor is 95%, and
 held-out cases are repeated twice before promotion. A measured 100% means every repeated
 approved final-test scenario passed on every configured repeat; it is not a guarantee
 about every future input. Reports show distinct scenario count and execution count
 separately.
 
-Provider response time is not used as a hidden intelligence filter. The default deadline
+Speed can be part of the explicit production contract. Set
+`max_p90_latency_seconds` to require a measured tail-latency ceiling, or use the advanced
+`latency_value_usd_per_second` value-of-time term. Evalt reports measured p50 and p90 for
+every completed route. OpenRouter's provider price/latency/throughput preferences help
+search, but cannot replace those frozen-run measurements. The default deadline
 is 600 seconds per response, and complex or long-context suites can raise it explicitly
 up to 7200 seconds with `request_timeout_seconds` in the suite, with
 `Evalt(request_timeout_seconds=...)`, or with `evalt optimize --request-timeout ...`.
@@ -139,9 +157,10 @@ evalt check evalt-result.json --min-pass-rate 0.95
 `init`, `validate`, and `check` are offline and make no provider calls. `optimize` uses the
 single `max_optimization_cost_usd` value in the suite as a hard cap across optimization,
 target runs, judging, and every selected model. The command reports partial coverage
-instead of calling an unfinished tournament globally best. It emits line-delimited
-progress events to stderr as each model starts, finishes, or fails, while the final JSON
-stays on stdout and at the requested output path. Model/scenario concurrency and the
+instead of calling an unfinished tournament globally best. In a terminal it shows a
+live elapsed/active/settled heartbeat and prints score, p90 latency, and spend as each
+route finishes. When piped it emits the same progress as JSONL on stderr, while the final
+JSON stays on stdout and at the requested output path. Model/scenario concurrency and the
 wall-clock timeout for one provider response can be overridden per run.
 
 Use stricter CI gates when needed:

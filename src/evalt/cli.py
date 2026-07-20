@@ -6,6 +6,8 @@ import argparse
 import json
 from pathlib import Path
 import sys
+import threading
+import time
 
 from .core import BudgetExceeded, Evalt, ProviderError, Suite, check_result
 from .migration import migrate_openai_results
@@ -35,6 +37,68 @@ STARTER_SUITE = {
 }
 
 
+class _CliProgress:
+    """Readable TTY progress with JSONL preserved for pipes and automation."""
+
+    def __init__(self, total: int) -> None:
+        self.total = max(1, int(total))
+        self.started_at = time.monotonic()
+        self.active: set[str] = set()
+        self.finished: set[str] = set()
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._tty = bool(getattr(sys.stderr, "isatty", lambda: False)())
+        self._thread: threading.Thread | None = None
+        if self._tty:
+            self._thread = threading.Thread(target=self._heartbeat, daemon=True)
+            self._thread.start()
+
+    def _status(self) -> str:
+        elapsed = int(time.monotonic() - self.started_at)
+        return (
+            f"Evalt {elapsed // 60:02d}:{elapsed % 60:02d}  "
+            f"{len(self.active)} active  {len(self.finished)}/{self.total} routes settled"
+        )
+
+    def _heartbeat(self) -> None:
+        while not self._stop.wait(1):
+            with self._lock:
+                print(f"\r{self._status():<88}", end="", file=sys.stderr, flush=True)
+
+    def __call__(self, event: dict) -> None:
+        if not self._tty:
+            print(json.dumps(event, ensure_ascii=False), file=sys.stderr, flush=True)
+            return
+        model = str(event.get("model") or "route")
+        kind = str(event.get("event") or "progress")
+        with self._lock:
+            if kind == "model_started":
+                self.active.add(model)
+                message = f"START  {model}"
+            elif kind == "model_completed":
+                self.active.discard(model)
+                self.finished.add(model)
+                rate = round(float(event.get("final_test_pass_rate", 0)) * 100)
+                p90 = int(event.get("target_latency_p90_ms") or 0)
+                spend = float(event.get("optimization_spend_usd") or 0)
+                message = f"DONE   {model}  {rate}% pass  p90 {p90 / 1000:.2f}s  ${spend:.4f}"
+            elif kind in {"model_unavailable", "model_incomplete", "configuration_omitted"}:
+                self.active.discard(model)
+                self.finished.add(model)
+                message = f"SKIP   {model}  {event.get('reason', kind)}"
+            else:
+                message = f"INFO   {model}  {kind.replace('_', ' ')}"
+            print(f"\r{'':88}\r{message}", file=sys.stderr, flush=True)
+
+    def close(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1)
+        if self._tty:
+            with self._lock:
+                print(f"\r{'':88}\r{self._status()}", file=sys.stderr, flush=True)
+
+
 class _OfflineTransport:
     def estimate_cost(self, *_args, **_kwargs):
         raise RuntimeError("Offline status does not make provider calls.")
@@ -48,7 +112,7 @@ def parser() -> argparse.ArgumentParser:
         prog="evalt",
         description="Run prompts through a durable, tested, budget-bounded model route.",
     )
-    root.add_argument("--version", action="version", version="evalt 0.8.12")
+    root.add_argument("--version", action="version", version="evalt 0.8.13")
     commands = root.add_subparsers(dest="command", required=True)
 
     init = commands.add_parser("init", help="Write a reviewable starter suite; no provider call.")
@@ -134,12 +198,18 @@ def _summary(result, path: str) -> dict[str, object]:
         "winner_scope": result.winner_scope,
         "quality_frontier": result.quality_frontier,
         "diminishing_returns": result.diminishing_returns,
+        "omitted_configurations": result.omitted_configurations,
         "unavailable_models": result.unavailable_models,
         "result": path,
     }
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Windows terminals may default to a legacy code page. Progress and summaries
+    # are UTF-8 JSON contracts and must not fail after a paid result was saved.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
     args = parser().parse_args(argv)
     try:
         if args.command == "init":
@@ -259,12 +329,11 @@ def main(argv: list[str] | None = None) -> int:
                 optimize_kwargs["max_parallel_models"] = args.max_parallel_models
             if args.max_parallel_scenarios is not None:
                 optimize_kwargs["max_parallel_scenarios"] = args.max_parallel_scenarios
+            progress = _CliProgress(len(optimize_kwargs.get("models") or []))
             try:
                 result = client.client.optimize(
                     **optimize_kwargs,
-                    progress_callback=lambda event: print(
-                        json.dumps(event, ensure_ascii=False), file=sys.stderr, flush=True
-                    ),
+                    progress_callback=progress,
                 )
             except (BudgetExceeded, ProviderError) as error:
                 failure = {
@@ -289,6 +358,8 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 print(json.dumps(failure, ensure_ascii=False), file=sys.stderr, flush=True)
                 return 2
+            finally:
+                progress.close()
             result.save(args.output)
             print(json.dumps(_summary(result, args.output), indent=2, ensure_ascii=False))
             return 0

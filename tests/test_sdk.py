@@ -206,6 +206,35 @@ class SdkTests(unittest.TestCase):
         completed = {event["model"] for event in events if event["event"] == "model_completed"}
         self.assertEqual(started, {"cheap-a", "cheap-b"})
         self.assertEqual(completed, started)
+        self.assertTrue(all("target_latency_p90_ms" in event for event in events if event["event"] == "model_completed"))
+
+    def test_latency_ceiling_can_reject_the_cheapest_otherwise_passing_route(self):
+        class LatencyTransport(FakeTransport):
+            def estimate_cost(self, model, messages, *, max_tokens):
+                return 0.0001 if model == "slow-cheap" else 0.0002
+
+            def complete(self, model, messages, *, max_tokens, response_schema=None):
+                completion = super().complete(
+                    model, messages, max_tokens=max_tokens, response_schema=response_schema
+                )
+                latency_ms = 9000 if model == "slow-cheap" else 400
+                return Completion(
+                    completion.content, completion.model, completion.generation_id,
+                    completion.cost_usd, completion.prompt_tokens,
+                    completion.completion_tokens, latency_ms,
+                )
+
+        result = Client(transport=LatencyTransport()).optimize(
+            prompt="Return the approved route label only.", examples=EXAMPLES,
+            models=["slow-cheap", "fast-costlier"], optimizer_model="optimizer",
+            evaluator_model="evaluator", max_optimization_cost_usd=1,
+            max_p90_latency_seconds=2,
+        )
+        self.assertEqual(result.winner.model, "fast-costlier")
+        by_model = {item.model: item for item in result.models}
+        self.assertFalse(by_model["slow-cheap"].passed_latency_ceiling)
+        self.assertEqual(by_model["slow-cheap"].target_latency_p90_ms, 9000)
+        self.assertTrue(by_model["fast-costlier"].passed_latency_ceiling)
 
     def test_scenario_lanes_overlap_but_each_multiturn_transcript_stays_ordered(self):
         class ScenarioParallelTransport(FakeTransport):
@@ -404,6 +433,33 @@ class SdkTests(unittest.TestCase):
             self.assertIn("new_human_feedback", status["maintenance_due"])
             self.assertTrue(status["decisions"])
 
+    def test_named_routes_keep_multiple_tasks_and_their_evidence_isolated(self):
+        with TemporaryDirectory() as directory:
+            state = Path(directory) / "evalt.db"
+            evalt = Evalt(transport=FakeTransport(), state_path=state)
+            support = evalt.run(
+                "Return the approved route label only.", "I was charged twice",
+                route="support-routing", budget_usd=0.01, models=["cheap"], auto_maintain=False,
+            )
+            incident = evalt.run(
+                "Return the approved route label only. This route triages incidents.", "The app freezes",
+                route="incident-triage", budget_usd=0.01, models=["cheap"], auto_maintain=False,
+            )
+            support.accept()
+            incident.correct("urgent")
+
+            support_status = evalt.route_status("support-routing")
+            incident_status = evalt.route_status("incident-triage")
+            self.assertEqual(support.content, "billing")
+            self.assertEqual(incident.content, "technical")
+            self.assertEqual(support_status["route"], "support-routing")
+            self.assertEqual(incident_status["route"], "incident-triage")
+            self.assertEqual(support_status["total_calls"], 1)
+            self.assertEqual(incident_status["total_calls"], 1)
+            self.assertEqual(support_status["feedback_count"], 1)
+            self.assertEqual(incident_status["feedback_count"], 1)
+            self.assertNotEqual(support.prompt_version, incident.prompt_version)
+
     def test_router_rejects_a_call_before_provider_use_when_request_cap_is_too_low(self):
         with TemporaryDirectory() as directory:
             transport = FakeTransport()
@@ -538,6 +594,15 @@ class SdkTests(unittest.TestCase):
         })
         self.assertEqual(suite.request_timeout_seconds, 1200)
         self.assertEqual(suite.to_dict()["request_timeout_seconds"], 1200)
+        latency_suite = Suite.from_dict({
+            "prompt": "Return the approved route label only.",
+            "examples": EXAMPLES,
+            "models": ["cheap"],
+            "max_p90_latency_seconds": 3.5,
+            "latency_value_usd_per_second": 0.00002,
+        })
+        self.assertEqual(latency_suite.optimize_kwargs()["max_p90_latency_seconds"], 3.5)
+        self.assertEqual(latency_suite.to_dict()["latency_value_usd_per_second"], 0.00002)
         with self.assertRaisesRegex(ValueError, "greater than zero"):
             Suite.from_dict({
                 "prompt": "Return the approved route label only.",
@@ -649,6 +714,13 @@ class SdkTests(unittest.TestCase):
         def opener(request, timeout):
             requests.append(json.loads(request.data) if request.data else None)
             if request.data is None:
+                if "endpoints/zdr" in request.full_url:
+                    return FakeResponse({"data": [{
+                        "model_id": "model-without-temperature", "tag": "fixture/full", "context_length": 131072,
+                        "max_completion_tokens": 131072,
+                        "pricing": {"prompt": "0.000001", "completion": "0.000002"},
+                        "supported_parameters": ["max_completion_tokens", "structured_outputs"],
+                    }]})
                 return FakeResponse({"data": [{
                     "id": "model-without-temperature",
                     "pricing": {"prompt": "0.000001", "completion": "0.000002"},
@@ -666,10 +738,10 @@ class SdkTests(unittest.TestCase):
             max_tokens=25, response_schema={"type": "object"},
         )
         sent = requests[-1]
-        self.assertEqual(sent["max_completion_tokens"], 8192)
+        self.assertEqual(sent["max_completion_tokens"], 32768)
         self.assertNotIn("max_tokens", sent)
         self.assertNotIn("temperature", sent)
-        self.assertNotIn("sort", sent["provider"])
+        self.assertEqual(sent["provider"]["sort"], "price")
         self.assertEqual(sent["usage"], {"include": True})
         self.assertEqual(sent["response_format"]["type"], "json_schema")
 
@@ -679,6 +751,13 @@ class SdkTests(unittest.TestCase):
         def opener(request, timeout):
             requests.append(json.loads(request.data) if request.data else None)
             if request.data is None:
+                if "endpoints/zdr" in request.full_url:
+                    return FakeResponse({"data": [{
+                        "model_id": "reasoning-model", "tag": "fixture/full", "context_length": 131072,
+                        "max_completion_tokens": 131072,
+                        "pricing": {"prompt": "0.000001", "completion": "0.000002"},
+                        "supported_parameters": ["max_completion_tokens", "reasoning"],
+                    }]})
                 return FakeResponse({"data": [{
                     "id": "reasoning-model",
                     "pricing": {"prompt": "0.000001", "completion": "0.000002"},
@@ -697,8 +776,158 @@ class SdkTests(unittest.TestCase):
             [{"role": "user", "content": "hello"}], max_tokens=100,
         )
         self.assertEqual(requests[-1]["reasoning"], {"effort": "low", "exclude": True})
-        self.assertEqual(requests[-1]["max_completion_tokens"], 16384)
+        self.assertEqual(requests[-1]["max_completion_tokens"], 65536)
         self.assertEqual(result.model, "reasoning-model#reasoning=low")
+
+    def test_mandatory_reasoning_catalog_never_emits_a_none_configuration(self):
+        plan = select_role_plan([{
+            "id": "openai/gpt-oss-120b",
+            "intelligence": 70,
+            "blended_price": 0.5,
+            "supported_parameters": ["max_tokens", "reasoning"],
+            "reasoning": {"mandatory": True, "supported_efforts": ["low", "medium", "high"]},
+        }], maintenance_budget_usd=3)
+        self.assertTrue(plan.target_models)
+        self.assertTrue(all("#reasoning=none" not in model for model in plan.target_models))
+
+    def test_optimizer_omits_known_unsupported_configuration_before_target_calls(self):
+        class CapabilityTransport(FakeTransport):
+            def __init__(self):
+                super().__init__()
+                self.target_models_seen = []
+
+            def model_catalog(self):
+                return []
+
+            def configuration_support(self, configuration):
+                if configuration.endswith("#reasoning=none"):
+                    return {"supported": False, "reason": "mandatory reasoning"}
+                return {"supported": True, "reason": "supported"}
+
+            def complete(self, model, messages, *, max_tokens, response_schema=None):
+                if model.startswith("target"):
+                    self.target_models_seen.append(model)
+                return super().complete(
+                    model, messages, max_tokens=max_tokens, response_schema=response_schema,
+                )
+
+        transport = CapabilityTransport()
+        result = Client(transport=transport).optimize(
+            prompt="Return one label.", examples=EXAMPLES,
+            models=["target#reasoning=none", "target#reasoning=low"],
+            optimizer_model="optimizer", evaluator_model="evaluator",
+            max_optimization_cost_usd=1,
+        )
+        self.assertTrue(transport.target_models_seen)
+        self.assertTrue(all(model.endswith("#reasoning=low") for model in transport.target_models_seen))
+        self.assertEqual(result.unavailable_models, [])
+        self.assertEqual(result.omitted_configurations[0]["model"], "target#reasoning=none")
+        self.assertEqual(result.omitted_configurations[0]["stage"], "preflight")
+
+    def test_transport_clamps_reasoning_headroom_to_endpoint_and_context_limits(self):
+        requests = []
+
+        def opener(request, timeout):
+            if request.data is not None:
+                requests.append(json.loads(request.data))
+                return FakeResponse({
+                    "id": "gen-limit", "choices": [{"finish_reason": "length", "message": {"content": "partial"}}],
+                    "usage": {"cost": 0.001, "prompt_tokens": 100, "completion_tokens": 2048},
+                })
+            if "endpoints/zdr" in request.full_url:
+                return FakeResponse({"data": [{
+                    "model_id": "bounded-reasoner", "context_length": 4096, "max_completion_tokens": 2048,
+                    "pricing": {"prompt": "0.000001", "completion": "0.000002"},
+                    "supported_parameters": ["max_tokens", "reasoning"],
+                }]})
+            return FakeResponse({"data": [{
+                "id": "bounded-reasoner", "context_length": 8192,
+                "top_provider": {"context_length": 8192, "max_completion_tokens": 4096},
+                "pricing": {"prompt": "0.000001", "completion": "0.000002"},
+                "supported_parameters": ["max_tokens", "reasoning"],
+                "reasoning": {"mandatory": True, "supported_efforts": ["low", "medium", "high"]},
+            }]})
+
+        transport = OpenRouterTransport("sk-or-v1-test-key", opener=opener)
+        with self.assertRaises(ProviderError) as raised:
+            transport.complete(
+                "bounded-reasoner#reasoning=high",
+                [{"role": "user", "content": "hello"}], max_tokens=100,
+            )
+        self.assertEqual(requests[-1]["max_tokens"], 2048)
+        self.assertEqual(raised.exception.code, "PROVIDER_TRUNCATED")
+        self.assertFalse(raised.exception.retry_with_more_tokens)
+
+    def test_transport_selects_and_pins_the_cheapest_route_with_full_first_call_headroom(self):
+        requests = []
+
+        def opener(request, timeout):
+            if request.data is not None:
+                requests.append(json.loads(request.data))
+                return FakeResponse({
+                    "id": "gen-full-headroom", "choices": [{"finish_reason": "stop", "message": {"content": "ok"}}],
+                    "usage": {"cost": 0.001, "prompt_tokens": 10, "completion_tokens": 20},
+                })
+            if "endpoints/zdr" in request.full_url:
+                return FakeResponse({"data": [
+                    {
+                        "model_id": "reasoner", "tag": "cheap/capped", "context_length": 131072,
+                        "max_completion_tokens": 32768, "pricing": {"prompt": "0.00000001", "completion": "0.00000001"},
+                        "supported_parameters": ["max_completion_tokens", "reasoning"],
+                    },
+                    {
+                        "model_id": "reasoner", "tag": "full/capacity", "context_length": 131072,
+                        "max_completion_tokens": 131072, "pricing": {"prompt": "0.00000002", "completion": "0.00000002"},
+                        "supported_parameters": ["max_completion_tokens", "reasoning"],
+                    },
+                ]})
+            return FakeResponse({"data": [{
+                "id": "reasoner", "context_length": 131072,
+                "top_provider": {"context_length": 131072, "max_completion_tokens": 131072},
+                "pricing": {"prompt": "0.00000001", "completion": "0.00000001"},
+                "supported_parameters": ["max_completion_tokens", "reasoning"],
+                "reasoning": {"mandatory": True, "supported_efforts": ["low", "medium", "high"]},
+            }]})
+
+        transport = OpenRouterTransport("sk-or-v1-test-key", opener=opener)
+        transport.complete(
+            "reasoner#reasoning=high", [{"role": "user", "content": "hello"}], max_tokens=100,
+        )
+        sent = requests[-1]
+        self.assertEqual(sent["provider"]["only"], ["full/capacity"])
+        self.assertFalse(sent["provider"]["allow_fallbacks"])
+        self.assertGreater(sent["max_completion_tokens"], 100000)
+
+    def test_missing_visible_content_at_length_is_typed_as_truncation(self):
+        def opener(request, timeout):
+            if request.data is None:
+                if "endpoints/zdr" in request.full_url:
+                    return FakeResponse({"data": [{
+                        "model_id": "reasoner", "tag": "fixture/full", "context_length": 131072,
+                        "max_completion_tokens": 131072,
+                        "pricing": {"prompt": "0.00000001", "completion": "0.00000001"},
+                        "supported_parameters": ["max_completion_tokens", "reasoning"],
+                    }]})
+                return FakeResponse({"data": [{
+                    "id": "reasoner", "context_length": 131072,
+                    "top_provider": {"context_length": 131072, "max_completion_tokens": 131072},
+                    "pricing": {"prompt": "0.00000001", "completion": "0.00000001"},
+                    "supported_parameters": ["max_completion_tokens", "reasoning"],
+                    "reasoning": {"mandatory": True, "supported_efforts": ["high"]},
+                }]})
+            return FakeResponse({
+                "id": "gen-no-visible-answer",
+                "choices": [{"finish_reason": "length", "message": {"reasoning": "hidden"}}],
+                "usage": {"cost": 0.001, "prompt_tokens": 10, "completion_tokens": 131000},
+            })
+
+        transport = OpenRouterTransport("sk-or-v1-test-key", opener=opener)
+        with self.assertRaises(ProviderError) as raised:
+            transport.complete(
+                "reasoner#reasoning=high", [{"role": "user", "content": "hello"}], max_tokens=100,
+            )
+        self.assertEqual(raised.exception.code, "PROVIDER_TRUNCATED")
+        self.assertFalse(raised.exception.retry_with_more_tokens)
 
     def test_empty_answer_retries_once_with_a_larger_budgeted_response_target(self):
         class EmptyOnceTransport(FakeTransport):
@@ -978,7 +1207,7 @@ class SdkTests(unittest.TestCase):
         self.assertEqual(result.winner.model, "cheap")
         self.assertTrue(result.incomplete_models)
         self.assertEqual(result.skipped_budget_models, ["later"])
-        self.assertEqual(result.winner_scope, "Best among fully completed targets only")
+        self.assertEqual(result.winner_scope, "Best among fully completed eligible targets only")
 
     def test_few_shot_selection_is_training_only_and_is_included_in_costed_package(self):
         transport = FewShotTransport()

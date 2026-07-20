@@ -7,6 +7,7 @@ from dataclasses import asdict, dataclass, field
 from fractions import Fraction
 import hashlib
 import json
+import math
 import os
 import statistics
 import threading
@@ -89,6 +90,8 @@ class CaseResult:
     evaluator_cost_usd: float
     target_generation_id: str
     evaluator_generation_id: str
+    target_latency_ms: int = 0
+    evaluator_latency_ms: int = 0
 
 
 @dataclass
@@ -103,6 +106,9 @@ class ModelResult:
     estimated_cost_per_successful_call_usd: float
     optimization_spend_usd: float
     passed_quality_floor: bool
+    target_latency_p50_ms: int = 0
+    target_latency_p90_ms: int = 0
+    passed_latency_ceiling: bool = True
     holdout_unique_scenarios: int = 0
     holdout_executions: int = 0
     holdout_execution_pass_rate: float = 0.0
@@ -128,6 +134,7 @@ class OptimizationResult:
     regression_suite: dict[str, Any]
     elapsed_seconds: float = 0.0
     comparison_integrity: dict[str, Any] = field(default_factory=dict)
+    omitted_configurations: list[dict[str, str]] = field(default_factory=list)
     unavailable_models: list[dict[str, str]] = field(default_factory=list)
     incomplete_models: list[dict[str, str]] = field(default_factory=list)
     skipped_budget_models: list[str] = field(default_factory=list)
@@ -204,7 +211,11 @@ class OpenRouterTransport:
         self._prices: dict[str, tuple[float, float]] | None = None
         self._supported_parameters: dict[str, set[str]] = {}
         self._reasoning: dict[str, dict[str, Any]] = {}
+        self._limits: dict[str, tuple[int | None, int | None]] = {}
+        self._providers: dict[str, list[str]] = {}
         self._catalog_items: list[dict[str, Any]] = []
+        self._preferred_max_latency_seconds: float | None = None
+        self._provider_sort = "price"
 
     @property
     def timeout_seconds(self) -> float:
@@ -215,6 +226,23 @@ class OpenRouterTransport:
         if not 0 < resolved <= 7200:
             raise ValueError("timeout_seconds must be greater than zero and no more than 7200 seconds.")
         self._timeout = resolved
+
+    def set_performance_policy(
+        self,
+        *,
+        preferred_max_latency_seconds: float | None = None,
+        provider_sort: str = "price",
+    ) -> None:
+        """Set current provider-performance preferences for subsequent calls."""
+        if provider_sort not in {"price", "latency", "throughput"}:
+            raise ValueError("provider_sort must be price, latency, or throughput.")
+        if preferred_max_latency_seconds is not None and preferred_max_latency_seconds <= 0:
+            raise ValueError("preferred_max_latency_seconds must be positive when provided.")
+        self._provider_sort = provider_sort
+        self._preferred_max_latency_seconds = (
+            float(preferred_max_latency_seconds)
+            if preferred_max_latency_seconds is not None else None
+        )
 
     def _request(self, url: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
         headers = {
@@ -265,26 +293,65 @@ class OpenRouterTransport:
             endpoint_catalog_available = False
             endpoint_payload = {"data": []}
         endpoint_candidates: dict[str, list[dict[str, Any]]] = {}
+        recognized_endpoints = 0
         for endpoint in endpoint_payload.get("data", []):
             model_id = str(endpoint.get("model_id") or "")
             parameters = {str(value) for value in endpoint.get("supported_parameters") or []}
             if model_id and ({"max_tokens", "max_completion_tokens"} & parameters):
                 endpoint_candidates.setdefault(model_id, []).append(endpoint)
+                recognized_endpoints += 1
+        if endpoint_catalog_available and endpoint_payload.get("data") and not recognized_endpoints:
+            # Test doubles and legacy gateways may return model-shaped data at the
+            # endpoint URL. Do not mistake that malformed catalog for a proof that
+            # every ZDR route disappeared.
+            endpoint_catalog_available = False
         prices: dict[str, tuple[float, float]] = {}
         catalog_items: list[dict[str, Any]] = []
         self._supported_parameters = {}
         self._reasoning = {}
+        self._limits = {}
+        self._providers = {}
         for item in payload.get("data", []):
             pricing = item.get("pricing") or {}
             try:
                 model_id = str(item["id"])
                 endpoints = endpoint_candidates.get(model_id, [])
-                endpoint = min(
-                    endpoints,
-                    key=lambda value: float((value.get("pricing") or {}).get("prompt") or "inf")
-                    + float((value.get("pricing") or {}).get("completion") or "inf"),
-                    default=None,
-                )
+                if endpoint_catalog_available and not endpoints:
+                    # A model-level listing is not an executable private route. Omit
+                    # it before spend instead of launching a guaranteed ZDR 404.
+                    continue
+                top_provider = item.get("top_provider") or {}
+
+                def endpoint_capacity(value: dict[str, Any]) -> int:
+                    raw = value.get("max_completion_tokens") or value.get("context_length") or 0
+                    try:
+                        return max(0, int(raw))
+                    except (TypeError, ValueError):
+                        return 0
+
+                def endpoint_price(value: dict[str, Any]) -> float:
+                    route = value.get("pricing") or {}
+                    return float(route.get("prompt") or "inf") + float(route.get("completion") or "inf")
+
+                model_ceiling_raw = top_provider.get("max_completion_tokens") or item.get("context_length") or 131072
+                try:
+                    preferred_capacity = min(131072, max(1, int(model_ceiling_raw)))
+                except (TypeError, ValueError):
+                    preferred_capacity = 131072
+                capacity_eligible = [value for value in endpoints if endpoint_capacity(value) >= preferred_capacity]
+                if capacity_eligible:
+                    provider_pool = sorted(capacity_eligible, key=endpoint_price)
+                    endpoint = provider_pool[0]
+                elif endpoints:
+                    maximum_capacity = max(endpoint_capacity(value) for value in endpoints)
+                    provider_pool = sorted(
+                        (value for value in endpoints if endpoint_capacity(value) == maximum_capacity),
+                        key=endpoint_price,
+                    )
+                    endpoint = provider_pool[0]
+                else:
+                    provider_pool = []
+                    endpoint = None
                 route_pricing = (endpoint or {}).get("pricing") or pricing
                 prices[model_id] = (
                     float(route_pricing.get("prompt") or 0),
@@ -297,6 +364,20 @@ class OpenRouterTransport:
                     # accepts optional reasoning controls, so fail closed on that lever.
                     self._supported_parameters[model_id] -= {"reasoning", "reasoning_effort"}
                 self._reasoning[model_id] = dict(item.get("reasoning") or {})
+                context_value = (endpoint or {}).get("context_length") or top_provider.get("context_length") or item.get("context_length")
+                completion_value = (endpoint or {}).get("max_completion_tokens") or top_provider.get("max_completion_tokens") or context_value
+                try:
+                    context_limit = int(context_value) if context_value is not None else None
+                except (TypeError, ValueError):
+                    context_limit = None
+                try:
+                    completion_limit = int(completion_value) if completion_value is not None else None
+                except (TypeError, ValueError):
+                    completion_limit = None
+                self._limits[model_id] = (context_limit, completion_limit)
+                provider_tags = [str(value["tag"]) for value in provider_pool if value.get("tag")]
+                if provider_tags:
+                    self._providers[model_id] = provider_tags[:3]
                 intelligence = ((item.get("benchmarks") or {}).get("artificial_analysis") or {}).get("intelligence_index")
                 try:
                     intelligence = float(intelligence) if intelligence is not None else None
@@ -308,6 +389,8 @@ class OpenRouterTransport:
                     "blended_price": prices[model_id][0] * 1_000_000 + prices[model_id][1] * 2_000_000,
                     "supported_parameters": sorted(self._supported_parameters[model_id]),
                     "reasoning": item.get("reasoning") or {},
+                    "context_length": context_limit,
+                    "max_completion_tokens": completion_limit,
                 })
             except (KeyError, TypeError, ValueError):
                 continue
@@ -325,12 +408,48 @@ class OpenRouterTransport:
         self._load_prices()
         return [dict(item) for item in self._catalog_items]
 
+    def configuration_support(self, configuration: str) -> dict[str, Any]:
+        """Preflight a model/effort pair against current routed capabilities."""
+        explicit_reasoning = "#reasoning=" in configuration
+        model, effort = self._split_configuration(configuration)
+        prices = self._load_prices()
+        if model not in prices:
+            return {
+                "supported": False,
+                "reason": f"OpenRouter did not return a current priced ZDR route for {model!r}.",
+            }
+        supported = self._supported_parameters.get(model, set())
+        reasoning = self._reasoning.get(model, {})
+        reasoning_supported = bool({"reasoning", "reasoning_effort"} & supported)
+        if explicit_reasoning and effort == "none" and reasoning.get("mandatory"):
+            return {
+                "supported": False,
+                "reason": f"Reasoning is mandatory for {model!r}; the no-reasoning configuration was omitted before spend.",
+            }
+        if explicit_reasoning and effort != "none" and not reasoning_supported:
+            return {
+                "supported": False,
+                "reason": f"The current ZDR route for {model!r} does not support adjustable reasoning; this configuration was omitted before spend.",
+            }
+        supported_efforts = {
+            str(value) for value in reasoning.get("supported_efforts") or []
+        }
+        if explicit_reasoning and effort != "none" and supported_efforts and effort not in supported_efforts:
+            return {
+                "supported": False,
+                "reason": f"The current ZDR route for {model!r} does not list reasoning effort {effort!r}; this configuration was omitted before spend.",
+            }
+        return {
+            "supported": True,
+            "reason": "Current routed capability metadata accepts this configuration.",
+        }
+
     def estimate_cost(
         self, model: str, messages: list[dict[str, str]], *, max_tokens: int
     ) -> float:
         model, effort = self._split_configuration(model)
-        max_tokens = self._reasoning_token_ceiling(max_tokens, effort)
         prices = self._load_prices()
+        max_tokens = self._bounded_output_tokens(model, messages, max_tokens, effort)
         if model not in prices:
             raise ProviderError(
                 f"OpenRouter did not return current pricing for model {model!r}; "
@@ -351,8 +470,8 @@ class OpenRouterTransport:
         configuration = model
         explicit_reasoning = "#reasoning=" in model
         model, reasoning_effort = self._split_configuration(model)
-        max_tokens = self._reasoning_token_ceiling(max_tokens, reasoning_effort)
         self._load_prices()
+        max_tokens = self._bounded_output_tokens(model, messages, max_tokens, reasoning_effort)
         supported = self._supported_parameters.get(model, set())
         body: dict[str, Any] = {
             "model": model,
@@ -361,9 +480,19 @@ class OpenRouterTransport:
                 "zdr": True,
                 "data_collection": "deny",
                 "require_parameters": True,
+                "sort": self._provider_sort,
             },
             "usage": {"include": True},
         }
+        if self._providers.get(model):
+            body["provider"].update({
+                "only": self._providers[model],
+                "allow_fallbacks": len(self._providers[model]) > 1,
+            })
+        if self._preferred_max_latency_seconds is not None:
+            body["provider"]["preferred_max_latency"] = {
+                "p90": self._preferred_max_latency_seconds
+            }
         if "max_completion_tokens" in supported:
             body["max_completion_tokens"] = max_tokens
         elif "max_tokens" in supported:
@@ -380,6 +509,11 @@ class OpenRouterTransport:
             raise ProviderError(f"The current ZDR endpoint for {model!r} does not support adjustable reasoning.")
         if explicit_reasoning and reasoning_effort == "none" and reasoning_metadata.get("mandatory"):
             raise ProviderError(f"Reasoning is mandatory for {model!r}; choose low, medium, high, or another model.")
+        supported_efforts = {str(value) for value in reasoning_metadata.get("supported_efforts") or []}
+        if explicit_reasoning and reasoning_effort != "none" and supported_efforts and reasoning_effort not in supported_efforts:
+            raise ProviderError(
+                f"The current ZDR endpoint for {model!r} does not list reasoning effort {reasoning_effort!r}."
+            )
         if reasoning_supported:
             if not explicit_reasoning and reasoning_metadata.get("mandatory"):
                 reasoning_effort = str(reasoning_metadata.get("default_effort") or "medium")
@@ -397,13 +531,15 @@ class OpenRouterTransport:
         payload = self._request(OPENROUTER_CHAT_URL, body)
         try:
             choice = payload["choices"][0]
-            content = choice["message"]["content"]
+            content = (choice.get("message") or {}).get("content")
             usage = payload.get("usage") or {}
             billed_cost = float(usage.get("cost") or 0)
             if content is None or not str(content).strip() or choice.get("finish_reason") == "length":
                 if choice.get("finish_reason") == "length":
                     error = ProviderError("OpenRouter reached the response limit before finishing.")
                     error.code = "PROVIDER_TRUNCATED"
+                    expanded = self._bounded_output_tokens(model, messages, 131072, reasoning_effort)
+                    error.retry_with_more_tokens = expanded > max_tokens
                 else:
                     error = ProviderError("OpenRouter returned an empty completion for this model configuration.")
                     error.code = "PROVIDER_EMPTY"
@@ -420,7 +556,8 @@ class OpenRouterTransport:
                 latency_ms=round((time.monotonic() - started) * 1000),
             )
         except (KeyError, IndexError, TypeError, ValueError) as error:
-            raise ProviderError("OpenRouter returned an invalid completion payload.") from error
+            detail = _safe_provider_error_detail(json.dumps(payload, ensure_ascii=False))
+            raise ProviderError(f"OpenRouter returned an invalid completion payload: {detail}") from error
 
     @staticmethod
     def _split_configuration(configuration: str) -> tuple[str, str]:
@@ -435,19 +572,40 @@ class OpenRouterTransport:
 
     @staticmethod
     def _reasoning_token_ceiling(requested_tokens: int, effort: str) -> int:
-        # OpenRouter counts hidden reasoning inside the completion allowance. The
-        # visible answer may be tiny while a reasoning model uses tens of thousands
-        # of completion tokens before emitting it.
+        # OpenRouter counts hidden reasoning inside the completion allowance.  The
+        # visible answer may be a two-field JSON object while a reasoning model still
+        # consumes tens of thousands of tokens before emitting it.  Keep these
+        # defaults deliberately generous so a paid evaluation is not thrown away by
+        # an allowance tuned to visible output length.
         minimums = {
-            "none": 8192,
-            "minimal": 8192,
-            "low": 16384,
-            "medium": 32768,
-            "high": 65536,
+            "none": 32768,
+            "minimal": 32768,
+            "low": 65536,
+            "medium": 98304,
+            "high": 131072,
             "xhigh": 131072,
             "max": 131072,
         }
         return max(1, int(requested_tokens), minimums.get(effort, 0))
+
+    def _bounded_output_tokens(
+        self,
+        model: str,
+        messages: list[dict[str, str]],
+        requested_tokens: int,
+        effort: str,
+    ) -> int:
+        desired = self._reasoning_token_ceiling(requested_tokens, effort)
+        context_limit, completion_limit = self._limits.get(model, (None, None))
+        # Use a conservative character/token ratio and reserve framing overhead so
+        # Evalt never asks for a full context window on top of a non-empty prompt.
+        estimated_prompt_tokens = max(1, math.ceil(len(json.dumps(messages)) / 3) + 128)
+        limits = [desired]
+        if completion_limit:
+            limits.append(max(1, completion_limit))
+        if context_limit:
+            limits.append(max(1, context_limit - estimated_prompt_tokens))
+        return max(1, min(limits))
 
 
 class _Budget:
@@ -522,8 +680,9 @@ class Client:
         response_schema: dict[str, Any] | None = None,
     ) -> Completion:
         for output_expansion_attempt in range(2):
-            # 600 -> 1,200 mapped to the same reasoning floor. A retry must request
-            # genuinely more completion headroom to be useful.
+            # A simple 2x retry was ineffective for reasoning models: 600 -> 1,200
+            # was mapped to the same reasoning floor on both attempts.  A truncation
+            # retry now requests a genuinely larger provider ceiling.
             attempt_max_tokens = (
                 int(max_tokens)
                 if output_expansion_attempt == 0
@@ -546,7 +705,7 @@ class Client:
                     budget.release(estimate)
                 if output_expansion_attempt == 0 and getattr(error, "code", "") in {
                     "PROVIDER_EMPTY", "PROVIDER_TRUNCATED",
-                }:
+                } and getattr(error, "retry_with_more_tokens", True):
                     continue
                 raise
             except Exception:
@@ -605,6 +764,8 @@ class Client:
         evaluator: dict[str, Any] | None = None,
         max_parallel_models: int = 16,
         max_parallel_scenarios: int = 32,
+        max_p90_latency_seconds: float | None = None,
+        latency_value_usd_per_second: float = 0.0,
         progress_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> OptimizationResult:
         optimization_started = time.monotonic()
@@ -637,7 +798,17 @@ class Client:
             raise ValueError("max_parallel_models must be between one and thirty-two.")
         if not 1 <= int(max_parallel_scenarios) <= 128:
             raise ValueError("max_parallel_scenarios must be between one and one hundred twenty-eight.")
+        if max_p90_latency_seconds is not None and max_p90_latency_seconds <= 0:
+            raise ValueError("max_p90_latency_seconds must be positive when provided.")
+        if latency_value_usd_per_second < 0:
+            raise ValueError("latency_value_usd_per_second cannot be negative.")
         evaluator_policy = _validate_evaluator_policy(evaluator)
+        performance_setter = getattr(self.transport, "set_performance_policy", None)
+        if callable(performance_setter):
+            performance_setter(
+                preferred_max_latency_seconds=max_p90_latency_seconds,
+                provider_sort="latency" if latency_value_usd_per_second > 0 else "price",
+            )
         objective = {
             "lowest_cost_at_accuracy": "cheapest_at_accuracy",
             "best_within_price": "best_within_cost",
@@ -649,6 +820,7 @@ class Client:
         incomplete_models = []
         skipped_budget_models = []
         pruned_models = []
+        omitted_configurations = []
         progress_lock = threading.Lock()
 
         def emit_progress(event: dict[str, Any]) -> None:
@@ -659,6 +831,38 @@ class Client:
             # not need their own synchronization.
             with progress_lock:
                 progress_callback(dict(event))
+
+        catalog_loader = getattr(self.transport, "model_catalog", None)
+        if callable(catalog_loader) and model_list:
+            catalog_loader()
+        support_checker = getattr(self.transport, "configuration_support", None)
+        if callable(support_checker):
+            eligible_models: list[str] = []
+            for configuration in model_list:
+                support = support_checker(configuration)
+                if support.get("supported"):
+                    eligible_models.append(configuration)
+                    continue
+                omitted_configurations.append({
+                    "model": configuration,
+                    "reason": str(support.get("reason") or "Unsupported by current provider capability metadata."),
+                    "stage": "preflight",
+                })
+                emit_progress({
+                    "event": "configuration_omitted",
+                    "model": configuration,
+                    "reason": omitted_configurations[-1]["reason"],
+                    "elapsed_seconds": round(time.monotonic() - optimization_started, 3),
+                })
+            model_list = eligible_models
+        if not model_list:
+            reasons = "; ".join(
+                f"{item['model']}: {item['reason']}" for item in omitted_configurations
+            )
+            raise ProviderError(
+                "No requested configuration is compatible with current provider capability metadata. "
+                + reasons
+            )
 
         broad_models: list[str] = []
         if adaptive_search:
@@ -686,10 +890,6 @@ class Client:
                 int(max_parallel_scenarios),
             )
 
-        catalog_loader = getattr(self.transport, "model_catalog", None)
-        if callable(catalog_loader) and len(model_list) > 1:
-            catalog_loader()
-
         def run_batch(configurations: list[str]) -> list[ModelResult]:
             if not configurations:
                 return []
@@ -703,6 +903,8 @@ class Client:
                             "event": "model_completed", "model": model,
                             "final_test_pass_rate": item.holdout_pass_rate,
                             "passed_quality_floor": item.passed_quality_floor,
+                            "target_latency_p50_ms": item.target_latency_p50_ms,
+                            "target_latency_p90_ms": item.target_latency_p90_ms,
                             "optimization_spend_usd": item.optimization_spend_usd,
                             "elapsed_seconds": round(time.monotonic() - optimization_started, 3),
                         })
@@ -727,6 +929,8 @@ class Client:
                             "event": "model_completed", "model": model,
                             "final_test_pass_rate": item.holdout_pass_rate,
                             "passed_quality_floor": item.passed_quality_floor,
+                            "target_latency_p50_ms": item.target_latency_p50_ms,
+                            "target_latency_p90_ms": item.target_latency_p90_ms,
                             "optimization_spend_usd": item.optimization_spend_usd,
                             "elapsed_seconds": round(time.monotonic() - optimization_started, 3),
                         })
@@ -817,10 +1021,29 @@ class Client:
             if max_cost_per_run_usd is None
             or item.estimated_production_cost_per_call_usd <= max_cost_per_run_usd + 1e-12
         ]
-        constrained = [item for item in passing if item in within_cost]
+        within_latency = [
+            item for item in results
+            if max_p90_latency_seconds is None
+            or item.target_latency_p90_ms <= max_p90_latency_seconds * 1000
+        ]
+        for item in results:
+            item.passed_latency_ceiling = item in within_latency
+        eligible_results = within_latency if max_p90_latency_seconds is not None and within_latency else results
+        constrained = [
+            item for item in passing
+            if item in within_cost and item in within_latency
+        ]
+        def effective_cost(item: ModelResult) -> float:
+            return (
+                item.estimated_cost_per_successful_call_usd
+                + latency_value_usd_per_second * item.target_latency_p90_ms / 1000
+            )
         baseline = next((item for item in results if item.model == incumbent_model), results[0])
         required_baseline_quality = max(0.0, baseline.baseline_holdout_pass_rate - allowed_accuracy_regression)
-        matched_baseline = [item for item in within_cost if item.holdout_pass_rate >= required_baseline_quality]
+        matched_baseline = [
+            item for item in within_cost
+            if item in within_latency and item.holdout_pass_rate >= required_baseline_quality
+        ]
         if objective == "match_baseline_at_lowest_cost" and matched_baseline:
             winner = min(
                 matched_baseline,
@@ -834,25 +1057,25 @@ class Client:
             winner = min(
                 constrained,
                 key=lambda item: (
-                    item.estimated_cost_per_successful_call_usd,
+                    effective_cost(item),
                     -item.holdout_pass_rate,
                     item.model,
                 ),
             )
-        elif objective == "best_within_cost" and within_cost:
+        elif objective == "best_within_cost" and [item for item in within_cost if item in within_latency]:
             winner = max(
-                within_cost,
+                [item for item in within_cost if item in within_latency],
                 key=lambda item: (
                     item.holdout_pass_rate,
-                    -item.estimated_cost_per_successful_call_usd,
+                    -effective_cost(item),
                 ),
             )
         else:
             winner = max(
-                results,
+                eligible_results,
                 key=lambda item: (
                     item.holdout_pass_rate,
-                    -item.estimated_cost_per_successful_call_usd,
+                    -effective_cost(item),
                 ),
             )
         warnings = []
@@ -864,6 +1087,10 @@ class Client:
             warnings.append("No prompt/model pair cleared the requested quality threshold.")
         if max_cost_per_run_usd is not None and not within_cost:
             warnings.append("No tested configuration fit the requested production cost ceiling.")
+        if max_p90_latency_seconds is not None and not [
+            item for item in passing if item in within_latency
+        ]:
+            warnings.append("No passing configuration fit the requested measured p90 latency ceiling.")
         if objective == "constrained" and not constrained:
             warnings.append("No tested configuration satisfied both production cost and accuracy constraints.")
         if objective == "match_baseline_at_lowest_cost" and not matched_baseline:
@@ -877,6 +1104,10 @@ class Client:
         if pruned_models:
             warnings.append(
                 f"Adaptive search pruned {len(pruned_models)} reasoning configuration(s) outside the observed task-capability band."
+            )
+        if omitted_configurations:
+            warnings.append(
+                f"Preflight omitted {len(omitted_configurations)} known-incompatible configuration(s) before any target call."
             )
         frontier, diminishing = _quality_frontier(
             results, float(minimum_meaningful_quality_gain)
@@ -897,6 +1128,8 @@ class Client:
             "incumbent_baseline_holdout_pass_rate": baseline.baseline_holdout_pass_rate,
             "allowed_accuracy_regression": allowed_accuracy_regression,
             "max_cost_per_run_usd": max_cost_per_run_usd,
+            "max_p90_latency_seconds": max_p90_latency_seconds,
+            "latency_value_usd_per_second": latency_value_usd_per_second,
             "representative_input_chars": representative_input_chars,
             "representative_output_tokens": representative_output_tokens,
             "holdout_repeats": int(holdout_repeats),
@@ -946,11 +1179,12 @@ class Client:
             regression_suite=suite_payload,
             elapsed_seconds=round(time.monotonic() - optimization_started, 3),
             comparison_integrity=comparison_integrity,
+            omitted_configurations=omitted_configurations,
             unavailable_models=unavailable_models,
             incomplete_models=incomplete_models,
             skipped_budget_models=skipped_budget_models,
             pruned_models=pruned_models,
-            winner_scope="Best among the completed adaptive search band" if pruned_models else "Best among fully completed targets only" if incomplete_models or skipped_budget_models or unavailable_models else "Best among every requested target",
+            winner_scope="Best among the completed adaptive search band" if pruned_models else "Best among fully completed eligible targets only" if incomplete_models or skipped_budget_models or unavailable_models else "Best among every capability-eligible requested target" if omitted_configurations else "Best among every requested target",
         )
 
     @staticmethod
@@ -1089,8 +1323,27 @@ class Client:
         typical_input = representative_input_chars or _percentile(observed_inputs, 0.90)
         typical_output_tokens = representative_output_tokens or max(32, int(_percentile(observed_outputs, 0.90) / 3) + 1)
         production_messages = [{"role": "system", "content": selected_prompt}] + _few_shot_messages(train, selected_few_shot_ids) + [{"role": "user", "content": "x" * int(typical_input)}]
-        production_cost = self.transport.estimate_cost(model, production_messages, max_tokens=int(typical_output_tokens))
+        # A completion allowance is a safety ceiling, not an expected bill. Price
+        # the promoted route from the measured 90th-percentile successful final-test
+        # call so generous first-request headroom does not make a tiny JSON response
+        # look as if it always consumes the full context window.
+        measured_target_costs = sorted(
+            result.target_cost_usd for result in selected_holdout
+            if result.target_cost_usd > 0
+        )
+        if measured_target_costs:
+            production_cost = measured_target_costs[
+                max(0, min(len(measured_target_costs) - 1, math.ceil(len(measured_target_costs) * 0.90) - 1))
+            ]
+        else:
+            production_cost = self.transport.estimate_cost(model, production_messages, max_tokens=int(typical_output_tokens))
         cost_per_success = production_cost / max(holdout_rate, 0.01)
+        measured_target_latencies = sorted(
+            result.target_latency_ms for result in selected_holdout
+            if result.target_latency_ms > 0
+        )
+        latency_p50 = _percentile(measured_target_latencies, 0.50) if measured_target_latencies else 0
+        latency_p90 = _percentile(measured_target_latencies, 0.90) if measured_target_latencies else 0
         all_cases = baseline_train + baseline_dev + candidate_cases + baseline_holdout
         if selected_holdout is not baseline_holdout:
             all_cases += selected_holdout
@@ -1105,6 +1358,8 @@ class Client:
             estimated_cost_per_successful_call_usd=round(cost_per_success, 10),
             optimization_spend_usd=round(budget.spent_usd - started_spend, 10),
             passed_quality_floor=holdout_rate >= threshold,
+            target_latency_p50_ms=round(latency_p50),
+            target_latency_p90_ms=round(latency_p90),
             holdout_unique_scenarios=len(holdout),
             holdout_executions=len(selected_holdout),
             holdout_execution_pass_rate=round(holdout_execution_rate, 6),
@@ -1151,6 +1406,8 @@ class Client:
                         evaluator_cost_usd=judge_completion.cost_usd,
                         target_generation_id=target.generation_id,
                         evaluator_generation_id=judge_completion.generation_id,
+                        target_latency_ms=target.latency_ms,
+                        evaluator_latency_ms=judge_completion.latency_ms,
                     )
                 )
             return scenario_results
