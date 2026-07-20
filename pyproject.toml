@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "evalt"
+version = "0.8.8"
+description = "A durable LLM router that finds the most accurate configuration at your price."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Jonathan Larson" }]
+maintainers = [{ name = "Jonathan Larson" }]
+keywords = ["llm", "prompt-engineering", "evaluation", "model-routing", "ci"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Software Development :: Testing",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://evalt.dev"
+Documentation = "https://evalt.dev/#sdk"
+Repository = "https://github.com/JarJarBeatyourattitude/evalt"
+Issues = "https://github.com/JarJarBeatyourattitude/evalt/issues"
+Changelog = "https://github.com/JarJarBeatyourattitude/evalt/releases"
+
+[project.scripts]
+evalt = "evalt.cli:main"
+modelsieve = "modelsieve.cli:main"
+lgp = "last_good_prompt.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+evalt = ["py.typed"]

@@ -1,0 +1,10 @@
+{
+  "winner": {
+    "model": "synthetic/target-mini",
+    "selected_prompt": "Return the approved support route label only.",
+    "holdout_pass_rate": 1.0,
+    "estimated_cost_per_successful_call_usd": 0.001
+  },
+  "winner_scope": "Best among every requested target in this synthetic example",
+  "coverage_complete": true
+}
