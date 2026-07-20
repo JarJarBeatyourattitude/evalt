@@ -17,12 +17,23 @@ change makes retesting worthwhile.
 python -m pip install evalt
 ```
 
+Migrating from OpenAI Evals result JSONL? Evalt can recover only the reviewable
+input/reference pairs, offline, and reports everything it cannot honestly reconstruct:
+
+```bash
+evalt import-openai-results results.jsonl --prompt-file system-prompt.txt --output evalt.json
+```
+
+Read the [OpenAI Evals migration guide](https://github.com/JarJarBeatyourattitude/evalt/blob/main/docs/openai-evals-migration.md)
+before running an imported suite. Historical candidate outputs are never treated as
+approved answers.
+
 For an offline or pinned artifact install, use the verified versioned wheel from this
 repository checkout:
 
 ```bash
 python -m venv .venv
-python -m pip install dist/evalt-0.8.8-py3-none-any.whl
+python -m pip install dist/evalt-0.8.9-py3-none-any.whl
 evalt --version
 ```
 

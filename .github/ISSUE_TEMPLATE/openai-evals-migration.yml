@@ -1,0 +1,48 @@
+name: OpenAI Evals migration gap
+description: Report a redacted, recurring migration problem the offline importer cannot represent.
+title: "[OpenAI Evals migration] "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping improve the open-source importer. Do not paste prompts, API keys, customer data, request IDs, or raw production rows. Use a synthetic shape if an example is necessary.
+  - type: dropdown
+    id: gap
+    attributes:
+      label: What is missing?
+      options:
+        - My JSONL has inputs but no explicit approved/reference outputs
+        - My runnable eval definition is separate from the result export
+        - My export uses a supported concept in a different JSON shape
+        - I need multi-turn or tool-call cases represented
+        - Other
+    validations:
+      required: true
+  - type: checkboxes
+    id: recurring
+    attributes:
+      label: Workflow
+      options:
+        - label: This is part of a recurring prompt or model evaluation workflow, not a one-off answer.
+          required: true
+  - type: input
+    id: project
+    attributes:
+      label: Public team or project link
+      description: Optional for support. Required only if you want this report counted in the public qualified-team measurement.
+      placeholder: https://github.com/example/project
+  - type: textarea
+    id: outcome
+    attributes:
+      label: What should a safe migration produce?
+      description: Describe the desired structure using redacted or synthetic details.
+    validations:
+      required: true
+  - type: checkboxes
+    id: consent
+    attributes:
+      label: Consent
+      options:
+        - label: Evalt may use this public, redacted report to improve migration support.
+          required: true

@@ -8,6 +8,7 @@ from pathlib import Path
 import sys
 
 from .core import BudgetExceeded, Evalt, OpenRouterTransport, ProviderError, Suite, check_result
+from .migration import migrate_openai_results
 
 
 STARTER_SUITE = {
@@ -47,7 +48,7 @@ def parser() -> argparse.ArgumentParser:
         prog="evalt",
         description="Run prompts through a durable, tested, budget-bounded model route.",
     )
-    root.add_argument("--version", action="version", version="evalt 0.8.8")
+    root.add_argument("--version", action="version", version="evalt 0.8.9")
     commands = root.add_subparsers(dest="command", required=True)
 
     init = commands.add_parser("init", help="Write a reviewable starter suite; no provider call.")
@@ -56,6 +57,21 @@ def parser() -> argparse.ArgumentParser:
 
     validate = commands.add_parser("validate", help="Validate a suite offline; no API key or spend.")
     validate.add_argument("suite")
+
+    migrate = commands.add_parser(
+        "import-openai-results",
+        help="Recover reviewable cases from OpenAI Evals result JSONL; offline and conservative.",
+    )
+    migrate.add_argument("results", help="OpenAI Evals result JSONL export.")
+    prompt_source = migrate.add_mutually_exclusive_group(required=True)
+    prompt_source.add_argument("--prompt", help="The original task prompt.")
+    prompt_source.add_argument("--prompt-file", help="UTF-8 file containing the original task prompt.")
+    migrate.add_argument("--output", default="evalt.json", help="Output Evalt suite path.")
+    migrate.add_argument("--report", help="Migration report path; defaults beside --output.")
+    migrate.add_argument("--name", default="openai-evals-migration")
+    migrate.add_argument("--model", action="append", dest="models")
+    migrate.add_argument("--quality-threshold", type=float, default=0.95)
+    migrate.add_argument("--max-optimization-cost", type=float, default=2.0)
 
     draft = commands.add_parser("draft", help="Generate one bounded answer for approval or correction.")
     draft.add_argument("--task", required=True)
@@ -146,6 +162,50 @@ def main(argv: list[str] | None = None) -> int:
                 "quality_threshold": suite.quality_threshold,
                 "hard_provider_spend_cap_usd": suite.max_optimization_cost_usd,
                 "provider_call_started": False,
+            }, indent=2))
+            return 0
+        if args.command == "import-openai-results":
+            prompt = args.prompt
+            if args.prompt_file:
+                prompt = Path(args.prompt_file).read_text(encoding="utf-8")
+            output_path = Path(args.output)
+            report_path = Path(args.report) if args.report else output_path.with_suffix(
+                output_path.suffix + ".migration-report.json"
+            )
+            migrated = migrate_openai_results(
+                args.results,
+                prompt=prompt or "",
+                name=args.name,
+                models=args.models or STARTER_SUITE["models"],
+                quality_threshold=args.quality_threshold,
+                max_optimization_cost_usd=args.max_optimization_cost,
+            )
+            report_path.parent.mkdir(parents=True, exist_ok=True)
+            report_path.write_text(
+                json.dumps(migrated.report, indent=2, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+            if migrated.suite is None:
+                print(
+                    f"No runnable suite written: only {migrated.report['imported_rows']} rows had both "
+                    f"an input and explicit approved output. Review {report_path}.",
+                    file=sys.stderr,
+                )
+                return 2
+            Suite.from_dict(migrated.suite)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text(
+                json.dumps(migrated.suite, indent=2, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+            print(json.dumps({
+                "suite": str(output_path),
+                "report": str(report_path),
+                "imported_rows": migrated.report["imported_rows"],
+                "skipped_rows": migrated.report["skipped_rows"],
+                "malformed_rows": migrated.report["malformed_rows"],
+                "provider_call_started": False,
+                "next": f"Review approved outputs, then run: evalt validate {output_path}",
             }, indent=2))
             return 0
         if args.command == "draft":

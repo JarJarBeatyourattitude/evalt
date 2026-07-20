@@ -11,6 +11,7 @@ from unittest import mock
 from evalt import BudgetExceeded, Client, Evalt, ProviderError, Suite, check_result, select_role_plan
 from evalt.cli import STARTER_SUITE, main as cli_main
 from evalt.core import Completion, OpenRouterTransport, _safe_provider_error_detail
+from evalt.migration import migrate_openai_results
 from modelsieve import Client as ModelSieveClient
 from last_good_prompt import Client as LegacyClient
 
@@ -115,6 +116,57 @@ EXAMPLES = [
 
 
 class SdkTests(unittest.TestCase):
+    def test_openai_results_migration_is_offline_conservative_and_valid(self):
+        rows = [
+            {"id": "one", "input": "2 + 2", "ideal": "4", "output": "5"},
+            {"sample_id": "two", "sample": {"input": "3 + 3", "expected": "6"}},
+            {"messages": [{"role": "user", "content": "4 + 4"}], "ground_truth": "8"},
+            {"id": "candidate-only", "input": "5 + 5", "output": "10"},
+        ]
+        with TemporaryDirectory() as directory:
+            source = Path(directory) / "results.jsonl"
+            source.write_text("\n".join(json.dumps(row) for row in rows), encoding="utf-8")
+            result = migrate_openai_results(
+                source, prompt="Return only the number.", name="math", models=["cheap"],
+            )
+        self.assertIsNotNone(result.suite)
+        self.assertEqual(result.report["imported_rows"], 3)
+        self.assertEqual(result.report["skipped_rows"], 1)
+        self.assertTrue(result.report["skipped"][0]["candidate_output_ignored"])
+        self.assertEqual(result.suite["examples"][0]["approved_output"], "4")
+        Suite.from_dict(result.suite)
+
+    def test_openai_results_migration_refuses_to_invent_a_runnable_suite(self):
+        with TemporaryDirectory() as directory:
+            source = Path(directory) / "results.jsonl"
+            source.write_text(
+                json.dumps({"input": "hello", "output": "historical candidate answer"}),
+                encoding="utf-8",
+            )
+            result = migrate_openai_results(
+                source, prompt="Answer.", name="missing-labels", models=["cheap"],
+            )
+        self.assertIsNone(result.suite)
+        self.assertFalse(result.report["runnable_suite_created"])
+        self.assertRegex(result.report["important_limit"], "did not infer")
+
+    def test_openai_results_cli_writes_report_even_when_suite_is_not_runnable(self):
+        with TemporaryDirectory() as directory:
+            source = Path(directory) / "results.jsonl"
+            output = Path(directory) / "evalt.json"
+            source.write_text(json.dumps({"input": "hello", "response": "candidate"}), encoding="utf-8")
+            stderr = StringIO()
+            with redirect_stderr(stderr):
+                code = cli_main([
+                    "import-openai-results", str(source), "--prompt", "Answer.",
+                    "--output", str(output),
+                ])
+            report = Path(str(output) + ".migration-report.json")
+            self.assertEqual(code, 2)
+            self.assertFalse(output.exists())
+            self.assertTrue(report.exists())
+            self.assertIn("No runnable suite written", stderr.getvalue())
+
     def test_default_model_lanes_overlap_while_preserving_requested_result_order(self):
         class ParallelTransport(FakeTransport):
             def __init__(self):
