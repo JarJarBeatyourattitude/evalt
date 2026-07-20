@@ -17,10 +17,6 @@ change makes retesting worthwhile.
 pip install evalt
 ```
 
-If importing fails afterward, `pip` may belong to a different Python. Install with
-`python3 -m pip install evalt` when you run with `python3`, or use `py -m pip install
-evalt` on Windows.
-
 Migrating from OpenAI Evals result JSONL? Evalt can recover only the reviewable
 input/reference pairs, offline, and reports everything it cannot honestly reconstruct:
 
@@ -36,7 +32,7 @@ repository checkout:
 
 ```bash
 python -m venv .venv
-python -m pip install dist/evalt-0.8.15-py3-none-any.whl
+python -m pip install dist/evalt-0.8.16-py3-none-any.whl
 evalt --version
 ```
 
@@ -73,9 +69,8 @@ else:
 print(evalt.route_status("support-routing"))
 ```
 
-`Evalt()` reads `OPENROUTER_API_KEY` from the current process. A `.env` file is not
-loaded automatically. On macOS/Linux, run `set -a; source .env; set +a` before the
-Python command; on PowerShell, set `$env:OPENROUTER_API_KEY` in that terminal.
+`Evalt()` reads `OPENROUTER_API_KEY` automatically from the process environment or a
+`.env` file in the current working directory. An explicit `api_key=` takes precedence.
 
 Use one stable route name per production task. A single `Evalt` instance can manage any
 number of independent routes; each route keeps its own prompt, approved or corrected

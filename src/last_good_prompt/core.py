@@ -9,12 +9,15 @@ import hashlib
 import json
 import math
 import os
+from pathlib import Path
 import statistics
 import threading
 import time
 from typing import Any, Callable, Iterable, Protocol
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
+
+from dotenv import load_dotenv
 
 
 OPENROUTER_CHAT_URL = "https://openrouter.ai/api/v1/chat/completions"
@@ -200,12 +203,15 @@ class OpenRouterTransport:
         catalog_ttl_seconds: float = 3600,
         opener: Callable[..., Any] = urlopen,
     ) -> None:
+        if not api_key and not os.environ.get("OPENROUTER_API_KEY"):
+            dotenv_path = Path.cwd() / ".env"
+            if dotenv_path.is_file():
+                load_dotenv(dotenv_path=dotenv_path, override=False)
         self._api_key = api_key or os.environ.get("OPENROUTER_API_KEY", "")
         if not self._api_key:
             raise ValueError(
-                "OPENROUTER_API_KEY is not visible to this Python process. Export it before "
-                "running Evalt. A .env file is not loaded automatically; on macOS/Linux run "
-                "'set -a; source .env; set +a' before 'python3 your_script.py'."
+                "Set OPENROUTER_API_KEY in the environment or in a .env file in the current "
+                "working directory, or pass api_key= to Evalt()."
             )
         self.set_timeout_seconds(timeout_seconds)
         self._app_url = app_url

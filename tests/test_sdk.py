@@ -141,10 +141,25 @@ class SdkTests(unittest.TestCase):
         example = Path(__file__).resolve().parents[1] / "examples" / "quickstart.py"
         compile(example.read_text(encoding="utf-8"), str(example), "exec")
 
-    def test_missing_openrouter_key_explains_dotenv_and_same_process_requirement(self):
-        with mock.patch.dict(os.environ, {}, clear=True):
-            with self.assertRaisesRegex(ValueError, r"\.env file is not loaded automatically"):
-                Evalt()
+    def test_evalt_loads_openrouter_key_from_local_dotenv(self):
+        with TemporaryDirectory() as directory:
+            Path(directory, ".env").write_text("OPENROUTER_API_KEY=from-dotenv\n", encoding="utf-8")
+            with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(Path, "cwd", return_value=Path(directory)):
+                evalt = Evalt()
+                self.assertEqual(evalt.client.transport._api_key, "from-dotenv")
+
+    def test_process_environment_wins_over_local_dotenv(self):
+        with TemporaryDirectory() as directory:
+            Path(directory, ".env").write_text("OPENROUTER_API_KEY=from-dotenv\n", encoding="utf-8")
+            with mock.patch.dict(os.environ, {"OPENROUTER_API_KEY": "from-process"}, clear=True), mock.patch.object(Path, "cwd", return_value=Path(directory)):
+                evalt = Evalt()
+                self.assertEqual(evalt.client.transport._api_key, "from-process")
+
+    def test_missing_openrouter_key_names_all_supported_sources(self):
+        with TemporaryDirectory() as directory:
+            with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(Path, "cwd", return_value=Path(directory)):
+                with self.assertRaisesRegex(ValueError, r"environment or in a \.env file"):
+                    Evalt()
 
     def test_openai_results_migration_is_offline_conservative_and_valid(self):
         rows = [

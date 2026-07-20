@@ -1,7 +1,6 @@
 """Minimal Evalt production-route example.
 
-Before running, export OPENROUTER_API_KEY in this terminal. A .env file is not
-loaded automatically.
+Evalt reads OPENROUTER_API_KEY from the environment or a local .env file.
 """
 
 from evalt import Evalt
