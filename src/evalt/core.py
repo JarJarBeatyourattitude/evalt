@@ -243,6 +243,7 @@ class Evalt:
         max_test_budget_usd: float = 1.00,
         target_accuracy: float = 0.95,
         objective: str = "lowest_cost_at_accuracy",
+        max_latency_seconds: float | None = None,
         max_p90_latency_seconds: float | None = None,
         latency_value_usd_per_second: float = 0.0,
         models: Iterable[str] | None = None,
@@ -287,8 +288,17 @@ class Evalt:
             if target_accuracy != 0.95 and float(target_accuracy) != float(quality_threshold):
                 raise ValueError("Use target_accuracy; quality_threshold is only a backward-compatible alias.")
             target_accuracy = float(quality_threshold)
+        if max_latency_seconds is not None:
+            if (
+                max_p90_latency_seconds is not None
+                and float(max_latency_seconds) != float(max_p90_latency_seconds)
+            ):
+                raise ValueError(
+                    "Use max_latency_seconds or max_p90_latency_seconds, not conflicting values."
+                )
+            max_p90_latency_seconds = float(max_latency_seconds)
         if max_p90_latency_seconds is not None and max_p90_latency_seconds <= 0:
-            raise ValueError("max_p90_latency_seconds must be positive when provided.")
+            raise ValueError("max_latency_seconds must be positive when provided.")
         if latency_value_usd_per_second < 0:
             raise ValueError("latency_value_usd_per_second cannot be negative.")
         if maintenance_budget_usd is not None:

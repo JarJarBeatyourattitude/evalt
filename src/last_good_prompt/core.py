@@ -202,7 +202,11 @@ class OpenRouterTransport:
     ) -> None:
         self._api_key = api_key or os.environ.get("OPENROUTER_API_KEY", "")
         if not self._api_key:
-            raise ValueError("OPENROUTER_API_KEY is required for live optimization.")
+            raise ValueError(
+                "OPENROUTER_API_KEY is not visible to this Python process. Export it before "
+                "running Evalt. A .env file is not loaded automatically; on macOS/Linux run "
+                "'set -a; source .env; set +a' before 'python3 your_script.py'."
+            )
         self.set_timeout_seconds(timeout_seconds)
         self._app_url = app_url
         self._opener = opener

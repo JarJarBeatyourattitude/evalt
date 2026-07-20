@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "evalt"
-version = "0.8.14"
+version = "0.8.15"
 description = "A durable LLM router that finds the most accurate configuration at your price."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -30,7 +30,7 @@ dependencies = []
 
 [project.urls]
 Homepage = "https://evalt.dev"
-Documentation = "https://evalt.dev/#sdk"
+Documentation = "https://evalt.dev/docs/"
 Repository = "https://github.com/JarJarBeatyourattitude/evalt"
 Issues = "https://github.com/JarJarBeatyourattitude/evalt/issues"
 Changelog = "https://github.com/JarJarBeatyourattitude/evalt/releases"

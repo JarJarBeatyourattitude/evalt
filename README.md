@@ -14,8 +14,12 @@ change makes retesting worthwhile.
 ## Install
 
 ```bash
-python -m pip install evalt
+pip install evalt
 ```
+
+If importing fails afterward, `pip` may belong to a different Python. Install with
+`python3 -m pip install evalt` when you run with `python3`, or use `py -m pip install
+evalt` on Windows.
 
 Migrating from OpenAI Evals result JSONL? Evalt can recover only the reviewable
 input/reference pairs, offline, and reports everything it cannot honestly reconstruct:
@@ -32,7 +36,7 @@ repository checkout:
 
 ```bash
 python -m venv .venv
-python -m pip install dist/evalt-0.8.14-py3-none-any.whl
+python -m pip install dist/evalt-0.8.15-py3-none-any.whl
 evalt --version
 ```
 
@@ -51,20 +55,27 @@ package never creates a platform charge.
 ```python
 from evalt import Evalt
 
-evalt = Evalt(api_key=OPENROUTER_API_KEY)
+ticket = "Please help—the website won't load."
+expected = "technical"
+evalt = Evalt()
 answer = evalt.run(
-    "Classify this support request as billing, account, or technical.",
+    "Classify this request. Return exactly one lowercase label: billing, account, or technical.",
     ticket,
     route="support-routing",
     test_budget_usd="auto",
-    max_p90_latency_seconds=3.0,       # optional hard tail-latency contract
-    latency_value_usd_per_second=0.0,  # optional softer cost/speed tradeoff
 )
 
-send(answer.content)
-answer.accept()                 # or answer.correct("billing")
+print(answer.content)
+if answer.content.strip().lower() == expected:
+    answer.accept()
+else:
+    answer.correct(expected)
 print(evalt.route_status("support-routing"))
 ```
+
+`Evalt()` reads `OPENROUTER_API_KEY` from the current process. A `.env` file is not
+loaded automatically. On macOS/Linux, run `set -a; source .env; set +a` before the
+Python command; on PowerShell, set `$env:OPENROUTER_API_KEY` in that terminal.
 
 Use one stable route name per production task. A single `Evalt` instance can manage any
 number of independent routes; each route keeps its own prompt, approved or corrected
@@ -123,11 +134,11 @@ approved final-test scenario passed on every configured repeat; it is not a guar
 about every future input. Reports show distinct scenario count and execution count
 separately.
 
-Speed is durable route state, not a one-time benchmark option. Set
-`max_p90_latency_seconds` to require a measured tail-latency ceiling, or use the advanced
-`latency_value_usd_per_second` value-of-time term. Evalt reports measured p50 and p90 for
-every completed route, persists both controls in SQLite, and refuses to promote a later
-maintenance winner that misses the route's latency ceiling. OpenRouter's provider
+Speed is durable route state, not a one-time benchmark option. There is no latency
+ceiling by default. Set
+`max_latency_seconds=3.0` when a route needs a ceiling. Evalt reports measured p50 and
+p90 for every completed route, persists the limit in SQLite, and refuses to promote a
+later maintenance winner whose measured p90 misses it. OpenRouter's provider
 price/latency/throughput preferences help search, but cannot replace those frozen-run measurements. The default deadline
 is 600 seconds per response, and complex or long-context suites can raise it explicitly
 up to 7200 seconds with `request_timeout_seconds` in the suite, with

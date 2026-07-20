@@ -1,4 +1,5 @@
 import json
+import os
 from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from pathlib import Path
@@ -136,6 +137,15 @@ EXAMPLES = [
 
 
 class SdkTests(unittest.TestCase):
+    def test_checked_in_quickstart_is_syntactically_runnable(self):
+        example = Path(__file__).resolve().parents[1] / "examples" / "quickstart.py"
+        compile(example.read_text(encoding="utf-8"), str(example), "exec")
+
+    def test_missing_openrouter_key_explains_dotenv_and_same_process_requirement(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with self.assertRaisesRegex(ValueError, r"\.env file is not loaded automatically"):
+                Evalt()
+
     def test_openai_results_migration_is_offline_conservative_and_valid(self):
         rows = [
             {"id": "one", "input": "2 + 2", "ideal": "4", "output": "5"},
@@ -427,6 +437,7 @@ class SdkTests(unittest.TestCase):
             status = evalt.route_status("default")
             self.assertEqual(status["objective"], "lowest_cost_at_accuracy")
             self.assertEqual(status["target_accuracy"], 0.95)
+            self.assertIsNone(status["max_p90_latency_seconds"])
 
     def test_primary_run_is_a_durable_budget_bounded_router_not_a_json_export(self):
         with TemporaryDirectory() as directory:
@@ -499,6 +510,28 @@ class SdkTests(unittest.TestCase):
                 if item["event_type"] == "routing_policy_configured"
             ]
             self.assertEqual(policy_events[-1]["detail"]["max_p90_latency_seconds"], 2.5)
+
+    def test_simple_latency_alias_persists_a_conservative_p90_ceiling(self):
+        with TemporaryDirectory() as directory:
+            transport = PolicyTransport()
+            evalt = Evalt(transport=transport, state_path=Path(directory) / "evalt.db")
+            evalt.run(
+                "Return one label.", "hello", route="simple-speed-ceiling",
+                price_usd=0.01, models=["cheap"], auto_maintain=False,
+                max_latency_seconds=3.0,
+            )
+            status = evalt.route_status("simple-speed-ceiling")
+            self.assertEqual(status["max_p90_latency_seconds"], 3.0)
+            self.assertEqual(transport.performance_policies[-1], (3.0, "price"))
+
+    def test_simple_and_advanced_latency_names_cannot_conflict(self):
+        with TemporaryDirectory() as directory:
+            evalt = Evalt(transport=FakeTransport(), state_path=Path(directory) / "evalt.db")
+            with self.assertRaisesRegex(ValueError, "not conflicting values"):
+                evalt.run(
+                    "Return one label.", "hello", models=["cheap"], auto_maintain=False,
+                    max_latency_seconds=3.0, max_p90_latency_seconds=2.0,
+                )
 
     def test_durable_maintenance_never_promotes_a_route_that_misses_latency_ceiling(self):
         with TemporaryDirectory() as directory:
