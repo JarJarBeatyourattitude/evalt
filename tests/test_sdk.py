@@ -528,6 +528,32 @@ class SdkTests(unittest.TestCase):
         self.assertFalse(check_result(result.to_dict(), min_pass_rate=0.9).passed)
         self.assertIn("exploratory", check_result(result.to_dict(), min_pass_rate=0.9).failures[0])
 
+    def test_suite_persists_a_long_configurable_provider_deadline(self):
+        suite = Suite.from_dict({
+            "name": "long-context-routing",
+            "prompt": "Return the approved route label only.",
+            "examples": EXAMPLES,
+            "models": ["cheap"],
+            "request_timeout_seconds": 1200,
+        })
+        self.assertEqual(suite.request_timeout_seconds, 1200)
+        self.assertEqual(suite.to_dict()["request_timeout_seconds"], 1200)
+        with self.assertRaisesRegex(ValueError, "greater than zero"):
+            Suite.from_dict({
+                "prompt": "Return the approved route label only.",
+                "examples": EXAMPLES,
+                "models": ["cheap"],
+                "request_timeout_seconds": 0,
+            })
+
+    def test_transport_defaults_to_ten_minutes_and_allows_long_complex_jobs(self):
+        transport = OpenRouterTransport("sk-or-v1-test-key")
+        self.assertEqual(transport.timeout_seconds, 600)
+        transport.set_timeout_seconds(1800)
+        self.assertEqual(transport.timeout_seconds, 1800)
+        with self.assertRaisesRegex(ValueError, "greater than zero"):
+            transport.set_timeout_seconds(0)
+
     def test_result_gate_fails_quality_cost_and_partial_coverage_for_ci(self):
         report = check_result({
             "winner": {
@@ -559,6 +585,7 @@ class SdkTests(unittest.TestCase):
                 self.assertEqual(cli_main(["validate", str(suite_path)]), 0)
             self.assertIn("not production evidence", output.getvalue())
             self.assertIn('"exploratory": true', output.getvalue())
+            self.assertIn('"per_provider_request_timeout_seconds": 600', output.getvalue())
             result_path = Path(directory) / "result.json"
             result_path.write_text(json.dumps({
                 "winner": {"holdout_pass_rate": 1.0, "estimated_cost_per_successful_call_usd": 0.001},

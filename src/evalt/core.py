@@ -49,6 +49,7 @@ class Suite:
     holdout_repeats: int = 2
     max_parallel_models: int = 8
     max_parallel_scenarios: int = 16
+    request_timeout_seconds: float = 600
     minimum_meaningful_quality_gain: float = 0.03
     allow_few_shot: bool = True
     max_few_shot_examples: int = 3
@@ -78,6 +79,7 @@ class Suite:
                 holdout_repeats=int(value.get("holdout_repeats", 2)),
                 max_parallel_models=int(value.get("max_parallel_models", 8)),
                 max_parallel_scenarios=int(value.get("max_parallel_scenarios", 16)),
+                request_timeout_seconds=float(value.get("request_timeout_seconds", 600)),
                 minimum_meaningful_quality_gain=float(value.get("minimum_meaningful_quality_gain", 0.03)),
                 allow_few_shot=bool(value.get("allow_few_shot", True)),
                 max_few_shot_examples=int(value.get("max_few_shot_examples", 3)),
@@ -122,6 +124,8 @@ class Suite:
             raise ValueError("max_parallel_models must be between 1 and 16.")
         if not 1 <= self.max_parallel_scenarios <= 64:
             raise ValueError("max_parallel_scenarios must be between 1 and 64.")
+        if not 0 < self.request_timeout_seconds <= 7200:
+            raise ValueError("request_timeout_seconds must be greater than zero and no more than 7200 seconds.")
         _validate_evaluator_policy(dict(self.evaluator))
 
     def to_dict(self) -> dict[str, Any]:
@@ -141,6 +145,7 @@ class Suite:
             "holdout_repeats": self.holdout_repeats,
             "max_parallel_models": self.max_parallel_models,
             "max_parallel_scenarios": self.max_parallel_scenarios,
+            "request_timeout_seconds": self.request_timeout_seconds,
             "minimum_meaningful_quality_gain": self.minimum_meaningful_quality_gain,
             "allow_few_shot": self.allow_few_shot,
             "max_few_shot_examples": self.max_few_shot_examples,
@@ -191,8 +196,14 @@ class Evalt:
         *,
         transport: ChatTransport | None = None,
         state_path: str | Path = ".evalt/evalt.db",
+        request_timeout_seconds: float = 600,
     ) -> None:
-        self.client = Client(api_key=api_key, transport=transport)
+        if transport is not None and request_timeout_seconds != 600:
+            raise ValueError("request_timeout_seconds cannot be combined with a custom transport.")
+        resolved_transport = transport or OpenRouterTransport(
+            api_key=api_key, timeout_seconds=request_timeout_seconds
+        )
+        self.client = Client(api_key=api_key, transport=resolved_transport)
         self._state_path = Path(state_path)
         self._router: DurableRouter | None = None
 
@@ -227,6 +238,10 @@ class Evalt:
             if input is not None:
                 raise ValueError("input is not used when running an explicit Suite.")
             suite_or_prompt.validate()
+            if isinstance(self.client.transport, OpenRouterTransport):
+                self.client.transport.set_timeout_seconds(
+                    suite_or_prompt.request_timeout_seconds
+                )
             return self.client.optimize(**suite_or_prompt.optimize_kwargs())
         if input is None:
             raise ValueError("input is required when executing a prompt through Evalt.")

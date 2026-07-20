@@ -188,7 +188,7 @@ class OpenRouterTransport:
         self,
         api_key: str | None = None,
         *,
-        timeout_seconds: float = 90,
+        timeout_seconds: float = 600,
         app_url: str = "https://evalt.dev",
         catalog_ttl_seconds: float = 3600,
         opener: Callable[..., Any] = urlopen,
@@ -196,7 +196,7 @@ class OpenRouterTransport:
         self._api_key = api_key or os.environ.get("OPENROUTER_API_KEY", "")
         if not self._api_key:
             raise ValueError("OPENROUTER_API_KEY is required for live optimization.")
-        self._timeout = timeout_seconds
+        self.set_timeout_seconds(timeout_seconds)
         self._app_url = app_url
         self._opener = opener
         self._catalog_ttl_seconds = max(0.0, float(catalog_ttl_seconds))
@@ -205,6 +205,16 @@ class OpenRouterTransport:
         self._supported_parameters: dict[str, set[str]] = {}
         self._reasoning: dict[str, dict[str, Any]] = {}
         self._catalog_items: list[dict[str, Any]] = []
+
+    @property
+    def timeout_seconds(self) -> float:
+        return self._timeout
+
+    def set_timeout_seconds(self, value: float) -> None:
+        resolved = float(value)
+        if not 0 < resolved <= 7200:
+            raise ValueError("timeout_seconds must be greater than zero and no more than 7200 seconds.")
+        self._timeout = resolved
 
     def _request(self, url: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
         headers = {

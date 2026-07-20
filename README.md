@@ -33,7 +33,7 @@ repository checkout:
 
 ```bash
 python -m venv .venv
-python -m pip install dist/evalt-0.8.9-py3-none-any.whl
+python -m pip install dist/evalt-0.8.10-py3-none-any.whl
 evalt --version
 ```
 
@@ -107,6 +107,13 @@ held-out cases are repeated twice before promotion. A measured 100% means every 
 approved final-test scenario passed on every configured repeat; it is not a guarantee
 about every future input. Reports show distinct scenario count and execution count
 separately.
+
+Provider response time is not used as a hidden intelligence filter. The default deadline
+is 600 seconds per response, and complex or long-context suites can raise it explicitly
+up to 7200 seconds with `request_timeout_seconds` in the suite, with
+`Evalt(request_timeout_seconds=...)`, or with `evalt optimize --request-timeout ...`.
+The deadline protects against a genuinely hung provider request; the provider spend cap
+remains the economic stop condition.
 
 Model roles are selected separately:
 
@@ -198,6 +205,7 @@ and offline-validatable before spend.
   "rounds": 3,
   "max_parallel_models": 8,
   "max_parallel_scenarios": 16,
+  "request_timeout_seconds": 600,
   "allow_few_shot": true,
   "max_few_shot_examples": 3
 }

@@ -36,4 +36,4 @@ __all__ = [
     "select_role_plan",
 ]
 
-__version__ = "0.8.9"
+__version__ = "0.8.10"

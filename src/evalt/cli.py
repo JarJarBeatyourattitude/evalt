@@ -7,7 +7,7 @@ import json
 from pathlib import Path
 import sys
 
-from .core import BudgetExceeded, Evalt, OpenRouterTransport, ProviderError, Suite, check_result
+from .core import BudgetExceeded, Evalt, ProviderError, Suite, check_result
 from .migration import migrate_openai_results
 
 
@@ -48,7 +48,7 @@ def parser() -> argparse.ArgumentParser:
         prog="evalt",
         description="Run prompts through a durable, tested, budget-bounded model route.",
     )
-    root.add_argument("--version", action="version", version="evalt 0.8.9")
+    root.add_argument("--version", action="version", version="evalt 0.8.10")
     commands = root.add_subparsers(dest="command", required=True)
 
     init = commands.add_parser("init", help="Write a reviewable starter suite; no provider call.")
@@ -102,7 +102,7 @@ def parser() -> argparse.ArgumentParser:
     optimize.add_argument("--model", action="append", dest="models", help="Override the suite candidate list; repeat for each model/reasoning configuration.")
     optimize.add_argument("--max-parallel-models", type=int, help="Override parallel model lanes for this run.")
     optimize.add_argument("--max-parallel-scenarios", type=int, help="Override parallel scenario lanes per model for this run.")
-    optimize.add_argument("--request-timeout", type=float, help="Maximum wall-clock seconds for one provider response.")
+    optimize.add_argument("--request-timeout", type=float, help="Override the suite's per-response wall-clock deadline (default 600 seconds; maximum 7200).")
 
     check = commands.add_parser("check", help="Gate an exported result for CI; no provider call.")
     check.add_argument("result")
@@ -161,6 +161,7 @@ def main(argv: list[str] | None = None) -> int:
                 "models": list(suite.models),
                 "quality_threshold": suite.quality_threshold,
                 "hard_provider_spend_cap_usd": suite.max_optimization_cost_usd,
+                "per_provider_request_timeout_seconds": suite.request_timeout_seconds,
                 "provider_call_started": False,
             }, indent=2))
             return 0
@@ -245,10 +246,12 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command == "optimize":
             suite = Suite.load(args.suite)
-            client = Evalt(
-                transport=OpenRouterTransport(timeout_seconds=args.request_timeout)
-                if args.request_timeout is not None else None
+            request_timeout_seconds = (
+                args.request_timeout
+                if args.request_timeout is not None
+                else suite.request_timeout_seconds
             )
+            client = Evalt(request_timeout_seconds=request_timeout_seconds)
             optimize_kwargs = suite.optimize_kwargs()
             if args.models:
                 optimize_kwargs["models"] = args.models
