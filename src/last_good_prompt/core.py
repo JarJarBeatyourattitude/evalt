@@ -435,7 +435,18 @@ class OpenRouterTransport:
 
     @staticmethod
     def _reasoning_token_ceiling(requested_tokens: int, effort: str) -> int:
-        minimums = {"none": 0, "minimal": 4096, "low": 8192, "medium": 16384, "high": 32768, "xhigh": 65536, "max": 65536}
+        # OpenRouter counts hidden reasoning inside the completion allowance. The
+        # visible answer may be tiny while a reasoning model uses tens of thousands
+        # of completion tokens before emitting it.
+        minimums = {
+            "none": 8192,
+            "minimal": 8192,
+            "low": 16384,
+            "medium": 32768,
+            "high": 65536,
+            "xhigh": 131072,
+            "max": 131072,
+        }
         return max(1, int(requested_tokens), minimums.get(effort, 0))
 
 
@@ -511,7 +522,13 @@ class Client:
         response_schema: dict[str, Any] | None = None,
     ) -> Completion:
         for output_expansion_attempt in range(2):
-            attempt_max_tokens = int(max_tokens) * (2 ** output_expansion_attempt)
+            # 600 -> 1,200 mapped to the same reasoning floor. A retry must request
+            # genuinely more completion headroom to be useful.
+            attempt_max_tokens = (
+                int(max_tokens)
+                if output_expansion_attempt == 0
+                else max(int(max_tokens) * 2, 131072)
+            )
             estimate = self.transport.estimate_cost(model, messages, max_tokens=attempt_max_tokens)
             budget.authorize(estimate)
             try:
@@ -527,10 +544,9 @@ class Client:
                     budget.commit(billed_cost, estimate)
                 else:
                     budget.release(estimate)
-                # An empty response can be transient. A token-limit response is a
-                # completed, billed configuration failure; doubling a reasoning
-                # model's allowance can add minutes without a usable answer.
-                if output_expansion_attempt == 0 and getattr(error, "code", "") == "PROVIDER_EMPTY":
+                if output_expansion_attempt == 0 and getattr(error, "code", "") in {
+                    "PROVIDER_EMPTY", "PROVIDER_TRUNCATED",
+                }:
                     continue
                 raise
             except Exception:
@@ -560,7 +576,7 @@ class Client:
                 {"role": "system", "content": task_text},
                 {"role": "user", "content": input_text},
             ],
-            max_tokens=600,
+            max_tokens=8192,
         )
         return DraftAnswer(task_text, input_text, response.content, response.model, response.cost_usd)
 
@@ -587,8 +603,8 @@ class Client:
         adaptive_search: bool = False,
         holdout_repeats: int = 2,
         evaluator: dict[str, Any] | None = None,
-        max_parallel_models: int = 8,
-        max_parallel_scenarios: int = 16,
+        max_parallel_models: int = 16,
+        max_parallel_scenarios: int = 32,
         progress_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> OptimizationResult:
         optimization_started = time.monotonic()
@@ -617,10 +633,10 @@ class Client:
             raise ValueError("allowed_accuracy_regression must be between zero and one.")
         if not 1 <= int(holdout_repeats) <= 5:
             raise ValueError("holdout_repeats must be between one and five.")
-        if not 1 <= int(max_parallel_models) <= 16:
-            raise ValueError("max_parallel_models must be between one and sixteen.")
-        if not 1 <= int(max_parallel_scenarios) <= 64:
-            raise ValueError("max_parallel_scenarios must be between one and sixty-four.")
+        if not 1 <= int(max_parallel_models) <= 32:
+            raise ValueError("max_parallel_models must be between one and thirty-two.")
+        if not 1 <= int(max_parallel_scenarios) <= 128:
+            raise ValueError("max_parallel_scenarios must be between one and one hundred twenty-eight.")
         evaluator_policy = _validate_evaluator_policy(evaluator)
         objective = {
             "lowest_cost_at_accuracy": "cheapest_at_accuracy",
@@ -751,7 +767,7 @@ class Client:
             # Keep the final frontier candidate as a rescue when a cheaper wave already
             # clears the bar. Realistic eight-model defaults still launch seven lanes at
             # once, while avoiding an unnecessary expensive call on an easy task.
-            broad_wave_size = max(1, min(len(ordered_broad) - 1 or 1, int(max_parallel_models), 8))
+            broad_wave_size = max(1, min(len(ordered_broad) - 1 or 1, int(max_parallel_models)))
             stop_after_first_pass = objective in {
                 "cheapest_passing", "cheapest_at_accuracy", "constrained",
                 "match_baseline_at_lowest_cost",
@@ -1117,7 +1133,7 @@ class Client:
             transcript: list[dict[str, str]] = []
             demonstrations = _few_shot_messages(few_shot_source or [], few_shot_ids or [], exclude_id=example.id if split == "train" else "")
             for turn_index, turn in enumerate(example.conversation()):
-                target = self._call(budget, target_model, [{"role": "system", "content": prompt}] + demonstrations + transcript + [{"role": "user", "content": turn.input}], max_tokens=600)
+                target = self._call(budget, target_model, [{"role": "system", "content": prompt}] + demonstrations + transcript + [{"role": "user", "content": turn.input}], max_tokens=8192)
                 transcript += [{"role": "user", "content": turn.input}, {"role": "assistant", "content": target.content}]
                 judgment, judge_completion = self._judge(example, turn, turn_index, transcript, target.content, evaluator_model, budget, evaluator or {"type": "semantic"})
                 repeat_suffix = f":repeat-{repeat_index + 1}" if repeats > 1 else ""

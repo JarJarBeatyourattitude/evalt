@@ -241,7 +241,7 @@ class SdkTests(unittest.TestCase):
         )
         self.assertEqual(result.winner.model, "cheap")
 
-    def test_repeated_case_executions_use_the_sixteen_lane_default(self):
+    def test_repeated_case_executions_use_the_thirty_two_lane_default(self):
         class MeasuredParallelTransport(FakeTransport):
             def __init__(self):
                 super().__init__()
@@ -274,8 +274,8 @@ class SdkTests(unittest.TestCase):
             max_optimization_cost_usd=2,
         )
         self.assertEqual(result.winner.model, "cheap")
-        self.assertGreater(transport.peak, 8)
-        self.assertLessEqual(transport.peak, 16)
+        self.assertGreater(transport.peak, 16)
+        self.assertLessEqual(transport.peak, 32)
 
     def test_exact_json_evaluator_is_zero_cost_and_normalizes_rational_values(self):
         class ExactJsonTransport(FakeTransport):
@@ -666,7 +666,7 @@ class SdkTests(unittest.TestCase):
             max_tokens=25, response_schema={"type": "object"},
         )
         sent = requests[-1]
-        self.assertEqual(sent["max_completion_tokens"], 25)
+        self.assertEqual(sent["max_completion_tokens"], 8192)
         self.assertNotIn("max_tokens", sent)
         self.assertNotIn("temperature", sent)
         self.assertNotIn("sort", sent["provider"])
@@ -697,7 +697,7 @@ class SdkTests(unittest.TestCase):
             [{"role": "user", "content": "hello"}], max_tokens=100,
         )
         self.assertEqual(requests[-1]["reasoning"], {"effort": "low", "exclude": True})
-        self.assertEqual(requests[-1]["max_completion_tokens"], 8192)
+        self.assertEqual(requests[-1]["max_completion_tokens"], 16384)
         self.assertEqual(result.model, "reasoning-model#reasoning=low")
 
     def test_empty_answer_retries_once_with_a_larger_budgeted_response_target(self):
@@ -720,28 +720,54 @@ class SdkTests(unittest.TestCase):
             task="Answer completely.", input="Test", max_cost_usd=0.10,
         )
         self.assertEqual(answer.answer, "complete answer")
-        self.assertEqual(transport.max_tokens_seen, [600, 1200])
+        self.assertEqual(transport.max_tokens_seen, [8192, 131072])
 
-    def test_truncated_answer_fails_fast_without_an_expensive_retry(self):
+    def test_truncated_answer_gets_one_genuinely_larger_budgeted_retry(self):
         class TruncatedTransport(FakeTransport):
             def __init__(self):
                 super().__init__()
-                self.attempts = 0
+                self.max_tokens_seen = []
 
             def complete(self, model, messages, *, max_tokens, response_schema=None):
-                self.attempts += 1
+                self.max_tokens_seen.append(max_tokens)
+                if len(self.max_tokens_seen) == 1:
+                    error = ProviderError("response limit")
+                    error.code = "PROVIDER_TRUNCATED"
+                    error.cost_usd = 0.001
+                    raise error
+                return super().complete(
+                    model, messages, max_tokens=max_tokens, response_schema=response_schema,
+                )
+
+        transport = TruncatedTransport()
+        result = Client(transport=transport).optimize(
+            prompt="Return one label.", examples=EXAMPLES, models=["target"],
+            optimizer_model="optimizer", evaluator_model="evaluator",
+            max_optimization_cost_usd=1,
+        )
+        self.assertEqual(result.winner.model, "target")
+        self.assertEqual(transport.max_tokens_seen[:2], [8192, 131072])
+
+    def test_repeated_truncation_stops_after_one_expansion(self):
+        class AlwaysTruncatedTransport(FakeTransport):
+            def __init__(self):
+                super().__init__()
+                self.max_tokens_seen = []
+
+            def complete(self, model, messages, *, max_tokens, response_schema=None):
+                self.max_tokens_seen.append(max_tokens)
                 error = ProviderError("response limit")
                 error.code = "PROVIDER_TRUNCATED"
                 raise error
 
-        transport = TruncatedTransport()
+        transport = AlwaysTruncatedTransport()
         with self.assertRaises(ProviderError):
             Client(transport=transport).optimize(
                 prompt="Return one label.", examples=EXAMPLES, models=["target"],
                 optimizer_model="optimizer", evaluator_model="evaluator",
                 max_optimization_cost_usd=1,
             )
-        self.assertEqual(transport.attempts, 1)
+        self.assertEqual(transport.max_tokens_seen, [8192, 131072])
 
     def test_reasoning_effort_fails_closed_when_the_current_zdr_endpoint_cannot_honor_it(self):
         def opener(request, timeout):

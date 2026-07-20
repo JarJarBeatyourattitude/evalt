@@ -47,8 +47,8 @@ class Suite:
     max_optimization_cost_usd: float = 2.00
     rounds: int = 3
     holdout_repeats: int = 2
-    max_parallel_models: int = 8
-    max_parallel_scenarios: int = 16
+    max_parallel_models: int = 16
+    max_parallel_scenarios: int = 32
     request_timeout_seconds: float = 600
     minimum_meaningful_quality_gain: float = 0.03
     allow_few_shot: bool = True
@@ -77,8 +77,8 @@ class Suite:
                 max_optimization_cost_usd=float(value.get("max_optimization_cost_usd", 2.00)),
                 rounds=int(value.get("rounds", 3)),
                 holdout_repeats=int(value.get("holdout_repeats", 2)),
-                max_parallel_models=int(value.get("max_parallel_models", 8)),
-                max_parallel_scenarios=int(value.get("max_parallel_scenarios", 16)),
+                max_parallel_models=int(value.get("max_parallel_models", 16)),
+                max_parallel_scenarios=int(value.get("max_parallel_scenarios", 32)),
                 request_timeout_seconds=float(value.get("request_timeout_seconds", 600)),
                 minimum_meaningful_quality_gain=float(value.get("minimum_meaningful_quality_gain", 0.03)),
                 allow_few_shot=bool(value.get("allow_few_shot", True)),
@@ -120,10 +120,10 @@ class Suite:
             raise ValueError("allowed_accuracy_regression must be between zero and one.")
         if not 1 <= self.holdout_repeats <= 5:
             raise ValueError("holdout_repeats must be between 1 and 5.")
-        if not 1 <= self.max_parallel_models <= 16:
-            raise ValueError("max_parallel_models must be between 1 and 16.")
-        if not 1 <= self.max_parallel_scenarios <= 64:
-            raise ValueError("max_parallel_scenarios must be between 1 and 64.")
+        if not 1 <= self.max_parallel_models <= 32:
+            raise ValueError("max_parallel_models must be between 1 and 32.")
+        if not 1 <= self.max_parallel_scenarios <= 128:
+            raise ValueError("max_parallel_scenarios must be between 1 and 128.")
         if not 0 < self.request_timeout_seconds <= 7200:
             raise ValueError("request_timeout_seconds must be greater than zero and no more than 7200 seconds.")
         _validate_evaluator_policy(dict(self.evaluator))

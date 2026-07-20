@@ -33,7 +33,7 @@ repository checkout:
 
 ```bash
 python -m venv .venv
-python -m pip install dist/evalt-0.8.11-py3-none-any.whl
+python -m pip install dist/evalt-0.8.12-py3-none-any.whl
 evalt --version
 ```
 
@@ -96,12 +96,11 @@ workflows need no comparison model: their approved validation target is the bar.
 Reasoning effort is tested as part of the model configuration only when the current ZDR
 endpoint supports it. The adaptive search first runs one configuration across a broad
 price/intelligence frontier, then spends the remaining test budget on effort variants for
-models in the observed task-capability band. Reasoning configurations receive larger,
-budget-reserved completion headroom so internal reasoning cannot silently consume the
-requested visible response size. A transient empty response gets one budget-checked
-retry. An explicitly truncated response fails that configuration immediately: Evalt does
-not double a costly reasoning allowance after the provider has already hit the bounded
-limit. Production cost uses the route's
+models in the observed task-capability band. Reasoning configurations receive large,
+budget-reserved completion headroom (8,192 tokens without reasoning through 65,536 at
+high effort) so hidden reasoning cannot silently consume a tiny visible-response limit.
+An empty or explicitly truncated response gets one budget-checked retry with a real
+131,072-token ceiling where the provider supports it. Production cost uses the route's
 90th-percentile approved input and output lengths. The default quality floor is 95%, and
 held-out cases are repeated twice before promotion. A measured 100% means every repeated
 approved final-test scenario passed on every configured repeat; it is not a guarantee
@@ -203,8 +202,8 @@ and offline-validatable before spend.
   "quality_threshold": 0.95,
   "max_optimization_cost_usd": 2.0,
   "rounds": 3,
-  "max_parallel_models": 8,
-  "max_parallel_scenarios": 16,
+  "max_parallel_models": 16,
+  "max_parallel_scenarios": 32,
   "request_timeout_seconds": 600,
   "allow_few_shot": true,
   "max_few_shot_examples": 3
