@@ -389,6 +389,51 @@ class DesignerFallbackTransport(CaseDesignerTransport):
         )
 
 
+class MalformedThenValidDesignerTransport(CaseDesignerTransport):
+    def __init__(self):
+        super().__init__()
+        self.design_attempts = 0
+
+    def complete(self, model, messages, *, max_tokens, response_schema=None):
+        if response_schema and "Design a balanced evaluation suite" in messages[0]["content"]:
+            self.design_attempts += 1
+            if self.design_attempts == 1:
+                self.calls.append((model, messages, max_tokens, response_schema))
+                return Completion(
+                    '{"evaluator":{"type":"exact_text",',
+                    model,
+                    f"gen-{len(self.calls)}",
+                    self.estimate_cost(model, messages, max_tokens=max_tokens),
+                )
+        return super().complete(
+            model, messages, max_tokens=max_tokens, response_schema=response_schema
+        )
+
+
+class SemanticMiscalibratedDesignerTransport(CaseDesignerTransport):
+    def complete(self, model, messages, *, max_tokens, response_schema=None):
+        if response_schema and "Design a balanced evaluation suite" in messages[0]["content"]:
+            completion = super().complete(
+                model, messages, max_tokens=max_tokens, response_schema=response_schema
+            )
+            payload = json.loads(completion.content)
+            payload["evaluator"]["type"] = "semantic"
+            payload["evaluator"]["reason"] = "Equivalent sentiment scores may vary slightly."
+            payload["judge_calibration"][0]["candidate_output"] = "8"
+            payload["judge_calibration"][0]["approved_output"] = "5"
+            payload["judge_calibration"][1]["candidate_output"] = "84"
+            payload["judge_calibration"][1]["approved_output"] = "80"
+            return Completion(
+                json.dumps(payload),
+                completion.model,
+                completion.generation_id,
+                completion.cost_usd,
+            )
+        return super().complete(
+            model, messages, max_tokens=max_tokens, response_schema=response_schema
+        )
+
+
 class FailingCaseDesignerTransport(CaseDesignerTransport):
     def complete(self, model, messages, *, max_tokens, response_schema=None):
         if response_schema:
@@ -1075,6 +1120,21 @@ class SdkTests(unittest.TestCase):
                 "designer_timeout_seconds": 300,
             })
             evalt._emit_progress({
+                "event": "suite_design_attempt_started",
+                "route": "support-routing",
+                "designer_model": "smart-designer",
+                "attempt": 1,
+                "max_attempts": 2,
+            })
+            evalt._emit_progress({
+                "event": "suite_designer_invalid",
+                "route": "support-routing",
+                "designer_model": "smart-designer",
+                "attempt": 1,
+                "max_attempts": 2,
+                "will_retry": True,
+            })
+            evalt._emit_progress({
                 "event": "suite_design_heartbeat",
                 "route": "support-routing",
                 "designer_model": "smart-designer",
@@ -1108,6 +1168,9 @@ class SdkTests(unittest.TestCase):
             })
         rendered = stream.getvalue()
         self.assertIn("25 cases · smart-designer · deadline 300s", rendered)
+        self.assertIn("smart-designer · attempt 1/2 · request started", rendered)
+        self.assertIn("TEST DRAFT REJECTED · smart-designer · attempt 1/2", rendered)
+        self.assertIn("retrying this model within the workflow cap", rendered)
         self.assertIn("smart-designer · 20s elapsed · still working", rendered)
         self.assertIn("support-routing · BROAD SCREEN · 12 model configuration(s) · up to 12 in parallel", rendered)
         self.assertIn("support-routing · SCREENED · cheap#reasoning=low · 80% validation", rendered)
@@ -1713,6 +1776,71 @@ class SdkTests(unittest.TestCase):
                 )
             with self.assertRaises(KeyError):
                 evalt.route_status("bad-judge")
+
+    def test_ai_suite_design_retries_malformed_structured_output_with_visible_attempts(self):
+        events: list[dict] = []
+        transport = MalformedThenValidDesignerTransport()
+        evalt = Evalt(transport=transport, progress_callback=events.append)
+        draft = evalt.design_suite(
+            task="Classify recurring support tickets into one routing label.",
+            prompt="Return exactly one lowercase label: billing, account, or technical.",
+            route="designer-structured-retry",
+            case_count=25,
+            workflow_budget_usd=1,
+            models=["cheap"],
+            designer_model="designer",
+            evaluator_model="evaluator",
+        )
+        self.assertEqual(len(draft.examples), 25)
+        self.assertEqual(transport.design_attempts, 2)
+        attempts = [
+            event for event in events
+            if event["event"] == "suite_design_attempt_started"
+        ]
+        self.assertEqual([event["attempt"] for event in attempts], [1, 2])
+        rejected = [
+            event for event in events
+            if event["event"] == "suite_designer_invalid"
+        ]
+        self.assertEqual(len(rejected), 1)
+        self.assertTrue(rejected[0]["will_retry"])
+
+    def test_semantic_calibration_cannot_label_a_different_answer_as_a_known_pass(self):
+        events: list[dict] = []
+        transport = SemanticMiscalibratedDesignerTransport()
+        evalt = Evalt(transport=transport, progress_callback=events.append)
+        draft = evalt.design_suite(
+            task="Score recurring customer sentiment on a consistent scale.",
+            prompt="Return a sentiment score from zero to one hundred.",
+            route="semantic-calibration-identity",
+            case_count=25,
+            workflow_budget_usd=1,
+            models=["cheap"],
+            designer_model="designer",
+            evaluator_model="evaluator",
+        )
+        self.assertEqual(draft.evaluator["type"], "semantic")
+        self.assertTrue(any(
+            "known-pass control identical" in note for note in draft.design_notes
+        ))
+        calibration_events = [
+            event for event in events
+            if event["event"] == "judge_calibration_completed"
+        ]
+        self.assertTrue(calibration_events[-1]["passed"])
+        judgment_payloads = [
+            json.loads(messages[-1]["content"])
+            for _model, messages, _max_tokens, response_schema in transport.calls
+            if response_schema and "Judge whether" in messages[0]["content"]
+        ]
+        self.assertEqual(
+            judgment_payloads[0]["actual_answer"],
+            judgment_payloads[0]["approved_answer"],
+        )
+        self.assertEqual(
+            judgment_payloads[1]["actual_answer"],
+            judgment_payloads[1]["approved_answer"],
+        )
 
     def test_autopilot_design_runs_full_tournament_but_labels_ai_evidence(self):
         with TemporaryDirectory() as directory:

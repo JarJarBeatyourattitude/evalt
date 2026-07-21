@@ -31,7 +31,7 @@ repository checkout:
 
 ```bash
 python -m venv .venv
-python -m pip install dist/evalt-0.9.2-py3-none-any.whl
+python -m pip install dist/evalt-0.9.3-py3-none-any.whl
 evalt --version
 ```
 
@@ -177,7 +177,12 @@ use a 120-second per-provider deadline for candidate and production responses. S
 times out cannot earn a higher reasoning rung. Explicit `Suite` workflows keep their
 independently configurable 600-second default. During the broad screen, interactive
 progress reports each settled model configuration, validation rate, latency, spend,
-and total elapsed time.
+and total elapsed time. The same stream names every designer model and attempt. A
+malformed structured draft is rejected and retried once inside the same workflow
+budget before Evalt falls back to another cost-qualified designer role or fails closed.
+For semantic judges, Evalt also replaces AI-authored positive calibration guesses with
+identity controls: each known-pass candidate is exactly its approved answer. This keeps
+a designer from calling a different score or factual claim a known pass.
 
 The first call now performs the bounded AI-designed tournament by default. It fails
 closed without serving or promoting a route when no configuration clears the requested

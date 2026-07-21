@@ -509,7 +509,9 @@ class Evalt:
         elif kind == "suite_design_attempt_started":
             message = (
                 f"Evalt · {route} · DESIGNING TESTS · "
-                f"{event.get('designer_model', 'model')} · request started"
+                f"{event.get('designer_model', 'model')} · "
+                f"attempt {int(event.get('attempt') or 1)}/"
+                f"{int(event.get('max_attempts') or 1)} · request started"
             )
         elif kind == "suite_design_heartbeat":
             message = (
@@ -528,6 +530,19 @@ class Evalt:
             message = (
                 f"Evalt · {route} · DESIGNER ROUTE UNAVAILABLE · "
                 f"{event.get('designer_model', 'model')} · trying the next cost-qualified role"
+            )
+        elif kind == "suite_designer_invalid":
+            next_action = (
+                "retrying this model within the workflow cap"
+                if event.get("will_retry")
+                else "trying the next cost-qualified role"
+            )
+            message = (
+                f"Evalt · {route} · TEST DRAFT REJECTED · "
+                f"{event.get('designer_model', 'model')} · "
+                f"attempt {int(event.get('attempt') or 1)}/"
+                f"{int(event.get('max_attempts') or 1)} · invalid structured output · "
+                f"{next_action}"
             )
         elif kind == "judge_calibration_started":
             message = (
@@ -957,58 +972,101 @@ class Evalt:
             )
             designer_failures: list[str] = []
             completion = None
+            parsed: dict[str, Any] | None = None
+            max_structured_attempts = 2
             for designer_candidate in designer_candidates:
-                self._emit_progress({
-                    "event": "suite_design_attempt_started",
-                    "route": route,
-                    "designer_model": designer_candidate,
-                })
-                attempt_started = time.monotonic()
-                try:
-                    with ThreadPoolExecutor(max_workers=1) as pool:
-                        future = pool.submit(
-                            self.client._call,
-                            budget,
-                            designer_candidate,
-                            design_messages,
-                            max_tokens=max_tokens,
-                            response_schema=schema,
-                        )
-                        while True:
-                            try:
-                                completion = future.result(timeout=10)
-                                break
-                            except FutureTimeoutError:
-                                self._emit_progress({
-                                    "event": "suite_design_heartbeat",
-                                    "route": route,
-                                    "designer_model": designer_candidate,
-                                    "elapsed_seconds": round(
-                                        time.monotonic() - attempt_started, 1
-                                    ),
-                                })
-                    selected_designer = designer_candidate
-                    break
-                except ProviderError as error:
-                    designer_failures.append(
-                        f"{designer_candidate}: {error}"
-                    )
+                for structured_attempt in range(1, max_structured_attempts + 1):
                     self._emit_progress({
-                        "event": "suite_designer_unavailable",
+                        "event": "suite_design_attempt_started",
                         "route": route,
                         "designer_model": designer_candidate,
-                        "error": str(error),
+                        "attempt": structured_attempt,
+                        "max_attempts": max_structured_attempts,
                     })
+                    attempt_started = time.monotonic()
+                    try:
+                        with ThreadPoolExecutor(max_workers=1) as pool:
+                            future = pool.submit(
+                                self.client._call,
+                                budget,
+                                designer_candidate,
+                                design_messages,
+                                max_tokens=max_tokens,
+                                response_schema=schema,
+                            )
+                            while True:
+                                try:
+                                    candidate_completion = future.result(timeout=10)
+                                    break
+                                except FutureTimeoutError:
+                                    self._emit_progress({
+                                        "event": "suite_design_heartbeat",
+                                        "route": route,
+                                        "designer_model": designer_candidate,
+                                        "attempt": structured_attempt,
+                                        "max_attempts": max_structured_attempts,
+                                        "elapsed_seconds": round(
+                                            time.monotonic() - attempt_started, 1
+                                        ),
+                                    })
+                    except ProviderError as error:
+                        designer_failures.append(f"{designer_candidate}: {error}")
+                        self._emit_progress({
+                            "event": "suite_designer_unavailable",
+                            "route": route,
+                            "designer_model": designer_candidate,
+                            "error": str(error),
+                        })
+                        break
+
+                    try:
+                        candidate_text = str(candidate_completion.content).strip()
+                        if candidate_text.startswith("```"):
+                            candidate_text = (
+                                candidate_text.split("\n", 1)[-1]
+                                .rsplit("```", 1)[0]
+                                .strip()
+                            )
+                        candidate_payload = json.loads(candidate_text)
+                        if not isinstance(candidate_payload, dict):
+                            raise TypeError("designer payload must be an object")
+                        required_payload_keys = {
+                            "evaluator", "judge_calibration", "design_notes",
+                            "strata" if use_generated_groups else "scenarios",
+                        }
+                        if not required_payload_keys.issubset(candidate_payload):
+                            raise KeyError("designer payload is missing required fields")
+                    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+                        will_retry = structured_attempt < max_structured_attempts
+                        designer_failures.append(
+                            f"{designer_candidate} attempt {structured_attempt}: "
+                            f"invalid structured output ({error})"
+                        )
+                        self._emit_progress({
+                            "event": "suite_designer_invalid",
+                            "route": route,
+                            "designer_model": designer_candidate,
+                            "attempt": structured_attempt,
+                            "max_attempts": max_structured_attempts,
+                            "will_retry": will_retry,
+                            "error": str(error),
+                        })
+                        continue
+
+                    completion = candidate_completion
+                    parsed = candidate_payload
+                    selected_designer = designer_candidate
+                    break
+                if completion is not None:
+                    break
             if completion is None:
                 raise ProviderError(
                     "No cost-qualified suite designer completed: "
                     + "; ".join(designer_failures)
                 )
             try:
-                text = str(completion.content).strip()
-                if text.startswith("```"):
-                    text = text.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
-                parsed = json.loads(text)
+                if parsed is None:
+                    raise ValueError("designer payload was not decoded")
                 if use_generated_groups:
                     strata = list(parsed["strata"])
                     if len(strata) != 5:
@@ -1081,6 +1139,30 @@ class Evalt:
                 else:
                     if len(calibration_rows) < 3:
                         raise ValueError("insufficient judge calibration")
+                    known_passes = [
+                        dict(item) for item in calibration_rows
+                        if bool(item.get("should_pass"))
+                    ]
+                    known_failures = [
+                        dict(item) for item in calibration_rows
+                        if not bool(item.get("should_pass"))
+                    ]
+                    if len(known_passes) < 2 or not known_failures:
+                        raise ValueError(
+                            "semantic calibration requires two known passes and one known failure"
+                        )
+                    # A designer model cannot declare a numerically or materially
+                    # different answer a "known pass."  The pass controls are
+                    # deterministic identity checks; AI still proposes the clearly
+                    # wrong negative controls that the judge must reject.
+                    for calibration in known_passes:
+                        calibration["candidate_output"] = calibration["approved_output"]
+                        calibration["should_pass"] = True
+                    calibration_rows = [*known_passes, *known_failures]
+                    design_notes.insert(
+                        1,
+                        "Semantic calibration: Evalt made every known-pass control identical to its approved answer.",
+                    )
                     evaluator_candidates = tuple(
                         dict.fromkeys((selected_evaluator, selected_designer))
                     )
