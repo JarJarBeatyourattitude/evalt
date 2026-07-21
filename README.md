@@ -5,9 +5,10 @@
 [![CI](https://github.com/JarJarBeatyourattitude/evalt/actions/workflows/ci.yml/badge.svg)](https://github.com/JarJarBeatyourattitude/evalt/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-2f7a65.svg)](LICENSE)
 
-Evalt turns a recurring AI task into a tested production route. It can draft a broad
-test for review, compare prompt/model/reasoning/few-shot configurations under one hard
-budget, and remember the lowest-cost route that clears the approved quality target.
+Evalt turns a recurring AI task into a tested production route. On a route's first
+call, it can design and calibrate the test, compare prompt/model/reasoning/few-shot
+configurations under one hard budget, remember the lowest-cost passing package, and
+then answer the real input through that package. Later calls reuse it immediately.
 
 ## Install
 
@@ -30,7 +31,7 @@ repository checkout:
 
 ```bash
 python -m venv .venv
-python -m pip install dist/evalt-0.8.22-py3-none-any.whl
+python -m pip install dist/evalt-0.9.0-py3-none-any.whl
 evalt --version
 ```
 
@@ -44,10 +45,49 @@ package never creates a platform charge.
 - [Source and issues on GitHub](https://github.com/JarJarBeatyourattitude/evalt)
 - [Hosted documentation](https://evalt.dev/docs/)
 
-## Start with an AI-drafted test
+## One-call production route
 
-The recommended workflow lets a smart designer create 25 varied cases, but returns an
-unapproved draft before any tournament runs:
+```python
+from evalt import Evalt
+
+evalt = Evalt(show_progress=True)
+answer = evalt.run(
+    "Classify this request. Return exactly one lowercase label: billing, account, or technical.",
+    "Please help—the website won't load.",
+    task="Route recurring support tickets to billing, account, or technical.",
+    route="support-routing",
+    target_accuracy=0.95,
+    test_budget_usd="auto",
+)
+print(answer.content)
+```
+
+For a new route, that one call visibly:
+
+1. uses a smart designer to create 25 routine, boundary, adversarial, format, and
+   multi-turn cases where relevant;
+2. calibrates the proposed deterministic or semantic judge on separate labeled checks;
+3. searches the original prompt, prompt rewrites, training-only few-shot packages,
+   current models, providers, and supported reasoning efforts in parallel;
+4. promotes only a non-exploratory configuration clearing the frozen final test;
+5. stores the entire prompt/model/reasoning/few-shot package in the local route database;
+6. answers the real input through that selected package.
+
+The first production input is shown to the designer only as an unlabeled example of
+realistic domain, shape, and length. It is not copied into the suite or treated as a
+correct answer.
+
+AI-generated cases and AI judging are labeled `AI_GENERATED_AI_JUDGED`. They are useful
+initial evidence, not disguised human ground truth. `answer.accept()` and
+`answer.correct(expected)` add real production labels that calibrate and strengthen
+future retests. Pass `first_run="bootstrap"` only when you explicitly want one untested
+provider call with no tournament. The automatic first test and later retests never
+exceed `max_test_budget_usd` (USD 1 by default).
+
+## Optional: review the AI-drafted test first
+
+For high-stakes or tightly specified work, return an unapproved draft before any
+tournament runs:
 
 ```python
 from evalt import Evalt
@@ -85,7 +125,7 @@ tournament immediately, but the result is permanently labeled
 Bring your own examples with `Suite`, or replace `draft.examples` when calling
 `draft.approve(...)`, for the hands-on end of the spectrum.
 
-## Production API
+## Feedback and route maintenance
 
 ```python
 from evalt import Evalt
@@ -96,6 +136,7 @@ evalt = Evalt(show_progress=True)
 answer = evalt.run(
     "Classify this request. Return exactly one lowercase label: billing, account, or technical.",
     ticket,
+    task="Route recurring support tickets to billing, account, or technical.",
     route="support-routing",
     test_budget_usd="auto",
 )
@@ -129,17 +170,17 @@ Feedback on `support-routing` cannot enter the evaluation set for `call-summary`
 `fraud-review`. Reusing a route name means “this is the same repeated task”; using a new
 name creates a separate optimization track in the same local state database.
 
-The first `run(prompt, input)` call is deliberately one untested bootstrap provider call,
-not a tournament. Terminal output says `UNTESTED BOOTSTRAP`, `one provider call only`,
-and `no tournament ran`. `answer.accept()` records the returned output as correct;
-`answer.correct(expected)` records the desired output when it was wrong. The default
-first tournament becomes eligible after five labeled examples. Feedback progress is
-printed explicitly, and already-launched bounded maintenance is not abandoned when a
-short script exits. Call `evalt.wait_for_maintenance()` when the application needs an
-explicit synchronization point. Automatic test spend is bounded by
-`max_test_budget_usd` (USD 1 by default); a retest never spends from an unlimited hidden
-allowance. Changing the prompt resets qualification evidence for that route while
-preserving the old version in its audit history.
+The first call now performs the bounded AI-designed tournament by default. It fails
+closed without serving or promoting a route when no configuration clears the requested
+accuracy, the test is exploratory, judge calibration fails, or the shared test budget
+cannot complete a valid comparison. `answer.accept()` records the returned output as
+correct; `answer.correct(expected)` records the desired output when it was wrong. Once
+enough real labels accumulate, Evalt calibrates the semantic judge against known passes
+and corrected failures before a feedback-based retest. Already-launched bounded
+maintenance is not abandoned when a short script exits; call
+`evalt.wait_for_maintenance()` when an application needs an explicit synchronization
+point. Changing the source prompt requires a new first-route tournament while preserving
+the old version in the audit history.
 
 The focused default is `objective="lowest_cost_at_accuracy"` with
 `target_accuracy=0.95`: Evalt promotes the cheapest tested configuration that clears that

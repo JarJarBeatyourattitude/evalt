@@ -135,7 +135,7 @@ def parser() -> argparse.ArgumentParser:
         prog="evalt",
         description="Run prompts through a durable, tested, budget-bounded model route.",
     )
-    root.add_argument("--version", action="version", version="evalt 0.8.22")
+    root.add_argument("--version", action="version", version="evalt 0.9.0")
     commands = root.add_subparsers(dest="command", required=True)
 
     init = commands.add_parser("init", help="Write a reviewable starter suite; no provider call.")
@@ -166,8 +166,9 @@ def parser() -> argparse.ArgumentParser:
     draft.add_argument("--model", default="openai/gpt-5-mini")
     draft.add_argument("--max-cost", type=float, default=0.10)
 
-    run = commands.add_parser("run", help="Execute one prompt through a durable route.")
+    run = commands.add_parser("run", help="Design, test, and execute one prompt through a durable route.")
     run.add_argument("--route", required=True, help="Stable route name used to remember decisions.")
+    run.add_argument("--task", help="Plain-language recurring job; omitted uses the prompt as the task description.")
     run.add_argument("--prompt", required=True)
     run.add_argument("--input", required=True)
     run.add_argument("--price", "--budget", dest="price", type=float, help="Optional hard maximum provider price for one production response; omitted uses a request-sized automatic safety ceiling.")
@@ -177,6 +178,8 @@ def parser() -> argparse.ArgumentParser:
     run.add_argument("--objective", choices=("match_baseline_at_lowest_cost", "best_within_price", "lowest_cost_at_accuracy"), default="lowest_cost_at_accuracy")
     run.add_argument("--state", default=".evalt/evalt.db")
     run.add_argument("--model", action="append", dest="models")
+    run.add_argument("--cases", type=int, default=25, help="AI-designed cases for a new route; 25 provides five final-test cases.")
+    run.add_argument("--bootstrap-only", action="store_true", help="Skip first-route optimization and make one explicitly untested provider call.")
     run.add_argument("--fixed-prompt", action="store_true", help="Compare routes without rewriting the supplied prompt or adding few-shot examples.")
     run.add_argument("--approved-output", help="Immediately record an accepted/corrected answer for future tests.")
 
@@ -349,6 +352,9 @@ def main(argv: list[str] | None = None) -> int:
                 objective=args.objective,
                 models=args.models,
                 optimize_prompt=not args.fixed_prompt,
+                task=args.task,
+                first_run="bootstrap" if args.bootstrap_only else "optimize",
+                case_count=args.cases,
             )
             if args.approved_output is not None:
                 if args.approved_output == answer.content:

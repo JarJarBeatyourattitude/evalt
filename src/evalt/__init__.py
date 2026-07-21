@@ -50,4 +50,4 @@ __all__ = [
     "write_reports",
 ]
 
-__version__ = "0.8.22"
+__version__ = "0.9.0"

@@ -240,8 +240,16 @@ class SuiteDraft:
     quality_threshold: float
     workflow_budget_usd: float
     designer_spend_usd: float
+    objective: str = "lowest_cost_at_accuracy"
     optimize_prompt: bool = True
     holdout_repeats: int = 2
+    max_parallel_models: int = 16
+    max_parallel_scenarios: int = 32
+    request_timeout_seconds: float = 600
+    max_p90_latency_seconds: float | None = None
+    latency_value_usd_per_second: float = 0.0
+    allow_few_shot: bool = True
+    max_few_shot_examples: int = 3
     name: str = "evalt-suite"
     evidence_provenance: str = "AI_DRAFT_UNAPPROVED"
     design_notes: tuple[str, ...] = ()
@@ -268,8 +276,16 @@ class SuiteDraft:
                 quality_threshold=float(value.get("quality_threshold", 0.95)),
                 workflow_budget_usd=float(value["workflow_budget_usd"]),
                 designer_spend_usd=float(value.get("designer_spend_usd", 0)),
+                objective=str(value.get("objective", "lowest_cost_at_accuracy")),
                 optimize_prompt=bool(value.get("optimize_prompt", True)),
                 holdout_repeats=int(value.get("holdout_repeats", 2)),
+                max_parallel_models=int(value.get("max_parallel_models", 16)),
+                max_parallel_scenarios=int(value.get("max_parallel_scenarios", 32)),
+                request_timeout_seconds=float(value.get("request_timeout_seconds", 600)),
+                max_p90_latency_seconds=(float(value["max_p90_latency_seconds"]) if value.get("max_p90_latency_seconds") is not None else None),
+                latency_value_usd_per_second=float(value.get("latency_value_usd_per_second", 0.0)),
+                allow_few_shot=bool(value.get("allow_few_shot", True)),
+                max_few_shot_examples=int(value.get("max_few_shot_examples", 3)),
                 evidence_provenance="AI_DRAFT_UNAPPROVED",
                 design_notes=tuple(str(item) for item in value.get("design_notes", [])),
             )
@@ -302,8 +318,16 @@ class SuiteDraft:
             "workflow_budget_usd": self.workflow_budget_usd,
             "designer_spend_usd": self.designer_spend_usd,
             "remaining_optimization_budget_usd": self.remaining_optimization_budget_usd,
+            "objective": self.objective,
             "optimize_prompt": self.optimize_prompt,
             "holdout_repeats": self.holdout_repeats,
+            "max_parallel_models": self.max_parallel_models,
+            "max_parallel_scenarios": self.max_parallel_scenarios,
+            "request_timeout_seconds": self.request_timeout_seconds,
+            "max_p90_latency_seconds": self.max_p90_latency_seconds,
+            "latency_value_usd_per_second": self.latency_value_usd_per_second,
+            "allow_few_shot": self.allow_few_shot,
+            "max_few_shot_examples": self.max_few_shot_examples,
             "evidence_provenance": self.evidence_provenance,
             "design_notes": list(self.design_notes),
         }
@@ -330,10 +354,18 @@ class SuiteDraft:
             optimizer_model=self.designer_model,
             evaluator_model=self.evaluator_model,
             evaluator=dict(self.evaluator),
+            objective=self.objective,
             quality_threshold=self.quality_threshold,
             max_optimization_cost_usd=self.remaining_optimization_budget_usd,
             optimize_prompt=self.optimize_prompt,
             holdout_repeats=self.holdout_repeats,
+            max_parallel_models=self.max_parallel_models,
+            max_parallel_scenarios=self.max_parallel_scenarios,
+            request_timeout_seconds=self.request_timeout_seconds,
+            max_p90_latency_seconds=self.max_p90_latency_seconds,
+            latency_value_usd_per_second=self.latency_value_usd_per_second,
+            allow_few_shot=self.allow_few_shot,
+            max_few_shot_examples=self.max_few_shot_examples,
             evidence_provenance="HUMAN_APPROVED_AI_DRAFT",
         )
         suite.validate()
@@ -349,10 +381,18 @@ class SuiteDraft:
             optimizer_model=self.designer_model,
             evaluator_model=self.evaluator_model,
             evaluator=dict(self.evaluator),
+            objective=self.objective,
             quality_threshold=self.quality_threshold,
             max_optimization_cost_usd=self.remaining_optimization_budget_usd,
             optimize_prompt=self.optimize_prompt,
             holdout_repeats=self.holdout_repeats,
+            max_parallel_models=self.max_parallel_models,
+            max_parallel_scenarios=self.max_parallel_scenarios,
+            request_timeout_seconds=self.request_timeout_seconds,
+            max_p90_latency_seconds=self.max_p90_latency_seconds,
+            latency_value_usd_per_second=self.latency_value_usd_per_second,
+            allow_few_shot=self.allow_few_shot,
+            max_few_shot_examples=self.max_few_shot_examples,
             evidence_provenance="AI_GENERATED_AI_JUDGED",
         )
         suite.validate()
@@ -402,9 +442,12 @@ class Evalt:
         kind = str(event.get("event") or "progress")
         route = str(event.get("route") or "route")
         if kind == "production_call_started":
+            spent = float(event.get("test_budget_spent_usd") or 0)
             message = (
-                f"Evalt · {route} · serving one production call; "
-                f"${float(event['test_budget_usd']):.2f} test cap is not spent unless a tournament starts"
+                f"Evalt · {route} · serving one production call after "
+                f"${spent:.6f} initial test spend"
+                if spent
+                else f"Evalt · {route} · bootstrap-only production call; no tournament spend"
             )
         elif kind == "production_call_completed":
             model = str(event.get("model") or "model")
@@ -414,11 +457,17 @@ class Evalt:
             raw_reason = str(event.get("decision_reason") or "route")
             feedback_count = int(event.get("feedback_count") or 0)
             min_feedback = int(event.get("min_feedback") or 0)
-            if raw_reason in {"bootstrap_unqualified", "prompt_changed_unqualified"}:
+            route_phase = str(event.get("route_phase") or "untested_bootstrap")
+            if route_phase == "untested_bootstrap":
                 message = (
                     f"Evalt · {route} · UNTESTED BOOTSTRAP · one provider call only · "
                     f"{model} · ${cost:.6f} · {feedback_count}/{min_feedback} labeled examples · "
                     "no tournament ran"
+                )
+            elif route_phase == "ai_tested":
+                message = (
+                    f"Evalt · {route} · AI-TESTED ROUTE · {model} · ${cost:.6f} · "
+                    f"{policy} ceiling ${ceiling:.6f} · human feedback can strengthen the contract"
                 )
             else:
                 message = (
@@ -453,6 +502,18 @@ class Evalt:
                 f"{int(event.get('case_count') or 0)} AI-authored cases · "
                 f"spent ${float(event.get('designer_spend_usd') or 0):.6f} · "
                 f"${float(event.get('remaining_budget_usd') or 0):.6f} remains for the tournament"
+            )
+        elif kind == "initial_optimization_started":
+            message = (
+                f"Evalt · {route} · FIRST-ROUTE OPTIMIZATION · AI is designing and testing "
+                f"{int(event.get('case_count') or 0)} cases under one "
+                f"${float(event.get('workflow_budget_usd') or 0):.2f} cap"
+            )
+        elif kind == "initial_optimization_completed":
+            message = (
+                f"Evalt · {route} · ROUTE SELECTED · {event.get('winner_model')} · "
+                f"{float(event.get('holdout_pass_rate') or 0):.0%} final test · "
+                f"${float(event.get('workflow_spend_usd') or 0):.6f} test spend"
             )
         elif kind == "maintenance_started":
             message = (
@@ -550,6 +611,7 @@ class Evalt:
         prompt: str,
         route: str = "evalt-suite",
         seed_examples: Iterable[Example | Mapping[str, Any]] = (),
+        representative_inputs: Iterable[Any] = (),
         case_count: int = 25,
         workflow_budget_usd: float = 1.00,
         quality_threshold: float = 0.95,
@@ -557,8 +619,16 @@ class Evalt:
         designer_model: str | None = None,
         evaluator_model: str | None = None,
         evaluator: Mapping[str, Any] | None = None,
+        objective: str = "lowest_cost_at_accuracy",
         optimize_prompt: bool = True,
         holdout_repeats: int = 2,
+        max_parallel_models: int = 16,
+        max_parallel_scenarios: int = 32,
+        request_timeout_seconds: float = 600,
+        max_p90_latency_seconds: float | None = None,
+        latency_value_usd_per_second: float = 0.0,
+        allow_few_shot: bool = True,
+        max_few_shot_examples: int = 3,
     ) -> SuiteDraft:
         """Use a smart model to draft a reviewable, budget-accounted test contract."""
         task_text = str(task).strip()
@@ -579,6 +649,23 @@ class Evalt:
         )
         if len(seeds) > int(case_count):
             raise ValueError("seed_examples cannot outnumber case_count.")
+        representative_context: list[dict[str, Any]] = []
+        for raw_input in tuple(representative_inputs)[:3]:
+            content = (
+                raw_input
+                if isinstance(raw_input, str)
+                else json.dumps(
+                    raw_input,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            )
+            representative_context.append({
+                "content": content[:12000],
+                "original_characters": len(content),
+                "truncated": len(content) > 12000,
+            })
 
         requested_models = tuple(models) if models is not None else DEFAULT_TARGETS
         catalog: list[Mapping[str, Any]] = []
@@ -613,7 +700,7 @@ class Evalt:
             schema = {
                 "type": "object",
                 "additionalProperties": False,
-                "required": ["evaluator", "scenarios", "design_notes"],
+                "required": ["evaluator", "judge_calibration", "scenarios", "design_notes"],
                 "properties": {
                     "evaluator": {
                         "type": "object",
@@ -625,6 +712,22 @@ class Evalt:
                             "required_keys": {"type": "array", "items": {"type": "string"}},
                             "allow_additional_properties": {"type": "boolean"},
                             "normalize_rational_strings": {"type": "boolean"},
+                        },
+                    },
+                    "judge_calibration": {
+                        "type": "array",
+                        "minItems": 3,
+                        "maxItems": 6,
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "required": ["input", "approved_output", "candidate_output", "should_pass"],
+                            "properties": {
+                                "input": {"type": "string"},
+                                "approved_output": {"type": "string"},
+                                "candidate_output": {"type": "string"},
+                                "should_pass": {"type": "boolean"},
+                            },
                         },
                     },
                     "scenarios": {
@@ -665,6 +768,7 @@ class Evalt:
                 "current_prompt": prompt_text,
                 "required_new_scenarios": generated_count,
                 "seed_examples": [asdict(item) for item in seeds],
+                "representative_inputs_without_labels": representative_context,
                 "quality_target": quality_threshold,
             }
             max_tokens = min(32768, max(4000, generated_count * 500))
@@ -683,7 +787,11 @@ class Evalt:
                             "cases are drafted before any train/validation/final-test split, so never label "
                             "or target a split. Recommend exact_text or exact_json only when equivalent "
                             "answers truly must match that deterministic contract; otherwise use semantic. "
-                            "These are unapproved AI drafts. Return only the required JSON."
+                            "Also create judge-calibration checks outside the scenario suite: at least two "
+                            "clear passes and one clear failure, each labeled with should_pass. These are "
+                            "unapproved AI drafts. Representative inputs have no approved outputs; use them "
+                            "only to understand realistic shape, length, and domain, and do not copy them "
+                            "into the suite. Return only the required JSON."
                         ),
                     },
                     {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
@@ -713,6 +821,43 @@ class Evalt:
                             "normalize_rational_strings": bool(raw_evaluator.get("normalize_rational_strings", False)),
                         })
                     design_notes.insert(0, f"Evaluator: {str(raw_evaluator.get('reason') or '').strip()}")
+                calibration_rows = list(parsed.get("judge_calibration") or [])
+                if len(calibration_rows) < 3:
+                    raise ValueError("insufficient judge calibration")
+                calibrated_evaluator: str | None = None
+                for candidate in tuple(dict.fromkeys((selected_evaluator, selected_designer))):
+                    matched = True
+                    for calibration_index, calibration in enumerate(calibration_rows):
+                        calibration_example = Example.from_value({
+                            "id": f"judge-calibration-{calibration_index + 1}",
+                            "input": calibration["input"],
+                            "approved_output": calibration["approved_output"],
+                        }, calibration_index)
+                        judgment, _completion = self.client._judge(
+                            calibration_example,
+                            calibration_example.conversation()[0],
+                            0,
+                            [],
+                            str(calibration["candidate_output"]),
+                            candidate,
+                            budget,
+                            dict(suggested_evaluator),
+                        )
+                        if judgment.passed is not bool(calibration["should_pass"]):
+                            matched = False
+                            break
+                    if matched:
+                        calibrated_evaluator = candidate
+                        break
+                if calibrated_evaluator is None:
+                    raise ProviderError(
+                        "No candidate judge passed the AI-designed calibration checks; no tournament ran."
+                    )
+                selected_evaluator = calibrated_evaluator
+                design_notes.insert(
+                    1,
+                    f"Judge calibration: {selected_evaluator} matched {len(calibration_rows)} labeled checks.",
+                )
             except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
                 raise ProviderError("The test designer returned an invalid structured suite; no draft was approved.") from error
 
@@ -735,8 +880,16 @@ class Evalt:
             quality_threshold=float(quality_threshold),
             workflow_budget_usd=float(workflow_budget_usd),
             designer_spend_usd=round(budget.spent_usd, 10),
+            objective=objective,
             optimize_prompt=bool(optimize_prompt),
             holdout_repeats=int(holdout_repeats),
+            max_parallel_models=int(max_parallel_models),
+            max_parallel_scenarios=int(max_parallel_scenarios),
+            request_timeout_seconds=float(request_timeout_seconds),
+            max_p90_latency_seconds=max_p90_latency_seconds,
+            latency_value_usd_per_second=float(latency_value_usd_per_second),
+            allow_few_shot=bool(allow_few_shot),
+            max_few_shot_examples=int(max_few_shot_examples),
             design_notes=tuple(design_notes),
         )
         if draft.remaining_optimization_budget_usd <= 0:
@@ -809,6 +962,11 @@ class Evalt:
         min_feedback: int = 5,
         maintenance_budget_usd: float | None = None,
         auto_maintain: bool = True,
+        task: str | None = None,
+        first_run: str = "optimize",
+        case_count: int = 25,
+        designer_model: str | None = None,
+        evaluator_model: str | None = None,
     ) -> OptimizationResult | RoutedAnswer:
         if isinstance(suite_or_prompt, Suite):
             if input is not None:
@@ -838,6 +996,8 @@ class Evalt:
             return result
         if input is None:
             raise ValueError("input is required when executing a prompt through Evalt.")
+        if first_run not in {"optimize", "bootstrap"}:
+            raise ValueError("first_run must be 'optimize' or 'bootstrap'.")
         if price_usd is not None and budget_usd is not None and float(price_usd) != float(budget_usd):
             raise ValueError("Use price_usd; budget_usd is only a backward-compatible alias.")
         max_cost_per_run_usd = (
@@ -870,9 +1030,9 @@ class Evalt:
             raise ValueError("max_test_budget_usd must be greater than 0 and no more than 100.")
         if test_budget_usd == "auto":
             if max_cost_per_run_usd is None:
-                resolved_test_budget_usd = min(float(max_test_budget_usd), 0.25)
+                resolved_test_budget_usd = min(float(max_test_budget_usd), 1.00)
                 test_budget_policy = (
-                    "auto: $0.25 bounded retest cap when no production price ceiling is set"
+                    "auto: up to $1.00 for first-route testing and bounded retests when no production price ceiling is set"
                 )
             else:
                 resolved_test_budget_usd = min(
@@ -903,15 +1063,67 @@ class Evalt:
             requested_models = role_plan.target_models
         if incumbent_model:
             requested_models = tuple(dict.fromkeys((incumbent_model, *requested_models)))
-        self._emit_progress({
-            "event": "production_call_started",
-            "route": route,
-            "target_accuracy": target_accuracy,
-            "test_budget_usd": resolved_test_budget_usd,
-            "test_budget_policy": test_budget_policy,
-            "test_budget_spent_usd": 0.0,
-        })
+        initial_test_spend_usd = 0.0
         try:
+            if (
+                first_run == "optimize"
+                and resolved_test_budget_usd > 0
+                and self.router.needs_initial_optimization(route, suite_or_prompt)
+            ):
+                self._emit_progress({
+                    "event": "initial_optimization_started",
+                    "route": route,
+                    "case_count": int(case_count),
+                    "workflow_budget_usd": resolved_test_budget_usd,
+                })
+                draft = self.design_suite(
+                    task=(task or suite_or_prompt),
+                    prompt=suite_or_prompt,
+                    route=route,
+                    case_count=int(case_count),
+                    workflow_budget_usd=resolved_test_budget_usd,
+                    quality_threshold=target_accuracy,
+                    models=requested_models,
+                    designer_model=designer_model or role_plan.test_designer_model,
+                    evaluator_model=evaluator_model or role_plan.judge_model,
+                    representative_inputs=(input,),
+                    objective=objective,
+                    optimize_prompt=bool(optimize_prompt),
+                    max_p90_latency_seconds=max_p90_latency_seconds,
+                    latency_value_usd_per_second=latency_value_usd_per_second,
+                )
+                initial_result = self.run(draft.autopilot_suite())
+                initial_test_spend_usd = round(
+                    draft.designer_spend_usd + initial_result.total_provider_spend_usd,
+                    10,
+                )
+                try:
+                    summary = self.router.install_initial_result(
+                        route=route,
+                        prompt=suite_or_prompt,
+                        models=requested_models,
+                        quality_threshold=target_accuracy,
+                        catalog_revision=role_plan.catalog_revision,
+                        result=initial_result,
+                        examples=draft.examples,
+                        evidence_provenance="AI_GENERATED_AI_JUDGED",
+                        total_workflow_spend_usd=initial_test_spend_usd,
+                    )
+                except ValueError as error:
+                    raise ProviderError(str(error)) from error
+                self._emit_progress({
+                    "event": "initial_optimization_completed",
+                    "route": route,
+                    **summary,
+                })
+            self._emit_progress({
+                "event": "production_call_started",
+                "route": route,
+                "target_accuracy": target_accuracy,
+                "test_budget_usd": resolved_test_budget_usd,
+                "test_budget_policy": test_budget_policy,
+                "test_budget_spent_usd": initial_test_spend_usd,
+            })
             answer = self.router.run(
                 route=route,
                 prompt=suite_or_prompt,
@@ -949,6 +1161,8 @@ class Evalt:
             "maintenance_due": list(answer.maintenance_due),
             "feedback_count": status["feedback_count"],
             "min_feedback": min_feedback,
+            "route_phase": answer.route_phase,
+            "evidence_provenance": answer.evidence_provenance,
         })
 
         def on_feedback(receipt: dict[str, Any]) -> None:

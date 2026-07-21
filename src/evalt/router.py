@@ -52,6 +52,18 @@ def _percentile(values: Sequence[int], fraction: float) -> int:
     return ordered[index]
 
 
+def _route_phase(row: Mapping[str, Any]) -> str:
+    """Describe only the strongest route evidence the database actually proves."""
+    provenance = str(row["evidence_provenance"] or "LEGACY_UNKNOWN")
+    if provenance == "HUMAN_FEEDBACK_CALIBRATED":
+        return "human_calibrated"
+    if provenance == "AI_GENERATED_AI_JUDGED":
+        return "ai_tested"
+    if provenance == "LEGACY_UNKNOWN":
+        return "legacy_unknown"
+    return "untested_bootstrap"
+
+
 @dataclass(frozen=True)
 class RolePlan:
     """The three separately costed model roles used by a maintenance run."""
@@ -227,6 +239,9 @@ class RoutedAnswer:
     prompt_version: str
     decision_reason: str
     maintenance_due: tuple[str, ...]
+    route_phase: str = "untested_bootstrap"
+    evidence_provenance: str = "UNTESTED_BOOTSTRAP"
+    initial_test_summary: dict[str, Any] | None = None
     _router: "DurableRouter | None" = None
     _min_feedback: int = 5
     _retest_after_calls: int = 500
@@ -268,6 +283,9 @@ class RoutedAnswer:
             "prompt_version": self.prompt_version,
             "decision_reason": self.decision_reason,
             "maintenance_due": list(self.maintenance_due),
+            "route_phase": self.route_phase,
+            "evidence_provenance": self.evidence_provenance,
+            "initial_test_summary": self.initial_test_summary,
         }
 
 
@@ -364,6 +382,9 @@ class DurableRouter:
                 ("max_p90_latency_seconds", "REAL DEFAULT NULL"),
                 ("latency_value_usd_per_second", "REAL NOT NULL DEFAULT 0"),
                 ("optimize_prompt", "INTEGER NOT NULL DEFAULT 1"),
+                ("selected_few_shot_json", "TEXT NOT NULL DEFAULT '[]'"),
+                ("evidence_provenance", "TEXT NOT NULL DEFAULT 'LEGACY_UNKNOWN'"),
+                ("last_test_summary_json", "TEXT NOT NULL DEFAULT '{}'"),
             ):
                 if name not in columns:
                     db.execute(f"ALTER TABLE routes ADD COLUMN {name} {declaration}")
@@ -396,8 +417,8 @@ class DurableRouter:
             current = db.execute("SELECT * FROM routes WHERE route = ?", (route,)).fetchone()
             if current is None:
                 db.execute(
-                    "INSERT INTO routes(route,prompt,source_prompt_version,prompt_version,candidates_json,selected_model,selected_prompt,decision_reason,quality_threshold,catalog_revision,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-                    (route, prompt.strip(), version, version, json.dumps(candidates), candidates[0], prompt.strip(), "bootstrap_unqualified", quality_threshold, catalog_revision, now, now),
+                    "INSERT INTO routes(route,prompt,source_prompt_version,prompt_version,candidates_json,selected_model,selected_prompt,decision_reason,quality_threshold,catalog_revision,evidence_provenance,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (route, prompt.strip(), version, version, json.dumps(candidates), candidates[0], prompt.strip(), "bootstrap_unqualified", quality_threshold, catalog_revision, "UNTESTED_BOOTSTRAP", now, now),
                 )
                 self._event(db, route, "route_created", {"prompt_version": version, "bootstrap_model": candidates[0], "candidates": candidates})
             else:
@@ -405,7 +426,7 @@ class DurableRouter:
                 candidates_changed = json.loads(current["candidates_json"]) != list(candidates)
                 if changed:
                     db.execute(
-                        "UPDATE routes SET prompt=?,source_prompt_version=?,prompt_version=?,candidates_json=?,selected_model=?,selected_prompt=?,decision_reason='prompt_changed_unqualified',feedback_count=0,last_optimized_feedback=0,last_optimized_calls=total_calls,tested_catalog_revision='',catalog_revision=?,updated_at=? WHERE route=?",
+                        "UPDATE routes SET prompt=?,source_prompt_version=?,prompt_version=?,candidates_json=?,selected_model=?,selected_prompt=?,selected_few_shot_json='[]',evidence_provenance='UNTESTED_BOOTSTRAP',last_test_summary_json='{}',decision_reason='prompt_changed_unqualified',feedback_count=0,last_optimized_feedback=0,last_optimized_calls=total_calls,tested_catalog_revision='',catalog_revision=?,updated_at=? WHERE route=?",
                         (prompt.strip(), version, version, json.dumps(candidates), candidates[0], prompt.strip(), catalog_revision, now, route),
                     )
                     self._event(db, route, "prompt_changed", {
@@ -420,6 +441,94 @@ class DurableRouter:
                     )
                     self._event(db, route, "catalog_changed", {"catalog_revision": catalog_revision, "candidates": candidates})
             return db.execute("SELECT * FROM routes WHERE route = ?", (route,)).fetchone()
+
+    def needs_initial_optimization(self, route: str, prompt: str) -> bool:
+        """Return whether this exact source prompt lacks a tested durable package."""
+        version = _hash(prompt.strip())[:16]
+        with self._db() as db:
+            row = db.execute("SELECT * FROM routes WHERE route=?", (route,)).fetchone()
+        if row is None or row["source_prompt_version"] != version:
+            return True
+        if str(row["evidence_provenance"]) in {"LEGACY_UNKNOWN", "UNTESTED_BOOTSTRAP"}:
+            return True
+        return str(row["decision_reason"]).startswith(("bootstrap_", "prompt_changed_"))
+
+    def install_initial_result(
+        self,
+        *,
+        route: str,
+        prompt: str,
+        models: Sequence[str],
+        quality_threshold: float,
+        catalog_revision: str,
+        result: OptimizationResult,
+        examples: Sequence[Example],
+        evidence_provenance: str,
+        total_workflow_spend_usd: float,
+    ) -> dict[str, Any]:
+        """Durably install one split-tested first-route package or fail closed."""
+        winner = result.winner
+        passed = (
+            result.quality_gate_status == "QUALIFIED_ROUTE_SELECTED"
+            and not result.exploratory
+            and winner.passed_quality_floor
+            and winner.passed_difficulty_floors
+            and winner.passed_latency_ceiling
+            and winner.holdout_pass_rate >= float(quality_threshold)
+        )
+        if not passed:
+            raise ValueError(
+                "No configuration cleared the non-exploratory final-test gate; "
+                "the route was not promoted."
+            )
+        self._ensure_route(
+            route=route,
+            prompt=prompt,
+            models=models,
+            quality_threshold=quality_threshold,
+            catalog_revision=catalog_revision,
+        )
+        selected_ids = set(winner.few_shot_example_ids)
+        few_shot_messages: list[dict[str, str]] = []
+        for example in examples:
+            if example.id not in selected_ids:
+                continue
+            for turn in example.conversation():
+                few_shot_messages.extend((
+                    {"role": "user", "content": turn.input},
+                    {"role": "assistant", "content": turn.approved_output},
+                ))
+        summary = {
+            "quality_gate_status": result.quality_gate_status,
+            "winner_model": winner.model,
+            "winner_prompt_version": _hash(winner.selected_prompt)[:16],
+            "holdout_pass_rate": winner.holdout_pass_rate,
+            "final_test_scenarios": winner.holdout_unique_scenarios,
+            "tested_configurations": len(result.models),
+            "few_shot_examples": len(winner.few_shot_example_ids),
+            "workflow_spend_usd": round(float(total_workflow_spend_usd), 10),
+            "evidence_provenance": evidence_provenance,
+        }
+        with self._db() as db:
+            current = db.execute("SELECT * FROM routes WHERE route=?", (route,)).fetchone()
+            db.execute(
+                "UPDATE routes SET selected_model=?,selected_prompt=?,selected_few_shot_json=?,prompt_version=?,decision_reason='provisional_ai_qualified',evidence_provenance=?,last_test_summary_json=?,last_optimized_calls=?,last_optimized_feedback=?,tested_catalog_revision=?,updated_at=? WHERE route=?",
+                (
+                    winner.model,
+                    winner.selected_prompt,
+                    json.dumps(few_shot_messages, ensure_ascii=False, separators=(",", ":")),
+                    _hash(winner.selected_prompt)[:16],
+                    evidence_provenance,
+                    json.dumps(summary, sort_keys=True),
+                    current["total_calls"],
+                    current["feedback_count"],
+                    catalog_revision,
+                    _now(),
+                    route,
+                ),
+            )
+            self._event(db, route, "initial_ai_route_promoted", summary)
+        return summary
 
     def _due(self, row: sqlite3.Row, *, retest_after_calls: int, min_feedback: int) -> tuple[str, ...]:
         reasons: list[str] = []
@@ -473,7 +582,12 @@ class DurableRouter:
                 provider_sort=("latency" if latency_value_usd_per_second > 0 else "price"),
             )
         input_text = _content(input)
-        messages = [{"role": "system", "content": row["selected_prompt"]}, {"role": "user", "content": input_text}]
+        few_shot_messages = json.loads(row["selected_few_shot_json"] or "[]")
+        messages = [
+            {"role": "system", "content": row["selected_prompt"]},
+            *few_shot_messages,
+            {"role": "user", "content": input_text},
+        ]
         estimate = self.client.transport.estimate_cost(row["selected_model"], messages, max_tokens=max_tokens)
         price_policy = "explicit" if max_cost_per_run_usd is not None else "automatic"
         effective_price_ceiling_usd = (
@@ -537,6 +651,11 @@ class DurableRouter:
             prompt_version=row["prompt_version"],
             decision_reason=row["decision_reason"],
             maintenance_due=due,
+            route_phase=(
+                _route_phase(row)
+            ),
+            evidence_provenance=row["evidence_provenance"],
+            initial_test_summary=(json.loads(row["last_test_summary_json"] or "{}") or None),
             _router=self,
             _min_feedback=min_feedback,
             _retest_after_calls=retest_after_calls,
@@ -691,6 +810,7 @@ class DurableRouter:
                     "total_maintenance_spend_usd": maintenance_budget.spent_usd + result.total_provider_spend_usd,
                     "winner_model": winner.model,
                     "winner_prompt_version": _hash(winner.selected_prompt)[:16],
+                    "few_shot_examples": len(winner.few_shot_example_ids),
                     "holdout_pass_rate": winner.holdout_pass_rate,
                     "cost_per_success_usd": winner.estimated_cost_per_successful_call_usd,
                     "promoted": promoted,
@@ -704,9 +824,31 @@ class DurableRouter:
                     "representative_output_tokens_p90": representative_output_tokens,
                 }
                 if promoted:
+                    selected_ids = set(winner.few_shot_example_ids)
+                    few_shot_messages: list[dict[str, str]] = []
+                    for example in examples:
+                        if example.id not in selected_ids:
+                            continue
+                        for turn in example.conversation():
+                            few_shot_messages.extend((
+                                {"role": "user", "content": turn.input},
+                                {"role": "assistant", "content": turn.approved_output},
+                            ))
                     db.execute(
-                        "UPDATE routes SET selected_model=?,selected_prompt=?,prompt_version=?,decision_reason=?,last_optimized_calls=?,last_optimized_feedback=?,tested_catalog_revision=?,updated_at=? WHERE route=?",
-                        (winner.model, winner.selected_prompt, _hash(winner.selected_prompt)[:16], f"qualified_{objective}", current["total_calls"], current["feedback_count"], role_plan.catalog_revision, _now(), route),
+                        "UPDATE routes SET selected_model=?,selected_prompt=?,selected_few_shot_json=?,prompt_version=?,decision_reason=?,evidence_provenance='HUMAN_FEEDBACK_CALIBRATED',last_test_summary_json=?,last_optimized_calls=?,last_optimized_feedback=?,tested_catalog_revision=?,updated_at=? WHERE route=?",
+                        (
+                            winner.model,
+                            winner.selected_prompt,
+                            json.dumps(few_shot_messages, ensure_ascii=False, separators=(",", ":")),
+                            _hash(winner.selected_prompt)[:16],
+                            f"qualified_{objective}",
+                            json.dumps(detail, sort_keys=True),
+                            current["total_calls"],
+                            current["feedback_count"],
+                            role_plan.catalog_revision,
+                            _now(),
+                            route,
+                        ),
                     )
                     self._event(db, route, "route_promoted", detail)
                 else:
@@ -734,11 +876,15 @@ class DurableRouter:
             "selected_model": row["selected_model"],
             "selected_prompt_version": row["prompt_version"],
             "decision_reason": row["decision_reason"],
-            "route_phase": (
-                "qualified"
-                if str(row["decision_reason"]).startswith("qualified_")
-                else "untested_bootstrap"
+            "route_phase": _route_phase(row),
+            "evidence_provenance": row["evidence_provenance"],
+            "selected_few_shot_messages": len(json.loads(row["selected_few_shot_json"] or "[]")),
+            "selected_few_shot_examples": int(
+                json.loads(row["last_test_summary_json"] or "{}").get(
+                    "few_shot_examples", 0
+                )
             ),
+            "last_test_summary": json.loads(row["last_test_summary_json"] or "{}"),
             "price_usd": (
                 row["max_cost_per_run_usd"]
                 if row["price_policy"] == "explicit" else None
