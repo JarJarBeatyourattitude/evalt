@@ -17,6 +17,13 @@ from .core import (
     check_result,
     select_role_plan,
 )
+from .reporting import (
+    compare_results,
+    render_comparison_html,
+    render_html_report,
+    render_junit_report,
+    write_reports,
+)
 
 __all__ = [
     "BudgetExceeded",
@@ -34,6 +41,11 @@ __all__ = [
     "Turn",
     "check_result",
     "select_role_plan",
+    "compare_results",
+    "render_comparison_html",
+    "render_html_report",
+    "render_junit_report",
+    "write_reports",
 ]
 
-__version__ = "0.8.19"
+__version__ = "0.8.20"

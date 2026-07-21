@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "evalt"
-version = "0.8.19"
+version = "0.8.20"
 description = "A durable LLM router that finds the most accurate configuration at your price."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -26,7 +26,7 @@ classifiers = [
   "Programming Language :: Python :: 3.13",
   "Topic :: Software Development :: Testing",
 ]
-dependencies = ["python-dotenv>=1.0,<2"]
+dependencies = ["certifi>=2025.1.31", "python-dotenv>=1.0,<2"]
 
 [project.urls]
 Homepage = "https://evalt.dev"

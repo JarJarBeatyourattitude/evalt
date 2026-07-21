@@ -10,6 +10,7 @@ import json
 import math
 import os
 from pathlib import Path
+import ssl
 import statistics
 import threading
 import time
@@ -17,6 +18,7 @@ from typing import Any, Callable, Iterable, Protocol
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+import certifi
 from dotenv import load_dotenv
 
 
@@ -225,7 +227,7 @@ class OpenRouterTransport:
         timeout_seconds: float = 600,
         app_url: str = "https://evalt.dev",
         catalog_ttl_seconds: float = 3600,
-        opener: Callable[..., Any] = urlopen,
+        opener: Callable[..., Any] | None = None,
     ) -> None:
         if not api_key and not os.environ.get("OPENROUTER_API_KEY"):
             dotenv_path = Path.cwd() / ".env"
@@ -240,6 +242,7 @@ class OpenRouterTransport:
         self.set_timeout_seconds(timeout_seconds)
         self._app_url = app_url
         self._opener = opener
+        self._ssl_context = ssl.create_default_context(cafile=certifi.where())
         self._catalog_ttl_seconds = max(0.0, float(catalog_ttl_seconds))
         self._catalog_loaded_at = 0.0
         self._prices: dict[str, tuple[float, float]] | None = None
@@ -293,7 +296,12 @@ class OpenRouterTransport:
         request = Request(url, data=data, headers=headers, method="POST" if data else "GET")
         started = time.monotonic()
         try:
-            with self._opener(request, timeout=self._timeout) as response:
+            response_context = (
+                self._opener(request, timeout=self._timeout)
+                if self._opener is not None
+                else urlopen(request, timeout=self._timeout, context=self._ssl_context)
+            )
+            with response_context as response:
                 if not hasattr(response, "read1"):
                     raw = response.read()
                 else:

@@ -12,7 +12,7 @@ import unittest
 from unittest import mock
 from urllib.error import HTTPError
 
-from evalt import BudgetExceeded, Client, Evalt, ProviderError, Suite, check_result, select_role_plan
+from evalt import BudgetExceeded, Client, Evalt, ProviderError, Suite, check_result, compare_results, render_comparison_html, render_html_report, render_junit_report, select_role_plan
 from evalt.cli import STARTER_SUITE, main as cli_main, parser as cli_parser
 from evalt.core import Completion, OpenRouterTransport, _safe_provider_error_detail
 from evalt.migration import migrate_openai_results
@@ -25,6 +25,97 @@ class CompatibilityTests(unittest.TestCase):
     def test_earlier_imports_resolve_to_evalt_client(self):
         self.assertIs(LegacyClient, Client)
         self.assertIs(ModelSieveClient, Client)
+
+
+class PortableReportTests(unittest.TestCase):
+    def fixture(self):
+        case = {
+            "example_id": "final-1", "split": "holdout", "difficulty": "complex",
+            "passed": False, "reason": "wrong label", "output": "billing <unsafe>",
+            "approved_output": "technical", "target_latency_ms": 1250,
+        }
+        winner = {
+            "model": "fixture/cheap", "holdout_pass_rate": 0.96,
+            "estimated_cost_per_successful_call_usd": 0.0002, "cases": [case],
+        }
+        return {
+            "quality_threshold": 0.95, "winner": winner, "models": [winner],
+            "total_provider_spend_usd": 0.12, "winner_scope": "All requested targets",
+            "regression_suite": {"suite_hash": "abc123"}, "elapsed_seconds": 3.5,
+        }
+
+    def test_html_report_is_standalone_and_escapes_model_outputs(self):
+        html = render_html_report(self.fixture(), title="Fixture report")
+        self.assertIn("<!doctype html>", html)
+        self.assertIn("fixture/cheap", html)
+        self.assertIn("billing &lt;unsafe&gt;", html)
+        self.assertNotIn("billing <unsafe>", html)
+
+    def test_junit_report_preserves_case_failure_and_route_metadata(self):
+        junit = render_junit_report(self.fixture(), suite_name="fixture-route")
+        self.assertIn('tests="1"', junit)
+        self.assertIn('failures="1"', junit)
+        self.assertIn('name="winner_model" value="fixture/cheap"', junit)
+        self.assertIn("wrong label", junit)
+
+    def test_cli_report_writes_html_and_junit_without_provider_access(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            result = root / "result.json"
+            html = root / "report.html"
+            junit = root / "report.xml"
+            result.write_text(json.dumps(self.fixture()), encoding="utf-8")
+            with redirect_stdout(StringIO()):
+                code = cli_main(["report", str(result), "--html", str(html), "--junit", str(junit)])
+            self.assertEqual(code, 0)
+            self.assertTrue(html.exists())
+            self.assertTrue(junit.exists())
+
+    def test_comparison_reports_case_regressions_and_cost_delta(self):
+        baseline = self.fixture()
+        candidate = json.loads(json.dumps(baseline))
+        candidate["winner"]["model"] = "fixture/new"
+        candidate["winner"]["holdout_pass_rate"] = 1.0
+        candidate["winner"]["estimated_cost_per_successful_call_usd"] = 0.0001
+        candidate["winner"]["cases"][0]["passed"] = True
+        candidate["winner"]["cases"][0]["output"] = "technical"
+        comparison = compare_results(baseline, candidate)
+        self.assertTrue(comparison["comparable_contract"])
+        self.assertEqual(comparison["case_summary"]["improvements"], 1)
+        self.assertEqual(comparison["case_summary"]["regressions"], 0)
+        self.assertAlmostEqual(
+            comparison["delta"]["cost_per_1k_successful_calls_usd"], -0.1
+        )
+
+    def test_comparison_refuses_to_imply_a_shared_gate_when_hashes_differ(self):
+        baseline = self.fixture()
+        candidate = json.loads(json.dumps(baseline))
+        candidate["regression_suite"]["suite_hash"] = "different"
+        comparison = compare_results(baseline, candidate)
+        self.assertFalse(comparison["comparable_contract"])
+        self.assertIn("must not be used as a promotion gate", comparison["contract"]["warning"])
+
+    def test_cli_compare_writes_offline_json_and_escaped_html(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            baseline = root / "baseline.json"
+            candidate = root / "candidate.json"
+            output = root / "comparison.json"
+            html = root / "comparison.html"
+            baseline.write_text(json.dumps(self.fixture()), encoding="utf-8")
+            candidate_payload = self.fixture()
+            candidate_payload["winner"]["model"] = "new/<unsafe>"
+            candidate.write_text(json.dumps(candidate_payload), encoding="utf-8")
+            with redirect_stdout(StringIO()):
+                code = cli_main([
+                    "compare", str(baseline), str(candidate),
+                    "--output", str(output), "--html", str(html),
+                ])
+            self.assertEqual(code, 0)
+            self.assertTrue(output.exists())
+            rendered = html.read_text(encoding="utf-8")
+            self.assertIn("new/&lt;unsafe&gt;", rendered)
+            self.assertNotIn("new/<unsafe>", rendered)
 
 
 class FakeResponse:
@@ -930,6 +1021,14 @@ class SdkTests(unittest.TestCase):
         self.assertEqual(transport.timeout_seconds, 1800)
         with self.assertRaisesRegex(ValueError, "greater than zero"):
             transport.set_timeout_seconds(0)
+
+    def test_default_transport_uses_a_bundled_verified_ca_context(self):
+        with mock.patch("last_good_prompt.core.urlopen", return_value=FakeResponse({"ok": True})) as opener:
+            transport = OpenRouterTransport("sk-or-v1-test-key")
+            self.assertEqual(transport._request("https://openrouter.ai/test"), {"ok": True})
+        context = opener.call_args.kwargs["context"]
+        self.assertTrue(context.check_hostname)
+        self.assertGreater(len(context.get_ca_certs()), 0)
 
     def test_result_gate_fails_quality_cost_and_partial_coverage_for_ci(self):
         report = check_result({

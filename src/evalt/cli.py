@@ -11,6 +11,7 @@ import time
 
 from .core import BudgetExceeded, Evalt, ProviderError, Suite, check_result
 from .migration import migrate_openai_results
+from .reporting import compare_results, render_comparison_html, write_reports
 
 
 STARTER_SUITE = {
@@ -134,7 +135,7 @@ def parser() -> argparse.ArgumentParser:
         prog="evalt",
         description="Run prompts through a durable, tested, budget-bounded model route.",
     )
-    root.add_argument("--version", action="version", version="evalt 0.8.19")
+    root.add_argument("--version", action="version", version="evalt 0.8.20")
     commands = root.add_subparsers(dest="command", required=True)
 
     init = commands.add_parser("init", help="Write a reviewable starter suite; no provider call.")
@@ -191,6 +192,23 @@ def parser() -> argparse.ArgumentParser:
     optimize.add_argument("--max-parallel-scenarios", type=int, help="Override parallel scenario lanes per model for this run.")
     optimize.add_argument("--request-timeout", type=float, help="Override the suite's per-response wall-clock deadline (default 600 seconds; maximum 7200).")
     optimize.add_argument("--fixed-prompt", action="store_true", help="Override the suite and compare routes without modifying its prompt.")
+    optimize.add_argument("--html-report", help="Also write a self-contained offline HTML report.")
+    optimize.add_argument("--junit-report", help="Also write case-level JUnit XML for CI.")
+
+    report = commands.add_parser("report", help="Render saved JSON as HTML and/or JUnit; no provider call.")
+    report.add_argument("result", help="Saved Evalt result JSON.")
+    report.add_argument("--html", help="Self-contained HTML output path.")
+    report.add_argument("--junit", help="JUnit XML output path.")
+    report.add_argument("--title", default="Evalt evaluation report")
+
+    compare = commands.add_parser(
+        "compare", help="Diff two saved runs by final-test case; no provider call."
+    )
+    compare.add_argument("baseline", help="Earlier saved Evalt result JSON.")
+    compare.add_argument("candidate", help="Candidate saved Evalt result JSON.")
+    compare.add_argument("--output", help="Also write the structured comparison JSON.")
+    compare.add_argument("--html", help="Also write a self-contained HTML comparison.")
+    compare.add_argument("--title", default="Evalt comparison")
 
     check = commands.add_parser("check", help="Gate an exported result for CI; no provider call.")
     check.add_argument("result")
@@ -342,6 +360,47 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "status":
             print(json.dumps(Evalt(transport=_OfflineTransport(), state_path=args.state).route_status(args.route), indent=2, ensure_ascii=False))
             return 0
+        if args.command == "report":
+            with Path(args.result).open(encoding="utf-8") as handle:
+                result_payload = json.load(handle)
+            written = write_reports(
+                result_payload,
+                html_path=args.html,
+                junit_path=args.junit,
+                title=args.title,
+            )
+            print(json.dumps({"provider_call_started": False, "reports": written}, indent=2))
+            return 0
+        if args.command == "compare":
+            with Path(args.baseline).open(encoding="utf-8") as handle:
+                baseline_payload = json.load(handle)
+            with Path(args.candidate).open(encoding="utf-8") as handle:
+                candidate_payload = json.load(handle)
+            comparison = compare_results(baseline_payload, candidate_payload)
+            written: dict[str, str] = {}
+            if args.output:
+                target = Path(args.output)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(
+                    json.dumps(comparison, indent=2, ensure_ascii=False) + "\n",
+                    encoding="utf-8",
+                )
+                written["json"] = str(target)
+            if args.html:
+                target = Path(args.html)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(
+                    render_comparison_html(comparison, title=args.title),
+                    encoding="utf-8",
+                )
+                written["html"] = str(target)
+            payload = {
+                "provider_call_started": False,
+                "comparison": comparison,
+                "reports": written,
+            }
+            print(json.dumps(payload, indent=2, ensure_ascii=False))
+            return 0
         if args.command == "optimize":
             suite = Suite.load(args.suite)
             request_timeout_seconds = (
@@ -391,7 +450,18 @@ def main(argv: list[str] | None = None) -> int:
             finally:
                 progress.close()
             result.save(args.output)
-            print(json.dumps(_summary(result, args.output), indent=2, ensure_ascii=False))
+            reports = {}
+            if args.html_report or args.junit_report:
+                reports = write_reports(
+                    result.to_dict(),
+                    html_path=args.html_report,
+                    junit_path=args.junit_report,
+                    title=f"Evalt · {suite.name}",
+                )
+            summary = _summary(result, args.output)
+            if reports:
+                summary["reports"] = reports
+            print(json.dumps(summary, indent=2, ensure_ascii=False))
             return 0
         with Path(args.result).open(encoding="utf-8") as handle:
             report = check_result(
