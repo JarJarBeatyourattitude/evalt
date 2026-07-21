@@ -15,6 +15,7 @@ from urllib.error import HTTPError
 
 from evalt import BudgetExceeded, Client, Evalt, ProviderError, Suite, check_result, compare_results, render_comparison_html, render_html_report, render_junit_report, select_role_plan
 from evalt.cli import STARTER_SUITE, main as cli_main, parser as cli_parser
+from evalt.acceptance import AcceptanceFailure, redact_trace, validate_auto_first_route_receipt
 from evalt.core import Completion, OpenRouterTransport, _safe_provider_error_detail
 from evalt.migration import migrate_openai_results
 from modelsieve import Client as ModelSieveClient
@@ -26,6 +27,84 @@ class CompatibilityTests(unittest.TestCase):
     def test_earlier_imports_resolve_to_evalt_client(self):
         self.assertIs(LegacyClient, Client)
         self.assertIs(ModelSieveClient, Client)
+
+
+class AutomaticFirstRouteAcceptanceTests(unittest.TestCase):
+    def receipt(self):
+        summary = {
+            "final_test_scenarios": 5,
+            "holdout_pass_rate": 1.0,
+            "tested_configurations": 3,
+            "prompt_candidates_tested": 6,
+            "prompt_rewrites_tested": 3,
+            "evidence_provenance": "AI_GENERATED_AI_JUDGED",
+            "judge_calibrated": True,
+            "workflow_spend_usd": 0.75,
+            "winner_model": "cheap-a#reasoning=low",
+        }
+        return {
+            "target_accuracy": 0.95,
+            "test_budget_usd": 1.0,
+            "first_answer": {
+                "route_phase": "ai_tested",
+                "initial_test_summary": summary,
+            },
+            "second_answer": {"route_phase": "ai_tested"},
+            "route_status": {"route_phase": "ai_tested"},
+            "first_call_events": [
+                {"event": "initial_optimization_started"},
+                {"event": "suite_design_started"},
+                {
+                    "event": "suite_design_completed",
+                    "case_count": 25,
+                    "judge_calibrated": True,
+                    "judge_calibration_checks": 4,
+                },
+                {
+                    "event": "prompt_candidate_completed",
+                    "model": "cheap-a#reasoning=low",
+                    "kind": "starting_prompt",
+                },
+                {
+                    "event": "prompt_candidate_completed",
+                    "model": "cheap-a#reasoning=low",
+                    "kind": "rewrite",
+                },
+                {"event": "model_completed", "model": "cheap-a#reasoning=low"},
+                {"event": "model_completed", "model": "cheap-b#reasoning=low"},
+                {"event": "model_completed", "model": "cheap-b#reasoning=high"},
+                {"event": "initial_optimization_completed"},
+                {"event": "production_call_completed"},
+            ],
+            "second_call_events": [{"event": "production_call_completed"}],
+        }
+
+    def test_acceptance_requires_the_observable_full_tournament_and_reuse(self):
+        report = validate_auto_first_route_receipt(self.receipt())
+        self.assertEqual(report["status"], "PASS")
+        self.assertEqual(report["settled_configurations"], 3)
+        self.assertTrue(report["route_reused"])
+
+    def test_acceptance_rejects_the_old_instant_bootstrap_path(self):
+        receipt = self.receipt()
+        receipt["first_answer"]["route_phase"] = "untested_bootstrap"
+        receipt["first_call_events"] = [{"event": "production_call_completed"}]
+        with self.assertRaisesRegex(AcceptanceFailure, "missing first-call event"):
+            validate_auto_first_route_receipt(receipt)
+
+    def test_acceptance_rejects_a_second_call_that_restarts_design(self):
+        receipt = self.receipt()
+        receipt["second_call_events"].insert(0, {"event": "suite_design_started"})
+        with self.assertRaisesRegex(AcceptanceFailure, "second call incorrectly"):
+            validate_auto_first_route_receipt(receipt)
+
+    def test_trace_redaction_removes_secret_keys_and_values(self):
+        redacted = redact_trace(
+            {"authorization": "Bearer secret-value", "error": "secret-value failed"},
+            ("secret-value",),
+        )
+        self.assertNotIn("authorization", redacted)
+        self.assertEqual(redacted["error"], "[REDACTED] failed")
 
 
 class PortableReportTests(unittest.TestCase):
@@ -510,6 +589,15 @@ class SdkTests(unittest.TestCase):
         self.assertEqual(started, {"cheap-a", "cheap-b"})
         self.assertEqual(completed, started)
         self.assertTrue(all("target_latency_p90_ms" in event for event in events if event["event"] == "model_completed"))
+        prompt_events = [
+            event for event in events if event["event"] == "prompt_candidate_completed"
+        ]
+        self.assertEqual(
+            {event["model"] for event in prompt_events}, {"cheap-a", "cheap-b"}
+        )
+        self.assertTrue(any(event["kind"] == "rewrite" for event in prompt_events))
+        self.assertTrue(all("prompt_hash" in event for event in prompt_events))
+        self.assertTrue(all(item.prompt_rewrites_tested >= 1 for item in result.models))
 
     def test_latency_ceiling_can_reject_the_cheapest_otherwise_passing_route(self):
         class LatencyTransport(FakeTransport):
@@ -659,10 +747,21 @@ class SdkTests(unittest.TestCase):
         self.assertEqual(result.winner.holdout_pass_rate, 0)
         self.assertTrue(any("Unexpected JSON key" in case.reason for case in result.winner.cases))
 
-    def test_perfect_training_and_validation_skip_prompt_rewrite(self):
+    def test_perfect_training_and_validation_still_measure_one_prompt_rewrite(self):
         class AlreadyCorrectTransport(FakeTransport):
             def complete(self, model, messages, *, max_tokens, response_schema=None):
                 self.calls.append((model, messages, max_tokens, response_schema))
+                if response_schema and "Improve the current prompt" in messages[0]["content"]:
+                    return Completion(
+                        json.dumps({
+                            "prompt": "Return exactly the lowercase label billing.",
+                            "hypothesis": "Make the already observed output contract explicit.",
+                            "few_shot_example_ids": [],
+                        }),
+                        model,
+                        f"gen-{len(self.calls)}",
+                        0.0001,
+                    )
                 return Completion("billing", model, f"gen-{len(self.calls)}", 0.0001)
 
         examples = [
@@ -678,7 +777,9 @@ class SdkTests(unittest.TestCase):
         )
 
         called_models = [model for model, *_rest in transport.calls]
-        self.assertNotIn("optimizer", called_models)
+        self.assertIn("optimizer", called_models)
+        self.assertEqual(result.winner.prompt_rewrites_tested, 1)
+        self.assertEqual(result.winner.prompt_candidates_tested, 2)
         self.assertTrue(any(case.split == "train" for case in result.winner.cases))
         self.assertTrue(all(max_tokens == 64 for model, _messages, max_tokens, _schema in transport.calls if model == "target"))
         self.assertEqual(result.winner.holdout_pass_rate, 1)
@@ -908,6 +1009,33 @@ class SdkTests(unittest.TestCase):
                 ["production_call_started", "production_call_completed"],
             )
 
+    def test_interactive_progress_surfaces_the_parallel_broad_screen(self):
+        stream = StringIO()
+        evalt = Evalt(transport=FakeTransport(), show_progress=True)
+        with redirect_stderr(stream):
+            evalt._emit_progress({
+                "event": "broad_screen_started",
+                "configurations": 12,
+                "parallel_models": 12,
+            })
+            evalt._emit_progress({
+                "event": "model_screen_completed",
+                "model": "cheap#reasoning=low",
+                "validation_pass_rate": 0.8,
+                "target_latency_p90_ms": 432,
+                "screening_spend_usd": 0.0042,
+            })
+            evalt._emit_progress({
+                "event": "broad_screen_completed",
+                "configurations": 12,
+                "completed_configurations": 11,
+                "elapsed_seconds": 24.6,
+            })
+        rendered = stream.getvalue()
+        self.assertIn("BROAD SCREEN · 12 model configuration(s) · up to 12 in parallel", rendered)
+        self.assertIn("SCREENED · cheap#reasoning=low · 80% validation", rendered)
+        self.assertIn("BROAD SCREEN COMPLETE · 11/12 configuration(s) settled · 24.6s", rendered)
+
     def test_primary_run_is_a_durable_budget_bounded_router_not_a_json_export(self):
         with TemporaryDirectory() as directory:
             state = Path(directory) / "evalt.db"
@@ -1004,6 +1132,8 @@ class SdkTests(unittest.TestCase):
             self.assertEqual(first.decision_reason, "provisional_ai_qualified")
             self.assertEqual(first.initial_test_summary["final_test_scenarios"], 5)
             self.assertGreaterEqual(first.initial_test_summary["tested_configurations"], 1)
+            self.assertGreaterEqual(first.initial_test_summary["prompt_candidates_tested"], 2)
+            self.assertGreaterEqual(first.initial_test_summary["prompt_rewrites_tested"], 1)
             self.assertEqual(first.initial_test_summary["few_shot_examples"], 1)
             status = evalt.route_status("automatic-first-route")
             self.assertEqual(status["route_phase"], "ai_tested")
@@ -1047,6 +1177,7 @@ class SdkTests(unittest.TestCase):
             event_names = [event["event"] for event in events]
             self.assertIn("initial_optimization_started", event_names)
             self.assertIn("initial_optimization_completed", event_names)
+            self.assertIn("prompt_candidate_completed", event_names)
 
     def test_bootstrap_only_is_an_explicit_escape_hatch(self):
         with TemporaryDirectory() as directory:
@@ -1414,6 +1545,7 @@ class SdkTests(unittest.TestCase):
             self.assertEqual(draft.evidence_provenance, "AI_DRAFT_UNAPPROVED")
             self.assertGreater(draft.designer_spend_usd, 0)
             self.assertLess(draft.remaining_optimization_budget_usd, 1)
+            self.assertEqual(draft.request_timeout_seconds, 120)
             self.assertTrue(any("Judge calibration" in note for note in draft.design_notes))
             suite = draft.approve()
             self.assertEqual(suite.evidence_provenance, "HUMAN_APPROVED_AI_DRAFT")
@@ -2131,10 +2263,9 @@ class SdkTests(unittest.TestCase):
         )
         self.assertIn("far#reasoning=high", result.pruned_models)
         self.assertNotIn("cheap#reasoning=high", result.pruned_models)
+        self.assertIn("near#reasoning=high", result.pruned_models)
         self.assertEqual(result.winner.model, "near#reasoning=low")
         self.assertIn("adaptive search band", result.winner_scope)
-        near_high = next(item for item in result.models if item.model == "near#reasoning=high")
-        self.assertEqual(near_high.prompt_origin, "reasoning_hone_from:near#reasoning=low")
 
     def test_adaptive_cheapest_passing_stops_before_an_expensive_rescue_wave(self):
         transport = FakeTransport()

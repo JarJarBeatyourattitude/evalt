@@ -31,7 +31,7 @@ repository checkout:
 
 ```bash
 python -m venv .venv
-python -m pip install dist/evalt-0.9.0-py3-none-any.whl
+python -m pip install dist/evalt-0.9.1-py3-none-any.whl
 evalt --version
 ```
 
@@ -170,6 +170,13 @@ Feedback on `support-routing` cannot enter the evaluation set for `call-summary`
 `fraud-review`. Reusing a route name means “this is the same repeated task”; using a new
 name creates a separate optimization track in the same local state database.
 
+Automatic first-route requests use a 120-second per-provider deadline so one stalled
+configuration cannot freeze the tournament. Set `test_request_timeout_seconds=` on
+`Evalt.run(...)` when a genuinely long-output task needs more time. Explicit `Suite`
+workflows keep their independently configurable 600-second default. During the broad
+screen, interactive progress reports each settled model configuration, validation
+rate, latency, spend, and total elapsed time.
+
 The first call now performs the bounded AI-designed tournament by default. It fails
 closed without serving or promoting a route when no configuration clears the requested
 accuracy, the test is exploratory, judge calibration fails, or the shared test budget
@@ -210,7 +217,9 @@ workflows need no comparison model: their approved validation target is the bar.
 Reasoning effort is tested as part of the model configuration only when the current ZDR
 endpoint supports it. The adaptive search first runs one configuration across a broad
 price/intelligence frontier, then spends the remaining test budget on effort variants for
-models in the observed task-capability band. The first request receives large,
+models in the observed task-capability band. If an effort level passes, only a cheaper
+lower effort can still improve the cost objective; higher effort is pruned. If it fails,
+Evalt tests only higher effort as a possible accuracy repair. The first request receives large,
 reasoning-aware completion headroom: 32,768 tokens without reasoning, 65,536 at low,
 98,304 at medium, and up to 131,072 at high effort, always clamped to the provider's
 natural output limit and the remaining context. An empty or explicitly truncated

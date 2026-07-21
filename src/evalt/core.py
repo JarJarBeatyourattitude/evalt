@@ -245,7 +245,7 @@ class SuiteDraft:
     holdout_repeats: int = 2
     max_parallel_models: int = 16
     max_parallel_scenarios: int = 32
-    request_timeout_seconds: float = 600
+    request_timeout_seconds: float = 120
     max_p90_latency_seconds: float | None = None
     latency_value_usd_per_second: float = 0.0
     allow_few_shot: bool = True
@@ -253,6 +253,7 @@ class SuiteDraft:
     name: str = "evalt-suite"
     evidence_provenance: str = "AI_DRAFT_UNAPPROVED"
     design_notes: tuple[str, ...] = ()
+    judge_calibration_checks: int = 0
 
     @property
     def remaining_optimization_budget_usd(self) -> float:
@@ -281,13 +282,14 @@ class SuiteDraft:
                 holdout_repeats=int(value.get("holdout_repeats", 2)),
                 max_parallel_models=int(value.get("max_parallel_models", 16)),
                 max_parallel_scenarios=int(value.get("max_parallel_scenarios", 32)),
-                request_timeout_seconds=float(value.get("request_timeout_seconds", 600)),
+                request_timeout_seconds=float(value.get("request_timeout_seconds", 120)),
                 max_p90_latency_seconds=(float(value["max_p90_latency_seconds"]) if value.get("max_p90_latency_seconds") is not None else None),
                 latency_value_usd_per_second=float(value.get("latency_value_usd_per_second", 0.0)),
                 allow_few_shot=bool(value.get("allow_few_shot", True)),
                 max_few_shot_examples=int(value.get("max_few_shot_examples", 3)),
                 evidence_provenance="AI_DRAFT_UNAPPROVED",
                 design_notes=tuple(str(item) for item in value.get("design_notes", [])),
+                judge_calibration_checks=int(value.get("judge_calibration_checks", 0)),
             )
         except (KeyError, TypeError, ValueError) as error:
             raise ValueError(f"Invalid Evalt suite draft: {error}") from error
@@ -330,6 +332,7 @@ class SuiteDraft:
             "max_few_shot_examples": self.max_few_shot_examples,
             "evidence_provenance": self.evidence_provenance,
             "design_notes": list(self.design_notes),
+            "judge_calibration_checks": self.judge_calibration_checks,
         }
 
     def save(self, path: str | Path) -> None:
@@ -534,7 +537,42 @@ class Evalt:
             message = (
                 f"Evalt · {event.get('model', 'route')} · "
                 f"{float(event.get('final_test_pass_rate') or 0):.0%} final test · "
+                f"{int(event.get('prompt_candidates_tested') or 1)} prompt package(s) · "
                 f"${float(event.get('optimization_spend_usd') or 0):.6f} spent"
+            )
+        elif kind == "broad_screen_started":
+            message = (
+                f"Evalt · BROAD SCREEN · {int(event.get('configurations') or 0)} "
+                f"model configuration(s) · up to {int(event.get('parallel_models') or 1)} in parallel"
+            )
+        elif kind == "model_screen_completed":
+            message = (
+                f"Evalt · SCREENED · {event.get('model', 'model')} · "
+                f"{float(event.get('validation_pass_rate') or 0):.0%} validation · "
+                f"p90 {int(event.get('target_latency_p90_ms') or 0)} ms · "
+                f"${float(event.get('screening_spend_usd') or 0):.6f} spent"
+            )
+        elif kind == "broad_screen_completed":
+            message = (
+                f"Evalt · BROAD SCREEN COMPLETE · "
+                f"{int(event.get('completed_configurations') or 0)}/"
+                f"{int(event.get('configurations') or 0)} configuration(s) settled · "
+                f"{float(event.get('elapsed_seconds') or 0):.1f}s elapsed"
+            )
+        elif kind in {"model_unavailable", "model_incomplete"}:
+            label = "UNAVAILABLE" if kind == "model_unavailable" else "INCOMPLETE"
+            message = (
+                f"Evalt · {label} · {event.get('model', 'model')} · "
+                f"{event.get('reason', 'provider did not settle')}"
+            )
+        elif kind == "prompt_candidate_completed":
+            candidate = int(event.get("candidate") or 0)
+            label = "original prompt" if candidate == 0 else f"prompt rewrite {candidate}"
+            decision = "selected so far" if event.get("selected") else "not selected"
+            message = (
+                f"Evalt · {event.get('model', 'model')} · {label} · "
+                f"{float(event.get('validation_pass_rate') or 0):.0%} validation · "
+                f"{int(event.get('few_shot_examples') or 0)} example(s) · {decision}"
             )
         else:
             return
@@ -624,7 +662,7 @@ class Evalt:
         holdout_repeats: int = 2,
         max_parallel_models: int = 16,
         max_parallel_scenarios: int = 32,
-        request_timeout_seconds: float = 600,
+        request_timeout_seconds: float = 120,
         max_p90_latency_seconds: float | None = None,
         latency_value_usd_per_second: float = 0.0,
         allow_few_shot: bool = True,
@@ -688,6 +726,7 @@ class Evalt:
         drafted_examples: list[Example] = []
         design_notes: list[str] = []
         suggested_evaluator: dict[str, Any] = dict(evaluator or {})
+        judge_calibration_checks = 0
 
         if generated_count:
             self._emit_progress({
@@ -854,6 +893,7 @@ class Evalt:
                         "No candidate judge passed the AI-designed calibration checks; no tournament ran."
                     )
                 selected_evaluator = calibrated_evaluator
+                judge_calibration_checks = len(calibration_rows)
                 design_notes.insert(
                     1,
                     f"Judge calibration: {selected_evaluator} matched {len(calibration_rows)} labeled checks.",
@@ -891,6 +931,7 @@ class Evalt:
             allow_few_shot=bool(allow_few_shot),
             max_few_shot_examples=int(max_few_shot_examples),
             design_notes=tuple(design_notes),
+            judge_calibration_checks=judge_calibration_checks,
         )
         if draft.remaining_optimization_budget_usd <= 0:
             raise BudgetExceeded("Test design consumed the workflow cap before a tournament could run.")
@@ -901,6 +942,9 @@ class Evalt:
             "designer_spend_usd": draft.designer_spend_usd,
             "remaining_budget_usd": draft.remaining_optimization_budget_usd,
             "evidence_provenance": draft.evidence_provenance,
+            "judge_calibrated": draft.judge_calibration_checks >= 3,
+            "judge_calibration_checks": draft.judge_calibration_checks,
+            "evaluator_model": draft.evaluator_model,
         })
         return draft
 
@@ -967,6 +1011,7 @@ class Evalt:
         case_count: int = 25,
         designer_model: str | None = None,
         evaluator_model: str | None = None,
+        test_request_timeout_seconds: float = 120,
     ) -> OptimizationResult | RoutedAnswer:
         if isinstance(suite_or_prompt, Suite):
             if input is not None:
@@ -998,6 +1043,10 @@ class Evalt:
             raise ValueError("input is required when executing a prompt through Evalt.")
         if first_run not in {"optimize", "bootstrap"}:
             raise ValueError("first_run must be 'optimize' or 'bootstrap'.")
+        if not 0 < float(test_request_timeout_seconds) <= 7200:
+            raise ValueError(
+                "test_request_timeout_seconds must be greater than zero and no more than 7200 seconds."
+            )
         if price_usd is not None and budget_usd is not None and float(price_usd) != float(budget_usd):
             raise ValueError("Use price_usd; budget_usd is only a backward-compatible alias.")
         max_cost_per_run_usd = (
@@ -1091,6 +1140,7 @@ class Evalt:
                     optimize_prompt=bool(optimize_prompt),
                     max_p90_latency_seconds=max_p90_latency_seconds,
                     latency_value_usd_per_second=latency_value_usd_per_second,
+                    request_timeout_seconds=float(test_request_timeout_seconds),
                 )
                 initial_result = self.run(draft.autopilot_suite())
                 initial_test_spend_usd = round(
@@ -1108,6 +1158,9 @@ class Evalt:
                         examples=draft.examples,
                         evidence_provenance="AI_GENERATED_AI_JUDGED",
                         total_workflow_spend_usd=initial_test_spend_usd,
+                        designer_model=draft.designer_model,
+                        evaluator_model=draft.evaluator_model,
+                        judge_calibration_checks=draft.judge_calibration_checks,
                     )
                 except ValueError as error:
                     raise ProviderError(str(error)) from error

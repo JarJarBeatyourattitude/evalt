@@ -138,6 +138,9 @@ class ModelResult:
     holdout_pass_rates_by_difficulty: dict[str, float] = field(default_factory=dict)
     passed_difficulty_floors: bool = True
     prompt_origin: str = "starting_prompt"
+    prompt_candidates_tested: int = 1
+    prompt_rewrites_tested: int = 0
+    selected_prompt_changed: bool = False
     few_shot_example_ids: list[str] = field(default_factory=list)
     few_shot_provenance: list[dict[str, Any]] = field(default_factory=list)
     cases: list[CaseResult] = field(default_factory=list)
@@ -1052,6 +1055,7 @@ class Client:
                 seed_few_shot_ids=seed_few_shot_ids_by_model.get(model),
                 prompt_origin=prompt_origin_by_model.get(model, "starting_prompt"),
                 optimize_prompt=bool(optimize_prompt),
+                progress_callback=emit_progress,
             )
 
         def run_batch(configurations: list[str]) -> list[ModelResult]:
@@ -1070,6 +1074,9 @@ class Client:
                             "target_latency_p50_ms": item.target_latency_p50_ms,
                             "target_latency_p90_ms": item.target_latency_p90_ms,
                             "optimization_spend_usd": item.optimization_spend_usd,
+                            "prompt_candidates_tested": item.prompt_candidates_tested,
+                            "prompt_rewrites_tested": item.prompt_rewrites_tested,
+                            "selected_prompt_changed": item.selected_prompt_changed,
                             "elapsed_seconds": round(time.monotonic() - optimization_started, 3),
                         })
                     except BudgetExceeded as error:
@@ -1096,6 +1103,9 @@ class Client:
                             "target_latency_p50_ms": item.target_latency_p50_ms,
                             "target_latency_p90_ms": item.target_latency_p90_ms,
                             "optimization_spend_usd": item.optimization_spend_usd,
+                            "prompt_candidates_tested": item.prompt_candidates_tested,
+                            "prompt_rewrites_tested": item.prompt_rewrites_tested,
+                            "selected_prompt_changed": item.selected_prompt_changed,
                             "elapsed_seconds": round(time.monotonic() - optimization_started, 3),
                         })
                     except BudgetExceeded as error:
@@ -1142,6 +1152,12 @@ class Client:
 
         def run_screening(configurations: list[str]) -> list[dict[str, Any]]:
             completed: dict[str, dict[str, Any]] = {}
+            emit_progress({
+                "event": "broad_screen_started",
+                "configurations": len(configurations),
+                "parallel_models": min(int(max_parallel_models), len(configurations)),
+                "elapsed_seconds": round(time.monotonic() - optimization_started, 3),
+            })
             with ThreadPoolExecutor(max_workers=min(int(max_parallel_models), len(configurations))) as pool:
                 futures = {pool.submit(screen_model, model): model for model in configurations}
                 for future in as_completed(futures):
@@ -1154,6 +1170,12 @@ class Client:
                     except ProviderError as error:
                         unavailable_models.append({"model": model, "reason": str(error), "stage": "screening"})
                         emit_progress({"event": "model_unavailable", "model": model, "reason": str(error)})
+            emit_progress({
+                "event": "broad_screen_completed",
+                "configurations": len(configurations),
+                "completed_configurations": len(completed),
+                "elapsed_seconds": round(time.monotonic() - optimization_started, 3),
+            })
             return [completed[model] for model in configurations if model in completed]
 
         if adaptive_search:
@@ -1491,9 +1513,47 @@ class Client:
                     if item.holdout_pass_rate >= near_floor
                 }
             hone_models = model_list[len(broad_models):]
+            broad_result_by_base = {
+                item.model.split("#reasoning=", 1)[0]: item
+                for item in results
+                if item.model in broad_models
+            }
+            effort_rank = {
+                "none": 0,
+                "minimal": 1,
+                "low": 2,
+                "medium": 3,
+                "high": 4,
+                "xhigh": 5,
+                "max": 6,
+            }
+
+            def split_effort(configuration: str) -> tuple[str, str]:
+                if "#reasoning=" not in configuration:
+                    return configuration, "none"
+                base_model, effort = configuration.rsplit("#reasoning=", 1)
+                return base_model, effort
+
+            def reasoning_hone_can_improve(model: str) -> bool:
+                base_model, candidate_effort = split_effort(model)
+                broad_result = broad_result_by_base.get(base_model)
+                if broad_result is None or base_model not in hone_base_models:
+                    return False
+                _broad_model, broad_effort = split_effort(broad_result.model)
+                candidate_rank = effort_rank[candidate_effort]
+                broad_rank = effort_rank[broad_effort]
+                if broad_result.passed_quality_floor:
+                    # Once a base model clears the quality gate, more reasoning is
+                    # strictly dominated for a lowest-cost search.  A cheaper lower
+                    # effort can still be worth measuring.
+                    return candidate_rank < broad_rank
+                # If the broad effort missed, only extra reasoning can plausibly
+                # repair accuracy.  Do not spend on a still-weaker configuration.
+                return candidate_rank > broad_rank
+
             eligible_hone = [
                 model for model in hone_models
-                if model.split("#reasoning=", 1)[0] in hone_base_models
+                if reasoning_hone_can_improve(model)
             ]
             pruned_models.extend(model for model in hone_models if model not in eligible_hone)
             # Reasoning effort should be the lever under test, not a hidden change
@@ -1848,6 +1908,7 @@ class Client:
         seed_few_shot_ids: list[str] | None = None,
         prompt_origin: str = "starting_prompt",
         optimize_prompt: bool = True,
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> ModelResult:
         started_spend = budget.spent_usd
         initial_prompt = seed_prompt or prompt
@@ -1876,11 +1937,20 @@ class Client:
         selected_dev = baseline_dev
         selected_rate = baseline_dev_rate
         candidate_cases: list[CaseResult] = []
-        for round_number in (
-            range(1, int(rounds) + 1)
-            if optimize_prompt and (selected_rate < 1 or selected_train_rate < 1)
-            else ()
-        ):
+        prompt_candidates_tested = 1
+        if progress_callback is not None:
+            progress_callback({
+                "event": "prompt_candidate_completed",
+                "model": model,
+                "candidate": 0,
+                "kind": "starting_prompt",
+                "prompt_hash": hashlib.sha256(initial_prompt.encode("utf-8")).hexdigest()[:16],
+                "few_shot_examples": len(initial_few_shot_ids),
+                "training_pass_rate": round(baseline_train_rate, 6),
+                "validation_pass_rate": round(baseline_dev_rate, 6),
+                "selected": True,
+            })
+        for round_number in (range(1, int(rounds) + 1) if optimize_prompt else ()):
             revised_prompt, revised_few_shot_ids = self._propose_prompt(
                 selected_prompt,
                 model,
@@ -1912,6 +1982,8 @@ class Client:
             candidate_cases += revised_dev
             revised_rate = _pass_rate(revised_dev)
             revised_train_rate = _pass_rate(revised_train)
+            prompt_candidates_tested += 1
+            selected_candidate = False
             if (
                 revised_rate > selected_rate
                 or (
@@ -1925,6 +1997,19 @@ class Client:
                 selected_train_rate = revised_train_rate
                 selected_dev = revised_dev
                 selected_rate = revised_rate
+                selected_candidate = True
+            if progress_callback is not None:
+                progress_callback({
+                    "event": "prompt_candidate_completed",
+                    "model": model,
+                    "candidate": round_number,
+                    "kind": "rewrite",
+                    "prompt_hash": hashlib.sha256(revised_prompt.encode("utf-8")).hexdigest()[:16],
+                    "few_shot_examples": len(revised_few_shot_ids),
+                    "training_pass_rate": round(revised_train_rate, 6),
+                    "validation_pass_rate": round(revised_rate, 6),
+                    "selected": selected_candidate,
+                })
             if selected_rate >= 1 and selected_train_rate >= 1:
                 break
         selected_kind = (
@@ -2009,6 +2094,11 @@ class Client:
             holdout_pass_rates_by_difficulty=holdout_by_difficulty,
             passed_difficulty_floors=passed_difficulty_floors,
             prompt_origin=selected_prompt_origin,
+            prompt_candidates_tested=prompt_candidates_tested,
+            prompt_rewrites_tested=max(0, prompt_candidates_tested - 1),
+            selected_prompt_changed=(
+                selected_prompt != prompt or bool(selected_few_shot_ids)
+            ),
             few_shot_example_ids=selected_few_shot_ids,
             few_shot_provenance=[
                 {

@@ -465,6 +465,9 @@ class DurableRouter:
         examples: Sequence[Example],
         evidence_provenance: str,
         total_workflow_spend_usd: float,
+        designer_model: str,
+        evaluator_model: str,
+        judge_calibration_checks: int,
     ) -> dict[str, Any]:
         """Durably install one split-tested first-route package or fail closed."""
         winner = result.winner
@@ -505,9 +508,20 @@ class DurableRouter:
             "holdout_pass_rate": winner.holdout_pass_rate,
             "final_test_scenarios": winner.holdout_unique_scenarios,
             "tested_configurations": len(result.models),
+            "prompt_candidates_tested": sum(
+                item.prompt_candidates_tested for item in result.models
+            ),
+            "prompt_rewrites_tested": sum(
+                item.prompt_rewrites_tested for item in result.models
+            ),
+            "winner_prompt_changed": winner.selected_prompt_changed,
             "few_shot_examples": len(winner.few_shot_example_ids),
             "workflow_spend_usd": round(float(total_workflow_spend_usd), 10),
             "evidence_provenance": evidence_provenance,
+            "designer_model": designer_model,
+            "evaluator_model": evaluator_model,
+            "judge_calibrated": int(judge_calibration_checks) >= 3,
+            "judge_calibration_checks": int(judge_calibration_checks),
         }
         with self._db() as db:
             current = db.execute("SELECT * FROM routes WHERE route=?", (route,)).fetchone()
