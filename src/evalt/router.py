@@ -338,6 +338,7 @@ class DurableRouter:
                 db.execute("UPDATE routes SET source_prompt_version=prompt_version WHERE source_prompt_version='' ")
             for name, declaration in (
                 ("max_cost_per_run_usd", "REAL NOT NULL DEFAULT 0.02"),
+                ("price_policy", "TEXT NOT NULL DEFAULT 'legacy'"),
                 ("test_budget_usd", "REAL NOT NULL DEFAULT 0"),
                 ("objective", "TEXT NOT NULL DEFAULT 'best_within_price'"),
                 ("test_budget_policy", "TEXT NOT NULL DEFAULT 'legacy'"),
@@ -413,7 +414,7 @@ class DurableRouter:
         route: str,
         prompt: str,
         input: Any,
-        max_cost_per_run_usd: float,
+        max_cost_per_run_usd: float | None,
         models: Sequence[str] = DEFAULT_TARGETS,
         max_tokens: int = 600,
         target_accuracy: float = 0.95,
@@ -427,7 +428,7 @@ class DurableRouter:
         min_feedback: int = 5,
         catalog_revision: str = "explicit-model-list",
     ) -> RoutedAnswer:
-        if not 0 < float(max_cost_per_run_usd) <= 10:
+        if max_cost_per_run_usd is not None and not 0 < float(max_cost_per_run_usd) <= 10:
             raise ValueError("price_usd must be greater than 0 and no more than 10.")
         if objective not in {"match_baseline_at_lowest_cost", "best_within_price", "best_within_cost", "lowest_cost_at_accuracy", "cheapest_at_accuracy", "cheapest_passing", "constrained", "highest_quality"}:
             raise ValueError("objective is not a supported cost/accuracy policy.")
@@ -442,36 +443,6 @@ class DurableRouter:
             quality_threshold=target_accuracy,
             catalog_revision=catalog_revision,
         )
-        with self._db() as db:
-            current = db.execute("SELECT * FROM routes WHERE route=?", (route,)).fetchone()
-            controls = (
-                float(max_cost_per_run_usd), float(test_budget_usd), objective,
-                test_budget_policy, max_p90_latency_seconds,
-                float(latency_value_usd_per_second), int(bool(optimize_prompt)),
-            )
-            previous = (
-                current["max_cost_per_run_usd"], current["test_budget_usd"],
-                current["objective"], current["test_budget_policy"],
-                current["max_p90_latency_seconds"],
-                current["latency_value_usd_per_second"],
-                current["optimize_prompt"],
-            )
-            db.execute(
-                "UPDATE routes SET quality_threshold=?,max_cost_per_run_usd=?,test_budget_usd=?,objective=?,test_budget_policy=?,max_p90_latency_seconds=?,latency_value_usd_per_second=?,optimize_prompt=?,updated_at=? WHERE route=?",
-                (float(target_accuracy), *controls, _now(), route),
-            )
-            if previous != controls:
-                self._event(db, route, "routing_policy_configured", {
-                    "price_usd": max_cost_per_run_usd,
-                    "test_budget_usd": test_budget_usd,
-                    "test_budget_policy": test_budget_policy,
-                    "target_accuracy": target_accuracy,
-                    "objective": objective,
-                    "max_p90_latency_seconds": max_p90_latency_seconds,
-                    "latency_value_usd_per_second": latency_value_usd_per_second,
-                    "optimize_prompt": bool(optimize_prompt),
-                })
-            row = db.execute("SELECT * FROM routes WHERE route=?", (route,)).fetchone()
         set_performance_policy = getattr(self.client.transport, "set_performance_policy", None)
         if callable(set_performance_policy):
             set_performance_policy(
@@ -481,18 +452,55 @@ class DurableRouter:
         input_text = _content(input)
         messages = [{"role": "system", "content": row["selected_prompt"]}, {"role": "user", "content": input_text}]
         estimate = self.client.transport.estimate_cost(row["selected_model"], messages, max_tokens=max_tokens)
-        if estimate > float(max_cost_per_run_usd) + 1e-12:
+        price_policy = "explicit" if max_cost_per_run_usd is not None else "automatic"
+        effective_price_ceiling_usd = (
+            float(max_cost_per_run_usd)
+            if max_cost_per_run_usd is not None
+            else min(10.0, max(0.01, float(estimate) * 1.10))
+        )
+        with self._db() as db:
+            current = db.execute("SELECT * FROM routes WHERE route=?", (route,)).fetchone()
+            controls = (
+                effective_price_ceiling_usd, price_policy, float(test_budget_usd),
+                objective, test_budget_policy, max_p90_latency_seconds,
+                float(latency_value_usd_per_second), int(bool(optimize_prompt)),
+            )
+            previous = (
+                current["max_cost_per_run_usd"], current["price_policy"],
+                current["test_budget_usd"], current["objective"],
+                current["test_budget_policy"], current["max_p90_latency_seconds"],
+                current["latency_value_usd_per_second"], current["optimize_prompt"],
+            )
+            db.execute(
+                "UPDATE routes SET quality_threshold=?,max_cost_per_run_usd=?,price_policy=?,test_budget_usd=?,objective=?,test_budget_policy=?,max_p90_latency_seconds=?,latency_value_usd_per_second=?,optimize_prompt=?,updated_at=? WHERE route=?",
+                (float(target_accuracy), *controls, _now(), route),
+            )
+            if previous != controls:
+                self._event(db, route, "routing_policy_configured", {
+                    "price_usd": max_cost_per_run_usd,
+                    "effective_price_ceiling_usd": effective_price_ceiling_usd,
+                    "price_policy": price_policy,
+                    "test_budget_usd": test_budget_usd,
+                    "test_budget_policy": test_budget_policy,
+                    "target_accuracy": target_accuracy,
+                    "objective": objective,
+                    "max_p90_latency_seconds": max_p90_latency_seconds,
+                    "latency_value_usd_per_second": latency_value_usd_per_second,
+                    "optimize_prompt": bool(optimize_prompt),
+                })
+            row = db.execute("SELECT * FROM routes WHERE route=?", (route,)).fetchone()
+        if estimate > effective_price_ceiling_usd + 1e-12:
             raise BudgetExceeded(
-                f"The selected route estimates ${estimate:.6f}, above this call's ${float(max_cost_per_run_usd):.6f} price ceiling."
+                f"The selected route estimates ${estimate:.6f}, above this call's ${effective_price_ceiling_usd:.6f} price ceiling."
             )
         completion: Completion = self.client.transport.complete(row["selected_model"], messages, max_tokens=max_tokens)
-        if completion.cost_usd > float(max_cost_per_run_usd) + 1e-12:
+        if completion.cost_usd > effective_price_ceiling_usd + 1e-12:
             raise BudgetExceeded("The provider-reported cost exceeded this call's hard cap.")
         call_id = f"call-{uuid.uuid4().hex}"
         with self._db() as db:
             db.execute(
                 "INSERT INTO calls VALUES (?,?,?,?,?,?,?,?,?,?)",
-                (call_id, route, _now(), input_text, completion.content, completion.model, row["prompt_version"], completion.cost_usd, float(max_cost_per_run_usd), row["decision_reason"]),
+                (call_id, route, _now(), input_text, completion.content, completion.model, row["prompt_version"], completion.cost_usd, effective_price_ceiling_usd, row["decision_reason"]),
             )
             db.execute("UPDATE routes SET total_calls=total_calls+1,updated_at=? WHERE route=?", (_now(), route))
             current = db.execute("SELECT * FROM routes WHERE route=?", (route,)).fetchone()
@@ -677,7 +685,12 @@ class DurableRouter:
             "selected_model": row["selected_model"],
             "selected_prompt_version": row["prompt_version"],
             "decision_reason": row["decision_reason"],
-            "price_usd": row["max_cost_per_run_usd"],
+            "price_usd": (
+                row["max_cost_per_run_usd"]
+                if row["price_policy"] == "explicit" else None
+            ),
+            "price_policy": row["price_policy"],
+            "effective_price_ceiling_usd": row["max_cost_per_run_usd"],
             "test_budget_usd": row["test_budget_usd"],
             "test_budget_policy": row["test_budget_policy"],
             "target_accuracy": row["quality_threshold"],

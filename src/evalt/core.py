@@ -9,8 +9,9 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 import json
 from pathlib import Path
+import sys
 import threading
-from typing import Any, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 
 from last_good_prompt.core import (
     BudgetExceeded,
@@ -228,6 +229,8 @@ class Evalt:
         transport: ChatTransport | None = None,
         state_path: str | Path = ".evalt/evalt.db",
         request_timeout_seconds: float = 600,
+        show_progress: bool | None = None,
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> None:
         if transport is not None and request_timeout_seconds != 600:
             raise ValueError("request_timeout_seconds cannot be combined with a custom transport.")
@@ -237,6 +240,78 @@ class Evalt:
         self.client = Client(api_key=api_key, transport=resolved_transport)
         self._state_path = Path(state_path)
         self._router: DurableRouter | None = None
+        self._show_progress = (
+            bool(getattr(sys.stderr, "isatty", lambda: False)())
+            if show_progress is None else bool(show_progress)
+        )
+        self._progress_callback = progress_callback
+
+    def _emit_progress(self, event: dict[str, Any]) -> None:
+        if self._progress_callback is not None:
+            self._progress_callback(dict(event))
+        if not self._show_progress:
+            return
+        kind = str(event.get("event") or "progress")
+        route = str(event.get("route") or "route")
+        if kind == "production_call_started":
+            message = (
+                f"Evalt · {route} · routing call at {float(event['target_accuracy']):.0%} target; "
+                f"future retest cap ${float(event['test_budget_usd']):.2f}"
+            )
+        elif kind == "production_call_completed":
+            model = str(event.get("model") or "model")
+            cost = float(event.get("provider_cost_usd") or 0)
+            ceiling = float(event.get("effective_price_ceiling_usd") or 0)
+            policy = str(event.get("price_policy") or "explicit")
+            raw_reason = str(event.get("decision_reason") or "route")
+            reason = {
+                "bootstrap_unqualified": "initial route; collecting approved examples",
+                "prompt_changed_unqualified": "prompt changed; collecting fresh evidence",
+            }.get(raw_reason, raw_reason.replace("_", " "))
+            message = (
+                f"Evalt · {route} · {model} · ${cost:.6f} · {policy} ceiling "
+                f"${ceiling:.6f} · {reason}"
+            )
+        elif kind == "production_call_failed":
+            message = f"Evalt · {route} · stopped before completion: {event.get('error')}"
+        elif kind == "maintenance_started":
+            message = (
+                f"Evalt · {route} · bounded retest started in background; "
+                f"cap ${float(event['test_budget_usd']):.2f}"
+            )
+        elif kind == "maintenance_completed":
+            message = (
+                f"Evalt · {route} · bounded retest settled; "
+                f"spent ${float(event.get('provider_spend_usd') or 0):.6f}"
+            )
+        elif kind == "maintenance_failed":
+            message = f"Evalt · {route} · bounded retest stopped: {event.get('error')}"
+        elif kind == "model_completed":
+            message = (
+                f"Evalt · {event.get('model', 'route')} · "
+                f"{float(event.get('final_test_pass_rate') or 0):.0%} final test · "
+                f"${float(event.get('optimization_spend_usd') or 0):.6f} spent"
+            )
+        else:
+            return
+        print(message, file=sys.stderr, flush=True)
+
+    def _maintain_in_background(self, **kwargs: Any) -> None:
+        route = str(kwargs.get("route") or "route")
+        try:
+            result = self.router.maintain(**kwargs)
+            self._emit_progress({
+                "event": "maintenance_completed",
+                "route": route,
+                "provider_spend_usd": (
+                    0.0 if result is None else result.total_provider_spend_usd
+                ),
+                "promoted_model": None if result is None else result.winner.model,
+            })
+        except Exception as error:  # background failures stay visible without killing the caller
+            self._emit_progress({
+                "event": "maintenance_failed", "route": route, "error": str(error)
+            })
 
     @property
     def router(self) -> DurableRouter:
@@ -284,20 +359,19 @@ class Evalt:
                         else "price"
                     ),
                 )
-            return self.client.optimize(**suite_or_prompt.optimize_kwargs())
+            optimize_kwargs = suite_or_prompt.optimize_kwargs()
+            if self._show_progress or self._progress_callback is not None:
+                optimize_kwargs["progress_callback"] = self._emit_progress
+            return self.client.optimize(**optimize_kwargs)
         if input is None:
             raise ValueError("input is required when executing a prompt through Evalt.")
         if price_usd is not None and budget_usd is not None and float(price_usd) != float(budget_usd):
             raise ValueError("Use price_usd; budget_usd is only a backward-compatible alias.")
-        if price_usd is None and budget_usd is None and incumbent_model:
-            input_text = input if isinstance(input, str) else json.dumps(input, ensure_ascii=False, sort_keys=True)
-            max_cost_per_run_usd = self.client.transport.estimate_cost(
-                incumbent_model,
-                [{"role": "system", "content": suite_or_prompt}, {"role": "user", "content": input_text}],
-                max_tokens=max_tokens,
-            )
-        else:
-            max_cost_per_run_usd = float(price_usd if price_usd is not None else (budget_usd if budget_usd is not None else 0.02))
+        max_cost_per_run_usd = (
+            float(price_usd if price_usd is not None else budget_usd)
+            if price_usd is not None or budget_usd is not None
+            else None
+        )
         if quality_threshold is not None:
             if target_accuracy != 0.95 and float(target_accuracy) != float(quality_threshold):
                 raise ValueError("Use target_accuracy; quality_threshold is only a backward-compatible alias.")
@@ -322,11 +396,22 @@ class Evalt:
         if not 0 < max_test_budget_usd <= 100:
             raise ValueError("max_test_budget_usd must be greater than 0 and no more than 100.")
         if test_budget_usd == "auto":
-            resolved_test_budget_usd = min(
-                float(max_test_budget_usd),
-                max(0.25, max_cost_per_run_usd * max(1, int(retest_after_calls)) * 0.10),
-            )
-            test_budget_policy = "auto: 10% of one retest interval's production ceiling, floored at $0.25"
+            if max_cost_per_run_usd is None:
+                resolved_test_budget_usd = min(float(max_test_budget_usd), 0.25)
+                test_budget_policy = (
+                    "auto: $0.25 bounded retest cap when no production price ceiling is set"
+                )
+            else:
+                resolved_test_budget_usd = min(
+                    float(max_test_budget_usd),
+                    max(
+                        0.25,
+                        max_cost_per_run_usd * max(1, int(retest_after_calls)) * 0.10,
+                    ),
+                )
+                test_budget_policy = (
+                    "auto: 10% of one retest interval's production ceiling, floored at $0.25"
+                )
         else:
             resolved_test_budget_usd = float(test_budget_usd)
             if not 0 <= resolved_test_budget_usd <= float(max_test_budget_usd):
@@ -345,29 +430,60 @@ class Evalt:
             requested_models = role_plan.target_models
         if incumbent_model:
             requested_models = tuple(dict.fromkeys((incumbent_model, *requested_models)))
-        answer = self.router.run(
-            route=route,
-            prompt=suite_or_prompt,
-            input=input,
-            max_cost_per_run_usd=max_cost_per_run_usd,
-            models=requested_models,
-            max_tokens=max_tokens,
-            target_accuracy=target_accuracy,
-            objective=objective,
-            optimize_prompt=bool(optimize_prompt),
-            test_budget_usd=resolved_test_budget_usd,
-            test_budget_policy=test_budget_policy,
-            max_p90_latency_seconds=max_p90_latency_seconds,
-            latency_value_usd_per_second=latency_value_usd_per_second,
-            retest_after_calls=retest_after_calls,
-            min_feedback=min_feedback,
-            catalog_revision=role_plan.catalog_revision,
+        self._emit_progress({
+            "event": "production_call_started",
+            "route": route,
+            "target_accuracy": target_accuracy,
+            "test_budget_usd": resolved_test_budget_usd,
+            "test_budget_policy": test_budget_policy,
+            "test_budget_spent_usd": 0.0,
+        })
+        try:
+            answer = self.router.run(
+                route=route,
+                prompt=suite_or_prompt,
+                input=input,
+                max_cost_per_run_usd=max_cost_per_run_usd,
+                models=requested_models,
+                max_tokens=max_tokens,
+                target_accuracy=target_accuracy,
+                objective=objective,
+                optimize_prompt=bool(optimize_prompt),
+                test_budget_usd=resolved_test_budget_usd,
+                test_budget_policy=test_budget_policy,
+                max_p90_latency_seconds=max_p90_latency_seconds,
+                latency_value_usd_per_second=latency_value_usd_per_second,
+                retest_after_calls=retest_after_calls,
+                min_feedback=min_feedback,
+                catalog_revision=role_plan.catalog_revision,
+            )
+        except Exception as error:
+            self._emit_progress({
+                "event": "production_call_failed", "route": route, "error": str(error)
+            })
+            raise
+        status = self.router.status(
+            route, retest_after_calls=retest_after_calls, min_feedback=min_feedback
         )
+        self._emit_progress({
+            "event": "production_call_completed",
+            "route": route,
+            "model": answer.model,
+            "provider_cost_usd": answer.provider_cost_usd,
+            "price_policy": status["price_policy"],
+            "effective_price_ceiling_usd": status["effective_price_ceiling_usd"],
+            "decision_reason": answer.decision_reason,
+            "maintenance_due": list(answer.maintenance_due),
+        })
         if auto_maintain and resolved_test_budget_usd > 0 and answer.maintenance_due:
-            status = self.router.status(route, retest_after_calls=retest_after_calls, min_feedback=min_feedback)
             if status["feedback_count"] >= min_feedback:
+                self._emit_progress({
+                    "event": "maintenance_started",
+                    "route": route,
+                    "test_budget_usd": resolved_test_budget_usd,
+                })
                 threading.Thread(
-                    target=self.router.maintain,
+                    target=self._maintain_in_background,
                     kwargs={
                         "route": route,
                         "test_budget_usd": resolved_test_budget_usd,

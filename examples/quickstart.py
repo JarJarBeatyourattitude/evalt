@@ -9,7 +9,9 @@ from evalt import Evalt
 ticket = "Please help—the website won't load."
 expected = "technical"
 
-evalt = Evalt()
+# Interactive terminals show compact route, spend, and maintenance progress on stderr.
+# Pass show_progress=False in a server, or progress_callback=... for structured events.
+evalt = Evalt(show_progress=True)
 answer = evalt.run(
     "Classify this request. Return exactly one lowercase label: billing, account, or technical.",
     ticket,

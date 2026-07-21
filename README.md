@@ -32,7 +32,7 @@ repository checkout:
 
 ```bash
 python -m venv .venv
-python -m pip install dist/evalt-0.8.20-py3-none-any.whl
+python -m pip install dist/evalt-0.8.21-py3-none-any.whl
 evalt --version
 ```
 
@@ -53,7 +53,7 @@ from evalt import Evalt
 
 ticket = "Please help—the website won't load."
 expected = "technical"
-evalt = Evalt()
+evalt = Evalt(show_progress=True)
 answer = evalt.run(
     "Classify this request. Return exactly one lowercase label: billing, account, or technical.",
     ticket,
@@ -71,6 +71,10 @@ print(evalt.route_status("support-routing"))
 
 `Evalt()` reads `OPENROUTER_API_KEY` automatically from the process environment or a
 `.env` file in the current working directory. An explicit `api_key=` takes precedence.
+In an interactive terminal it also prints compact route, actual provider cost, automatic
+request ceiling, and bounded maintenance progress to `stderr`. Use
+`Evalt(show_progress=False)` for a silent service process, or pass
+`progress_callback=...` to receive structured event dictionaries without parsing text.
 
 Use one stable route name per production task. A single `Evalt` instance can manage any
 number of independent routes; each route keeps its own prompt, approved or corrected
@@ -94,7 +98,10 @@ retest never spends from an unlimited hidden allowance.
 
 The focused default is `objective="lowest_cost_at_accuracy"` with
 `target_accuracy=0.95`: Evalt promotes the cheapest tested configuration that clears that
-approved bar. A price-first frontier and an incumbent-preservation migration mode remain
+approved bar. Omitting `price_usd` uses a request-sized automatic safety ceiling for the
+selected route; it does not impose a hidden $0.02 limit. Set `price_usd` only when the
+production call itself has a hard monetary ceiling. This is independent from
+`test_budget_usd`, which caps evaluation and maintenance. A price-first frontier and an incumbent-preservation migration mode remain
 available:
 
 ```python

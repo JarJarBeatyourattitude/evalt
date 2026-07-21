@@ -135,7 +135,7 @@ def parser() -> argparse.ArgumentParser:
         prog="evalt",
         description="Run prompts through a durable, tested, budget-bounded model route.",
     )
-    root.add_argument("--version", action="version", version="evalt 0.8.20")
+    root.add_argument("--version", action="version", version="evalt 0.8.21")
     commands = root.add_subparsers(dest="command", required=True)
 
     init = commands.add_parser("init", help="Write a reviewable starter suite; no provider call.")
@@ -170,7 +170,7 @@ def parser() -> argparse.ArgumentParser:
     run.add_argument("--route", required=True, help="Stable route name used to remember decisions.")
     run.add_argument("--prompt", required=True)
     run.add_argument("--input", required=True)
-    run.add_argument("--price", "--budget", dest="price", type=float, required=True, help="Maximum provider price for one production response.")
+    run.add_argument("--price", "--budget", dest="price", type=float, help="Optional hard maximum provider price for one production response; omitted uses a request-sized automatic safety ceiling.")
     run.add_argument("--test-budget", "--maintenance-budget", dest="test_budget", default="auto", help="Automatic or numeric hard cap for a due retest.")
     run.add_argument("--max-test-budget", type=float, default=1.0, help="Hard ceiling when --test-budget=auto.")
     run.add_argument("--target-accuracy", type=float, default=0.95)

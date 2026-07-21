@@ -170,6 +170,11 @@ class FakeTransport:
         )
 
 
+class CostlyBootstrapTransport(FakeTransport):
+    def estimate_cost(self, model, messages, *, max_tokens):
+        return 0.057045
+
+
 class PartlyUnavailableTransport(FakeTransport):
     def complete(self, model, messages, *, max_tokens, response_schema=None):
         if model == "unavailable":
@@ -721,6 +726,58 @@ class SdkTests(unittest.TestCase):
             self.assertEqual(status["objective"], "lowest_cost_at_accuracy")
             self.assertEqual(status["target_accuracy"], 0.95)
             self.assertIsNone(status["max_p90_latency_seconds"])
+
+    def test_omitted_price_uses_request_sized_ceiling_separate_from_auto_test_budget(self):
+        with TemporaryDirectory() as directory:
+            evalt = Evalt(
+                transport=CostlyBootstrapTransport(),
+                state_path=Path(directory) / "evalt.db",
+            )
+            answer = evalt.run(
+                "Classify this request as billing, account, or technical.",
+                "Please, everything is broken and the website will not load.",
+                route="support-routing",
+                target_accuracy=0.95,
+                test_budget_usd="auto",
+                models=["costly-bootstrap"],
+                auto_maintain=False,
+            )
+            self.assertEqual(answer.content, "Here is a verbose answer")
+            status = evalt.route_status("support-routing")
+            self.assertIsNone(status["price_usd"])
+            self.assertEqual(status["price_policy"], "automatic")
+            self.assertAlmostEqual(status["effective_price_ceiling_usd"], 0.0627495)
+            self.assertEqual(status["test_budget_usd"], 0.25)
+            self.assertIn("no production price ceiling", status["test_budget_policy"])
+
+    def test_interactive_progress_shows_cost_without_polluting_answer_content(self):
+        with TemporaryDirectory() as directory:
+            events = []
+            stream = StringIO()
+            evalt = Evalt(
+                transport=CostlyBootstrapTransport(),
+                state_path=Path(directory) / "evalt.db",
+                show_progress=True,
+                progress_callback=events.append,
+            )
+            with redirect_stderr(stream):
+                answer = evalt.run(
+                    "Return the approved route label only.",
+                    "The website will not load.",
+                    route="visible-support",
+                    test_budget_usd="auto",
+                    models=["costly-bootstrap"],
+                    auto_maintain=False,
+                )
+            rendered = stream.getvalue()
+            self.assertEqual(answer.content, "technical")
+            self.assertIn("future retest cap $0.25", rendered)
+            self.assertIn("$0.057045", rendered)
+            self.assertIn("automatic ceiling $0.0627", rendered)
+            self.assertEqual(
+                [event["event"] for event in events],
+                ["production_call_started", "production_call_completed"],
+            )
 
     def test_primary_run_is_a_durable_budget_bounded_router_not_a_json_export(self):
         with TemporaryDirectory() as directory:
