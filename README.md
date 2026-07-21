@@ -31,7 +31,7 @@ repository checkout:
 
 ```bash
 python -m venv .venv
-python -m pip install dist/evalt-0.9.3-py3-none-any.whl
+python -m pip install dist/evalt-0.9.4-py3-none-any.whl
 evalt --version
 ```
 
@@ -66,7 +66,7 @@ For a new route, that one call visibly:
 
 1. uses a smart designer to create 25 routine, boundary, adversarial, format, and
    multi-turn cases where relevant;
-2. calibrates the proposed deterministic or semantic judge on separate labeled checks;
+2. calibrates the proposed exact, semantic, or numeric-tolerance judge on separate controls;
 3. searches the original prompt, prompt rewrites, training-only few-shot packages,
    current models, providers, and supported reasoning efforts in parallel;
 4. promotes only a non-exploratory configuration clearing the frozen final test;
@@ -114,10 +114,15 @@ print(result.winner.model, result.winner.holdout_pass_rate)
 ```
 
 The designer covers routine, complex, adversarial, format, boundary, and multi-turn
-cases where relevant, and recommends deterministic or semantic judging. Evalt then
+cases where relevant, and recommends exact, semantic, or numeric-tolerance judging.
+Scalar ratings such as 0–10 or 0–100 use an explicit scale and absolute tolerance
+instead of exact equality or an LLM's unspoken tolerance. AI-generated semantic suites
+must use a judge model different from the suite designer; Evalt does not use its
+designer as a correlated fallback judge. Evalt then
 splits the frozen contract, varies prompts and approved few-shot examples, tests current
 models and supported reasoning levels in parallel, and promotes only on the untouched
-final test. Use 25 or more distinct cases to obtain at least five final-test cases.
+final test. A balanced 25-case automatic suite reserves ten unique cases for final
+confirmation and runs each twice after the prompt/model package is frozen.
 
 For a fast directional result, set `case_control="autopilot"`. That runs the draft and
 tournament immediately, but the result is permanently labeled

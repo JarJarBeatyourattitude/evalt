@@ -1076,6 +1076,8 @@ class Client:
                         emit_progress({
                             "event": "model_completed", "model": model,
                             "final_test_pass_rate": item.holdout_pass_rate,
+                            "final_test_scenarios": item.holdout_unique_scenarios,
+                            "final_test_executions": item.holdout_executions,
                             "passed_quality_floor": item.passed_quality_floor,
                             "target_latency_p50_ms": item.target_latency_p50_ms,
                             "target_latency_p90_ms": item.target_latency_p90_ms,
@@ -1105,6 +1107,8 @@ class Client:
                         emit_progress({
                             "event": "model_completed", "model": model,
                             "final_test_pass_rate": item.holdout_pass_rate,
+                            "final_test_scenarios": item.holdout_unique_scenarios,
+                            "final_test_executions": item.holdout_executions,
                             "passed_quality_floor": item.passed_quality_floor,
                             "target_latency_p50_ms": item.target_latency_p50_ms,
                             "target_latency_p90_ms": item.target_latency_p90_ms,
@@ -2167,20 +2171,42 @@ class Client:
             if selected_prompt == prompt and not selected_few_shot_ids
             else "candidate"
         )
-        baseline_holdout = self._run_cases(
-            prompt, "baseline", holdout, "holdout", model, evaluator_model, budget,
-            repeats=holdout_repeats,
-            evaluator=evaluator,
-            max_parallel_scenarios=max_parallel_scenarios,
-        )
-        if selected_kind == "baseline":
-            selected_holdout = baseline_holdout
-        else:
-            selected_holdout = self._run_cases(
-                selected_prompt, "candidate", holdout, "holdout", model, evaluator_model, budget
-                , train, selected_few_shot_ids, holdout_repeats, evaluator=evaluator,
+        if selected_rate >= threshold:
+            if progress_callback is not None:
+                progress_callback({
+                    "event": "final_confirmation_started",
+                    "model": model,
+                    "unique_scenarios": len(holdout),
+                    "executions": len(holdout) * int(holdout_repeats),
+                    "validation_pass_rate": round(selected_rate, 6),
+                })
+            baseline_holdout = self._run_cases(
+                prompt, "baseline", holdout, "holdout", model, evaluator_model, budget,
+                repeats=holdout_repeats,
+                evaluator=evaluator,
                 max_parallel_scenarios=max_parallel_scenarios,
             )
+            if selected_kind == "baseline":
+                selected_holdout = baseline_holdout
+            else:
+                selected_holdout = self._run_cases(
+                    selected_prompt, "candidate", holdout, "holdout", model, evaluator_model, budget
+                    , train, selected_few_shot_ids, holdout_repeats, evaluator=evaluator,
+                    max_parallel_scenarios=max_parallel_scenarios,
+                )
+        else:
+            baseline_holdout = []
+            selected_holdout = []
+            if progress_callback is not None:
+                progress_callback({
+                    "event": "final_confirmation_skipped",
+                    "model": model,
+                    "unique_scenarios": len(holdout),
+                    "executions": len(holdout) * int(holdout_repeats),
+                    "validation_pass_rate": round(selected_rate, 6),
+                    "quality_threshold": threshold,
+                    "reason": "The frozen package did not clear validation, so final-test spend could not qualify it.",
+                })
         holdout_execution_rate = _pass_rate(selected_holdout)
         holdout_rate = _scenario_pass_rate(selected_holdout)
         holdout_by_difficulty = _scenario_pass_rates_by_difficulty(selected_holdout)
@@ -2237,7 +2263,7 @@ class Client:
             passed_quality_floor=holdout_rate >= threshold and passed_difficulty_floors,
             target_latency_p50_ms=round(latency_p50),
             target_latency_p90_ms=round(latency_p90),
-            holdout_unique_scenarios=len(holdout),
+            holdout_unique_scenarios=len(holdout) if selected_holdout else 0,
             holdout_executions=len(selected_holdout),
             holdout_execution_pass_rate=round(holdout_execution_rate, 6),
             baseline_holdout_execution_pass_rate=round(_pass_rate(baseline_holdout), 6),
@@ -2282,6 +2308,7 @@ class Client:
         target_max_tokens = {
             "exact_text": 64,
             "exact_json": 1024,
+            "numeric_tolerance": 64,
             "semantic": 8192,
         }[evaluator_policy["type"]]
 
@@ -2529,8 +2556,10 @@ def _exact_json_response_schema(
 def _validate_evaluator_policy(value: dict[str, Any] | None) -> dict[str, Any]:
     policy = dict(value or {"type": "semantic"})
     evaluator_type = str(policy.get("type", "")).strip().lower()
-    if evaluator_type not in {"semantic", "exact_text", "exact_json"}:
-        raise ValueError("evaluator.type must be semantic, exact_text, or exact_json.")
+    if evaluator_type not in {"semantic", "exact_text", "exact_json", "numeric_tolerance"}:
+        raise ValueError(
+            "evaluator.type must be semantic, exact_text, exact_json, or numeric_tolerance."
+        )
     policy["type"] = evaluator_type
     if evaluator_type == "exact_json":
         required_keys = policy.get("required_keys", [])
@@ -2539,6 +2568,26 @@ def _validate_evaluator_policy(value: dict[str, Any] | None) -> dict[str, Any]:
         policy["required_keys"] = list(dict.fromkeys(str(key).strip() for key in required_keys))
         policy["allow_additional_properties"] = bool(policy.get("allow_additional_properties", True))
         policy["normalize_rational_strings"] = bool(policy.get("normalize_rational_strings", False))
+    if evaluator_type == "numeric_tolerance":
+        try:
+            minimum = float(policy["minimum"])
+            maximum = float(policy["maximum"])
+            tolerance = float(policy["absolute_tolerance"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError(
+                "numeric_tolerance requires numeric minimum, maximum, and absolute_tolerance."
+            ) from error
+        if not all(math.isfinite(item) for item in (minimum, maximum, tolerance)):
+            raise ValueError("numeric_tolerance values must be finite.")
+        if maximum <= minimum:
+            raise ValueError("numeric_tolerance maximum must be greater than minimum.")
+        if tolerance <= 0 or tolerance >= maximum - minimum:
+            raise ValueError(
+                "numeric_tolerance absolute_tolerance must be greater than zero and smaller than the scale."
+            )
+        policy["minimum"] = minimum
+        policy["maximum"] = maximum
+        policy["absolute_tolerance"] = tolerance
     return policy
 
 
@@ -2561,6 +2610,31 @@ def _deterministic_judgment(
     if evaluator["type"] == "exact_text":
         passed = str(output).strip() == str(approved_output).strip()
         return Judgment(passed, 1.0 if passed else 0.0, "Exact text matched." if passed else "Exact text differed.")
+    if evaluator["type"] == "numeric_tolerance":
+        try:
+            actual = float(str(output).strip())
+            expected = float(str(approved_output).strip())
+        except (TypeError, ValueError):
+            return Judgment(False, 0.0, "Actual and approved answers must each be one numeric scalar.")
+        minimum = float(evaluator["minimum"])
+        maximum = float(evaluator["maximum"])
+        tolerance = float(evaluator["absolute_tolerance"])
+        if not math.isfinite(actual) or not math.isfinite(expected):
+            return Judgment(False, 0.0, "Numeric answers must be finite.")
+        if not minimum <= actual <= maximum:
+            return Judgment(False, 0.0, f"Actual score was outside the allowed {minimum:g} to {maximum:g} scale.")
+        difference = abs(actual - expected)
+        passed = difference <= tolerance
+        score = max(0.0, 1.0 - difference / max(tolerance, 1e-12)) if passed else 0.0
+        return Judgment(
+            passed,
+            score,
+            (
+                f"Numeric score was within ±{tolerance:g} of the approved score."
+                if passed
+                else f"Numeric score differed by {difference:g}, above the ±{tolerance:g} tolerance."
+            ),
+        )
     try:
         actual = _parse_json_object(output)
         expected = _parse_json_object(approved_output)
@@ -2609,6 +2683,11 @@ def _safe_provider_error_detail(value: str) -> str:
 
 
 def _split_examples(examples: list[Example], seed: str) -> tuple[list[Example], list[Example], list[Example]]:
+    # A 25-case automatic suite used to spend only five unique scenarios on the
+    # final confirmation. Preserve a useful development set, but reserve 40% of
+    # substantive suites for the untouched final test. With five balanced strata
+    # of five, this yields 10 training, 5 development, and 10 final scenarios.
+    deep_confirmation = len(examples) >= 25
     if examples and all(item.group for item in examples):
         grouped: dict[str, list[Example]] = {}
         for item in examples:
@@ -2621,7 +2700,10 @@ def _split_examples(examples: list[Example], seed: str) -> tuple[list[Example], 
                 items,
                 key=lambda item: hashlib.sha256(f"{seed}:{group}:{item.id}".encode()).hexdigest(),
             )
-            holdout_count = max(1, len(ranked_group) // 5)
+            holdout_count = max(
+                1,
+                (len(ranked_group) * (2 if deep_confirmation else 1)) // 5,
+            )
             dev_count = max(1, len(ranked_group) // 5)
             holdout.extend(ranked_group[:holdout_count])
             dev.extend(ranked_group[holdout_count : holdout_count + dev_count])
@@ -2631,7 +2713,10 @@ def _split_examples(examples: list[Example], seed: str) -> tuple[list[Example], 
         examples,
         key=lambda item: hashlib.sha256(f"{seed}:{item.id}".encode()).hexdigest(),
     )
-    holdout_count = max(1, len(ranked) // 5)
+    holdout_count = max(
+        1,
+        (len(ranked) * (2 if deep_confirmation else 1)) // 5,
+    )
     dev_count = max(1, len(ranked) // 5)
     return ranked[holdout_count + dev_count :], ranked[holdout_count : holdout_count + dev_count], ranked[:holdout_count]
 

@@ -142,11 +142,11 @@ def select_role_plan(
             })
 
     if maintenance_budget_usd < 0.50:
-        tier, designer_delta, judge_delta, breadth = "lean", 16.0, 26.0, 5
+        tier, designer_delta, judge_delta, breadth = "lean", 12.0, 26.0, 5
     elif maintenance_budget_usd < 2.00:
-        tier, designer_delta, judge_delta, breadth = "standard", 9.0, 18.0, 10
+        tier, designer_delta, judge_delta, breadth = "standard", 4.0, 18.0, 10
     else:
-        tier, designer_delta, judge_delta, breadth = "deep", 4.0, 11.0, 16
+        tier, designer_delta, judge_delta, breadth = "deep", 0.0, 11.0, 16
 
     if not normalized:
         targets = tuple(dict.fromkeys(fallback_targets))[:breadth]
@@ -162,8 +162,17 @@ def select_role_plan(
     normalized.sort(key=lambda item: (item["price"], -item["intelligence"], item["id"]))
     maximum = max(item["intelligence"] for item in normalized)
 
-    def cheapest_above(delta: float) -> str:
-        eligible = [item for item in normalized if item["intelligence"] >= maximum - delta]
+    def cheapest_above(delta: float, *, exclude: set[str] | None = None) -> str:
+        excluded = exclude or set()
+        eligible = [
+            item for item in normalized
+            if item["intelligence"] >= maximum - delta
+            and item["id"] not in excluded
+        ]
+        if not eligible:
+            eligible = [item for item in normalized if item["id"] not in excluded]
+        if not eligible:
+            eligible = list(normalized)
         return min(eligible, key=lambda item: (item["price"], -item["intelligence"]))["id"]
 
     frontier = [
@@ -228,14 +237,17 @@ def select_role_plan(
                 hone_ids.append(configured)
     target_ids = (broad_ids + hone_ids)[:25]
     revision = _hash(json.dumps(normalized, sort_keys=True, separators=(",", ":")))
+    designer_choice = cheapest_above(designer_delta)
+    judge_choice = cheapest_above(judge_delta, exclude={designer_choice})
     return RolePlan(
         tier=tier,
-        test_designer_model=cheapest_above(designer_delta),
-        judge_model=cheapest_above(judge_delta),
+        test_designer_model=designer_choice,
+        judge_model=judge_choice,
         target_models=tuple(target_ids),
         catalog_revision=revision,
         policy=(
-            "The smartest role is protected for test design; judging uses the cheapest model above a lower intelligence floor; "
+            f"The suite designer uses the cheapest model within {designer_delta:g} intelligence points of the current benchmark leader; "
+            f"judging uses the cheapest different model within {judge_delta:g} points and must pass route-specific calibration; "
             "the unqualified first call starts on a sufficiently intelligent provider-redundant route when available; production search then starts with one configuration across the price/intelligence frontier and spends remaining budget "
             "only on reasoning-effort variants in the task-specific capability band. Route holdouts, never benchmarks, promote the winner."
         ),

@@ -434,6 +434,38 @@ class SemanticMiscalibratedDesignerTransport(CaseDesignerTransport):
         )
 
 
+class NumericScoreDesignerTransport(CaseDesignerTransport):
+    def complete(self, model, messages, *, max_tokens, response_schema=None):
+        if response_schema and "Design a balanced evaluation suite" in messages[0]["content"]:
+            completion = super().complete(
+                model, messages, max_tokens=max_tokens, response_schema=response_schema
+            )
+            payload = json.loads(completion.content)
+            payload["evaluator"].update({
+                "type": "numeric_tolerance",
+                "reason": "Nearby scores on the stated sentiment scale are equivalent.",
+                "minimum": 0,
+                "maximum": 100,
+                "absolute_tolerance": 10,
+            })
+            scenarios = [
+                scenario
+                for stratum in payload["strata"]
+                for scenario in stratum["scenarios"]
+            ]
+            for index, scenario in enumerate(scenarios):
+                scenario["turns"][0]["approved_output"] = str((index * 4) % 101)
+            return Completion(
+                json.dumps(payload),
+                completion.model,
+                completion.generation_id,
+                completion.cost_usd,
+            )
+        return super().complete(
+            model, messages, max_tokens=max_tokens, response_schema=response_schema
+        )
+
+
 class FailingCaseDesignerTransport(CaseDesignerTransport):
     def complete(self, model, messages, *, max_tokens, response_schema=None):
         if response_schema:
@@ -1160,6 +1192,23 @@ class SdkTests(unittest.TestCase):
                 "model": "cheap#reasoning=low",
             })
             evalt._emit_progress({
+                "event": "final_confirmation_started",
+                "route": "support-routing",
+                "model": "cheap#reasoning=low",
+                "unique_scenarios": 10,
+                "executions": 20,
+            })
+            evalt._emit_progress({
+                "event": "model_completed",
+                "route": "support-routing",
+                "model": "cheap#reasoning=low",
+                "final_test_pass_rate": 1,
+                "final_test_scenarios": 10,
+                "final_test_executions": 20,
+                "prompt_candidates_tested": 2,
+                "optimization_spend_usd": 0.1,
+            })
+            evalt._emit_progress({
                 "event": "broad_screen_completed",
                 "route": "support-routing",
                 "configurations": 12,
@@ -1175,6 +1224,8 @@ class SdkTests(unittest.TestCase):
         self.assertIn("support-routing · BROAD SCREEN · 12 model configuration(s) · up to 12 in parallel", rendered)
         self.assertIn("support-routing · SCREENED · cheap#reasoning=low · 80% validation", rendered)
         self.assertIn("support-routing · DEEP TEST STARTED · cheap#reasoning=low", rendered)
+        self.assertIn("FINAL CONFIRMATION · cheap#reasoning=low · 10 unseen scenario(s) · 20 execution(s)", rendered)
+        self.assertIn("100% final test · 10 scenario(s) / 20 execution(s)", rendered)
         self.assertIn("support-routing · BROAD SCREEN COMPLETE · 11/12 configuration(s) settled · 24.6s", rendered)
 
     def test_primary_run_is_a_durable_budget_bounded_router_not_a_json_export(self):
@@ -1271,7 +1322,7 @@ class SdkTests(unittest.TestCase):
             self.assertEqual(first.route_phase, "ai_tested")
             self.assertEqual(first.evidence_provenance, "AI_GENERATED_AI_JUDGED")
             self.assertEqual(first.decision_reason, "provisional_ai_qualified")
-            self.assertEqual(first.initial_test_summary["final_test_scenarios"], 5)
+            self.assertEqual(first.initial_test_summary["final_test_scenarios"], 10)
             self.assertGreaterEqual(first.initial_test_summary["tested_configurations"], 1)
             self.assertGreaterEqual(first.initial_test_summary["prompt_candidates_tested"], 2)
             self.assertGreaterEqual(first.initial_test_summary["prompt_rewrites_tested"], 1)
@@ -1559,10 +1610,15 @@ class SdkTests(unittest.TestCase):
             {"id": "frontier", "intelligence": 96, "blended_price": 9.0},
         ]
         lean = select_role_plan(catalog, maintenance_budget_usd=0.25)
+        standard = select_role_plan(catalog, maintenance_budget_usd=1.0)
         deep = select_role_plan(catalog, maintenance_budget_usd=3.0)
         self.assertEqual(lean.tier, "lean")
         self.assertEqual(deep.tier, "deep")
         self.assertEqual(deep.test_designer_model, "frontier")
+        self.assertEqual(standard.test_designer_model, "frontier")
+        self.assertEqual(standard.judge_model, "balanced")
+        self.assertNotEqual(standard.test_designer_model, standard.judge_model)
+        self.assertIn("within 4 intelligence points", standard.policy)
         self.assertGreaterEqual(len(deep.target_models), len(lean.target_models))
         self.assertNotEqual(lean.judge_model, "tiny")
 
@@ -1700,6 +1756,35 @@ class SdkTests(unittest.TestCase):
         self.assertEqual(result.winner.model, "cheap")
         self.assertFalse(check_result(result.to_dict(), min_pass_rate=0.9).passed)
         self.assertIn("exploratory", check_result(result.to_dict(), min_pass_rate=0.9).failures[0])
+
+    def test_validation_failure_does_not_spend_on_the_deeper_final_confirmation(self):
+        examples = [
+            {
+                "id": f"failure-{index}",
+                "group": f"stratum-{index % 5}",
+                "input": f"case {index}",
+                "approved_output": "approved",
+            }
+            for index in range(25)
+        ]
+        suite = Suite.from_dict({
+            "name": "skip-final-after-validation-failure",
+            "prompt": "Return an unrelated verbose answer for every request.",
+            "examples": examples,
+            "models": ["cheap"],
+            "optimizer_model": "optimizer",
+            "evaluator_model": "evaluator",
+            "evaluator": {"type": "exact_text"},
+            "quality_threshold": 0.95,
+            "max_optimization_cost_usd": 1,
+            "optimize_prompt": False,
+            "holdout_repeats": 2,
+        })
+        result = Evalt(transport=FakeTransport()).run(suite)
+        self.assertEqual(result.winner.selected_pass_rate, 0)
+        self.assertEqual(result.winner.holdout_unique_scenarios, 0)
+        self.assertEqual(result.winner.holdout_executions, 0)
+        self.assertFalse(any(case.split == "holdout" for case in result.winner.cases))
 
     def test_ai_suite_design_is_budgeted_reviewable_and_not_silently_approved(self):
         with TemporaryDirectory() as directory:
@@ -1842,6 +1927,51 @@ class SdkTests(unittest.TestCase):
             judgment_payloads[1]["approved_answer"],
         )
 
+    def test_numeric_rating_uses_explicit_deterministic_tolerance(self):
+        transport = NumericScoreDesignerTransport()
+        evalt = Evalt(transport=transport)
+        draft = evalt.design_suite(
+            task="Score recurring customer sentiment from zero to one hundred.",
+            prompt="Return one sentiment score from zero to one hundred.",
+            route="numeric-sentiment",
+            case_count=25,
+            workflow_budget_usd=1,
+            models=["cheap"],
+            designer_model="designer",
+            evaluator_model="evaluator",
+        )
+        self.assertEqual(draft.evaluator, {
+            "type": "numeric_tolerance",
+            "minimum": 0.0,
+            "maximum": 100.0,
+            "absolute_tolerance": 10.0,
+        })
+        example = draft.examples[0]
+        turn = example.conversation()[0]
+        close, close_completion = evalt.client._judge(
+            example, turn, 0, [], "8", "unused", _Budget(0), dict(draft.evaluator)
+        )
+        far, _far_completion = evalt.client._judge(
+            example, turn, 0, [], "25", "unused", _Budget(0), dict(draft.evaluator)
+        )
+        self.assertTrue(close.passed)
+        self.assertFalse(far.passed)
+        self.assertEqual(close_completion.model, "deterministic/numeric_tolerance")
+
+    def test_ai_generated_semantic_suite_never_uses_its_designer_as_the_judge(self):
+        evalt = Evalt(transport=SemanticMiscalibratedDesignerTransport())
+        with self.assertRaisesRegex(ProviderError, "judge model different from the suite designer"):
+            evalt.design_suite(
+                task="Score recurring customer sentiment on a consistent scale.",
+                prompt="Explain the sentiment expressed by the customer.",
+                route="semantic-role-separation",
+                case_count=25,
+                workflow_budget_usd=1,
+                models=["cheap"],
+                designer_model="same-model",
+                evaluator_model="same-model",
+            )
+
     def test_autopilot_design_runs_full_tournament_but_labels_ai_evidence(self):
         with TemporaryDirectory() as directory:
             evalt = Evalt(
@@ -1864,7 +1994,7 @@ class SdkTests(unittest.TestCase):
                 "AI_GENERATED_AI_JUDGED",
             )
             self.assertIn("AI-generated", result.warnings[0])
-            self.assertEqual(result.regression_suite["holdout_unique_scenarios"], 5)
+            self.assertEqual(result.regression_suite["holdout_unique_scenarios"], 10)
             self.assertGreater(result.total_provider_spend_usd, 0)
 
     def test_suite_persists_a_long_configurable_provider_deadline(self):

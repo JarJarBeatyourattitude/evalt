@@ -586,11 +586,18 @@ class Evalt:
         elif kind == "maintenance_failed":
             message = f"Evalt · {route} · bounded retest stopped: {event.get('error')}"
         elif kind == "model_completed":
+            final_scenarios = int(event.get("final_test_scenarios") or 0)
+            final_result = (
+                f"{float(event.get('final_test_pass_rate') or 0):.0%} final test · "
+                f"{final_scenarios} scenario(s) / "
+                f"{int(event.get('final_test_executions') or 0)} execution(s)"
+                if final_scenarios
+                else "final confirmation not run · validation did not qualify"
+            )
             message = (
                 f"Evalt · {route} · {event.get('model', 'model')} · "
-                f"{float(event.get('final_test_pass_rate') or 0):.0%} final test · "
-                f"{int(event.get('prompt_candidates_tested') or 1)} prompt package(s) · "
-                f"${float(event.get('optimization_spend_usd') or 0):.6f} spent"
+                f"{final_result} · {int(event.get('prompt_candidates_tested') or 1)} "
+                f"prompt package(s) · ${float(event.get('optimization_spend_usd') or 0):.6f} spent"
             )
         elif kind == "model_started":
             work = (
@@ -617,6 +624,18 @@ class Evalt:
                 f"Evalt · {route} · {decision} {event.get('to_effort')} REASONING · "
                 f"{event.get('model', 'model')} · {measured_text}{latency_text} · "
                 f"{event.get('reason', '')}"
+            )
+        elif kind == "final_confirmation_started":
+            message = (
+                f"Evalt · {route} · FINAL CONFIRMATION · {event.get('model', 'model')} · "
+                f"{int(event.get('unique_scenarios') or 0)} unseen scenario(s) · "
+                f"{int(event.get('executions') or 0)} execution(s) · prompt and model frozen"
+            )
+        elif kind == "final_confirmation_skipped":
+            message = (
+                f"Evalt · {route} · FINAL TEST SKIPPED · {event.get('model', 'model')} · "
+                f"{float(event.get('validation_pass_rate') or 0):.0%} validation did not clear "
+                f"{float(event.get('quality_threshold') or 0):.0%}"
             )
         elif kind == "broad_screen_started":
             message = (
@@ -828,11 +847,14 @@ class Evalt:
                         "additionalProperties": False,
                         "required": ["type", "reason", "required_keys", "allow_additional_properties", "normalize_rational_strings"],
                         "properties": {
-                            "type": {"type": "string", "enum": ["semantic", "exact_text", "exact_json"]},
+                            "type": {"type": "string", "enum": ["semantic", "exact_text", "exact_json", "numeric_tolerance"]},
                             "reason": {"type": "string"},
                             "required_keys": {"type": "array", "items": {"type": "string"}},
                             "allow_additional_properties": {"type": "boolean"},
                             "normalize_rational_strings": {"type": "boolean"},
+                            "minimum": {"type": "number"},
+                            "maximum": {"type": "number"},
+                            "absolute_tolerance": {"type": "number", "exclusiveMinimum": 0},
                         },
                     },
                     "judge_calibration": {
@@ -951,8 +973,10 @@ class Evalt:
                         "Expected outputs describe the desired behavior, not what the current prompt happens to "
                         "produce. Make each case concrete enough for a human to approve or edit. All "
                         "cases are drafted before any train/validation/final-test split, so never label "
-                        "or target a split. Recommend exact_text or exact_json only when equivalent "
-                        "answers truly must match that deterministic contract; otherwise use semantic. "
+                        "or target a split. Use numeric_tolerance for a scalar rating or score where nearby "
+                        "values are equivalent; include the stated minimum, maximum, and a defensible absolute "
+                        "tolerance (normally ten percent of the scale). Recommend exact_text or exact_json only "
+                        "when equivalent answers truly must match that deterministic contract; otherwise use semantic. "
                         "Also create judge-calibration checks outside the scenario suite: at least two "
                             "clear passes and one clear failure, each labeled with should_pass. A pass must "
                             "fully satisfy every material requirement. A failure must be unmistakably wrong: "
@@ -1099,10 +1123,17 @@ class Evalt:
                             "allow_additional_properties": bool(raw_evaluator.get("allow_additional_properties", True)),
                             "normalize_rational_strings": bool(raw_evaluator.get("normalize_rational_strings", False)),
                         })
+                    elif suggested_evaluator["type"] == "numeric_tolerance":
+                        suggested_evaluator.update({
+                            "minimum": raw_evaluator.get("minimum"),
+                            "maximum": raw_evaluator.get("maximum"),
+                            "absolute_tolerance": raw_evaluator.get("absolute_tolerance"),
+                        })
+                        _validate_evaluator_policy(suggested_evaluator)
                     design_notes.insert(0, f"Evaluator: {str(raw_evaluator.get('reason') or '').strip()}")
                 calibration_rows = list(parsed.get("judge_calibration") or [])
                 evaluator_type = str(suggested_evaluator.get("type") or "semantic")
-                if evaluator_type in {"exact_text", "exact_json"}:
+                if evaluator_type in {"exact_text", "exact_json", "numeric_tolerance"}:
                     # AI-authored labels are unnecessary and can be internally
                     # inconsistent for deterministic evaluators. Construct known
                     # anchors whose outcomes follow directly from the evaluator's
@@ -1120,15 +1151,28 @@ class Evalt:
                             "should_pass": True,
                         })
                     failure_turn = anchor_examples[0].conversation()[0]
-                    calibration_rows.append({
-                        "input": failure_turn.input,
-                        "approved_output": failure_turn.approved_output,
-                        "candidate_output": (
+                    if evaluator_type == "numeric_tolerance":
+                        expected_score = float(failure_turn.approved_output.strip())
+                        minimum = float(suggested_evaluator["minimum"])
+                        maximum = float(suggested_evaluator["maximum"])
+                        tolerance = float(suggested_evaluator["absolute_tolerance"])
+                        failure_score = (
+                            minimum
+                            if abs(expected_score - minimum) > tolerance
+                            else maximum
+                        )
+                        failure_output = f"{failure_score:g}"
+                    else:
+                        failure_output = (
                             "{not valid json"
                             if evaluator_type == "exact_json"
                             else failure_turn.approved_output
                             + "\n__EVALT_INTENTIONALLY_WRONG__"
-                        ),
+                        )
+                    calibration_rows.append({
+                        "input": failure_turn.input,
+                        "approved_output": failure_turn.approved_output,
+                        "candidate_output": failure_output,
                         "should_pass": False,
                     })
                     evaluator_candidates = (f"deterministic/{evaluator_type}",)
@@ -1163,9 +1207,11 @@ class Evalt:
                         1,
                         "Semantic calibration: Evalt made every known-pass control identical to its approved answer.",
                     )
-                    evaluator_candidates = tuple(
-                        dict.fromkeys((selected_evaluator, selected_designer))
-                    )
+                    if selected_evaluator == selected_designer:
+                        raise ProviderError(
+                            "AI-generated semantic suites require a judge model different from the suite designer; no correlated self-judge fallback ran."
+                        )
+                    evaluator_candidates = (selected_evaluator,)
                 calibrated_evaluator: str | None = None
                 calibration_summaries: list[str] = []
                 for candidate in evaluator_candidates:
