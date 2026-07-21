@@ -32,8 +32,13 @@ from last_good_prompt.core import (
     _Budget,
     _safe_provider_error_detail,
     _validate_evaluator_policy,
+    normalize_request_options,
+    request_options_fingerprint,
 )
-from .router import DEFAULT_TARGETS, DurableRouter, RolePlan, RoutedAnswer, select_role_plan
+from .router import (
+    DEFAULT_TARGETS, DurableRouter, RequestEnvelopeDriftWarning, RolePlan,
+    RoutedAnswer, select_role_plan,
+)
 
 
 @dataclass(frozen=True)
@@ -56,6 +61,8 @@ class Suite:
     max_parallel_models: int = 16
     max_parallel_scenarios: int = 32
     request_timeout_seconds: float = 600
+    target_max_tokens: int = 600
+    request_options: Mapping[str, Any] = field(default_factory=dict)
     max_p90_latency_seconds: float | None = None
     latency_value_usd_per_second: float = 0.0
     minimum_meaningful_quality_gain: float = 0.03
@@ -95,6 +102,8 @@ class Suite:
                 max_parallel_models=int(value.get("max_parallel_models", 16)),
                 max_parallel_scenarios=int(value.get("max_parallel_scenarios", 32)),
                 request_timeout_seconds=float(value.get("request_timeout_seconds", 600)),
+                target_max_tokens=int(value.get("target_max_tokens", 600)),
+                request_options=normalize_request_options(value.get("request_options")),
                 max_p90_latency_seconds=(
                     float(value["max_p90_latency_seconds"])
                     if value.get("max_p90_latency_seconds") is not None else None
@@ -150,6 +159,9 @@ class Suite:
             raise ValueError("max_parallel_scenarios must be between 1 and 128.")
         if not 0 < self.request_timeout_seconds <= 7200:
             raise ValueError("request_timeout_seconds must be greater than zero and no more than 7200 seconds.")
+        if not 1 <= int(self.target_max_tokens) <= 131072:
+            raise ValueError("target_max_tokens must be between 1 and 131072.")
+        normalize_request_options(self.request_options)
         if self.max_p90_latency_seconds is not None and self.max_p90_latency_seconds <= 0:
             raise ValueError("max_p90_latency_seconds must be positive when provided.")
         if self.latency_value_usd_per_second < 0:
@@ -184,6 +196,9 @@ class Suite:
             "max_parallel_models": self.max_parallel_models,
             "max_parallel_scenarios": self.max_parallel_scenarios,
             "request_timeout_seconds": self.request_timeout_seconds,
+            "target_max_tokens": self.target_max_tokens,
+            "request_options": normalize_request_options(self.request_options),
+            "request_options_sha256": request_options_fingerprint(self.request_options),
             "max_p90_latency_seconds": self.max_p90_latency_seconds,
             "latency_value_usd_per_second": self.latency_value_usd_per_second,
             "minimum_meaningful_quality_gain": self.minimum_meaningful_quality_gain,
@@ -217,6 +232,8 @@ class Suite:
             "holdout_repeats": self.holdout_repeats,
             "max_parallel_models": self.max_parallel_models,
             "max_parallel_scenarios": self.max_parallel_scenarios,
+            "target_max_tokens": self.target_max_tokens,
+            "request_options": normalize_request_options(self.request_options),
             "max_p90_latency_seconds": self.max_p90_latency_seconds,
             "latency_value_usd_per_second": self.latency_value_usd_per_second,
             "minimum_meaningful_quality_gain": self.minimum_meaningful_quality_gain,
@@ -248,6 +265,8 @@ class SuiteDraft:
     max_parallel_models: int = 16
     max_parallel_scenarios: int = 32
     request_timeout_seconds: float = 120
+    target_max_tokens: int = 600
+    request_options: Mapping[str, Any] = field(default_factory=dict)
     max_p90_latency_seconds: float | None = None
     latency_value_usd_per_second: float = 0.0
     allow_few_shot: bool = True
@@ -285,6 +304,8 @@ class SuiteDraft:
                 max_parallel_models=int(value.get("max_parallel_models", 16)),
                 max_parallel_scenarios=int(value.get("max_parallel_scenarios", 32)),
                 request_timeout_seconds=float(value.get("request_timeout_seconds", 120)),
+                target_max_tokens=int(value.get("target_max_tokens", 600)),
+                request_options=normalize_request_options(value.get("request_options")),
                 max_p90_latency_seconds=(float(value["max_p90_latency_seconds"]) if value.get("max_p90_latency_seconds") is not None else None),
                 latency_value_usd_per_second=float(value.get("latency_value_usd_per_second", 0.0)),
                 allow_few_shot=bool(value.get("allow_few_shot", True)),
@@ -328,6 +349,9 @@ class SuiteDraft:
             "max_parallel_models": self.max_parallel_models,
             "max_parallel_scenarios": self.max_parallel_scenarios,
             "request_timeout_seconds": self.request_timeout_seconds,
+            "target_max_tokens": self.target_max_tokens,
+            "request_options": normalize_request_options(self.request_options),
+            "request_options_sha256": request_options_fingerprint(self.request_options),
             "max_p90_latency_seconds": self.max_p90_latency_seconds,
             "latency_value_usd_per_second": self.latency_value_usd_per_second,
             "allow_few_shot": self.allow_few_shot,
@@ -367,6 +391,8 @@ class SuiteDraft:
             max_parallel_models=self.max_parallel_models,
             max_parallel_scenarios=self.max_parallel_scenarios,
             request_timeout_seconds=self.request_timeout_seconds,
+            target_max_tokens=self.target_max_tokens,
+            request_options=normalize_request_options(self.request_options),
             max_p90_latency_seconds=self.max_p90_latency_seconds,
             latency_value_usd_per_second=self.latency_value_usd_per_second,
             allow_few_shot=self.allow_few_shot,
@@ -394,6 +420,8 @@ class SuiteDraft:
             max_parallel_models=self.max_parallel_models,
             max_parallel_scenarios=self.max_parallel_scenarios,
             request_timeout_seconds=self.request_timeout_seconds,
+            target_max_tokens=self.target_max_tokens,
+            request_options=normalize_request_options(self.request_options),
             max_p90_latency_seconds=self.max_p90_latency_seconds,
             latency_value_usd_per_second=self.latency_value_usd_per_second,
             allow_few_shot=self.allow_few_shot,
@@ -479,6 +507,8 @@ class Evalt:
                     f"Evalt · {route} · QUALIFIED ROUTE · {model} · ${cost:.6f} · "
                     f"{policy} ceiling ${ceiling:.6f}"
                 )
+            if event.get("request_envelope_validated") is False:
+                message += " | WARNING: request settings differ from the tested route"
         elif kind == "production_call_failed":
             message = f"Evalt · {route} · stopped before completion: {event.get('error')}"
         elif kind == "feedback_recorded":
@@ -760,6 +790,8 @@ class Evalt:
         max_parallel_models: int = 16,
         max_parallel_scenarios: int = 32,
         request_timeout_seconds: float = 120,
+        target_max_tokens: int = 600,
+        request_options: Mapping[str, Any] | None = None,
         max_p90_latency_seconds: float | None = None,
         latency_value_usd_per_second: float = 0.0,
         allow_few_shot: bool = True,
@@ -778,6 +810,9 @@ class Evalt:
             raise ValueError("workflow_budget_usd must be greater than zero and no more than 100.")
         if not 0 < float(quality_threshold) <= 1:
             raise ValueError("quality_threshold must be greater than zero and at most one.")
+        if not 1 <= int(target_max_tokens) <= 131072:
+            raise ValueError("target_max_tokens must be between 1 and 131072.")
+        normalized_request_options = normalize_request_options(request_options)
         seeds = tuple(
             Example.from_value(item, index)
             for index, item in enumerate(seed_examples)
@@ -1326,6 +1361,8 @@ class Evalt:
             max_parallel_models=int(max_parallel_models),
             max_parallel_scenarios=int(max_parallel_scenarios),
             request_timeout_seconds=float(request_timeout_seconds),
+            target_max_tokens=int(target_max_tokens),
+            request_options=normalized_request_options,
             max_p90_latency_seconds=max_p90_latency_seconds,
             latency_value_usd_per_second=float(latency_value_usd_per_second),
             allow_few_shot=bool(allow_few_shot),
@@ -1399,7 +1436,9 @@ class Evalt:
         max_p90_latency_seconds: float | None = None,
         latency_value_usd_per_second: float = 0.0,
         models: Iterable[str] | None = None,
-        max_tokens: int = 600,
+        max_tokens: int | None = None,
+        request_options: Mapping[str, Any] | None = None,
+        strict_request_options: bool = False,
         budget_usd: float | None = None,
         quality_threshold: float | None = None,
         retest_after_calls: int = 500,
@@ -1447,6 +1486,11 @@ class Evalt:
             return result
         if input is None:
             raise ValueError("input is required when executing a prompt through Evalt.")
+        normalized_request_options = (
+            None if request_options is None else normalize_request_options(request_options)
+        )
+        if max_tokens is not None and not 1 <= int(max_tokens) <= 131072:
+            raise ValueError("max_tokens must be between 1 and 131072.")
         if first_run not in {"optimize", "bootstrap"}:
             raise ValueError("first_run must be 'optimize' or 'bootstrap'.")
         if not 0 < float(test_request_timeout_seconds) <= 7200:
@@ -1564,6 +1608,8 @@ class Evalt:
                     max_p90_latency_seconds=max_p90_latency_seconds,
                     latency_value_usd_per_second=latency_value_usd_per_second,
                     request_timeout_seconds=float(test_request_timeout_seconds),
+                    target_max_tokens=int(max_tokens or 600),
+                    request_options=normalized_request_options,
                 )
                 initial_result = self.run(draft.autopilot_suite())
                 initial_test_spend_usd = round(
@@ -1584,6 +1630,8 @@ class Evalt:
                         designer_model=draft.designer_model,
                         evaluator_model=draft.evaluator_model,
                         judge_calibration_checks=draft.judge_calibration_checks,
+                        target_max_tokens=draft.target_max_tokens,
+                        request_options=draft.request_options,
                     )
                 except ValueError as error:
                     raise ProviderError(str(error)) from error
@@ -1613,6 +1661,8 @@ class Evalt:
                 max_cost_per_run_usd=max_cost_per_run_usd,
                 models=requested_models,
                 max_tokens=max_tokens,
+                request_options=normalized_request_options,
+                strict_request_options=bool(strict_request_options),
                 target_accuracy=target_accuracy,
                 objective=objective,
                 optimize_prompt=bool(optimize_prompt),
@@ -1645,6 +1695,8 @@ class Evalt:
             "min_feedback": min_feedback,
             "route_phase": answer.route_phase,
             "evidence_provenance": answer.evidence_provenance,
+            "request_envelope_validated": answer.request_envelope_validated,
+            "request_options_sha256": answer.request_options_sha256,
         })
 
         def on_feedback(receipt: dict[str, Any]) -> None:
@@ -1782,6 +1834,7 @@ __all__ = [
     "OpenRouterTransport",
     "OptimizationResult",
     "ProviderError",
+    "RequestEnvelopeDriftWarning",
     "RolePlan",
     "RoutedAnswer",
     "Suite",

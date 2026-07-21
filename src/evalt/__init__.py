@@ -10,6 +10,7 @@ from .core import (
     ModelResult,
     OptimizationResult,
     ProviderError,
+    RequestEnvelopeDriftWarning,
     RolePlan,
     RoutedAnswer,
     Suite,
@@ -36,6 +37,7 @@ __all__ = [
     "ModelResult",
     "OptimizationResult",
     "ProviderError",
+    "RequestEnvelopeDriftWarning",
     "RolePlan",
     "RoutedAnswer",
     "Suite",
@@ -50,4 +52,4 @@ __all__ = [
     "write_reports",
 ]
 
-__version__ = "0.9.4"
+__version__ = "0.9.5"

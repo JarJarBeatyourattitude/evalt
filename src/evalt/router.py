@@ -8,7 +8,7 @@ runtime source of truth; JSON is only an optional audit export.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from contextlib import contextmanager
 import hashlib
@@ -18,9 +18,13 @@ from pathlib import Path
 import sqlite3
 import threading
 import uuid
+import warnings as runtime_warnings
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
-from last_good_prompt.core import BudgetExceeded, Client, Completion, Example, OptimizationResult, _Budget
+from last_good_prompt.core import (
+    BudgetExceeded, Client, Completion, Example, OptimizationResult, _Budget,
+    normalize_request_options, request_options_fingerprint,
+)
 
 
 DEFAULT_TARGETS = (
@@ -28,6 +32,10 @@ DEFAULT_TARGETS = (
     "google/gemini-3-flash-preview",
     "qwen/qwen3.5-9b",
 )
+
+
+class RequestEnvelopeDriftWarning(UserWarning):
+    """A production call changed settings that were part of route qualification."""
 
 
 def _now() -> str:
@@ -267,6 +275,14 @@ class RoutedAnswer:
     route_phase: str = "untested_bootstrap"
     evidence_provenance: str = "UNTESTED_BOOTSTRAP"
     initial_test_summary: dict[str, Any] | None = None
+    request_envelope_validated: bool = True
+    request_options_sha256: str = ""
+    tested_request_options_sha256: str = ""
+    warnings: tuple[str, ...] = ()
+    finish_reason: str | None = None
+    native_finish_reason: str | None = None
+    message: dict[str, Any] = field(default_factory=dict)
+    tool_calls: tuple[dict[str, Any], ...] = ()
     _router: "DurableRouter | None" = None
     _min_feedback: int = 5
     _retest_after_calls: int = 500
@@ -311,6 +327,14 @@ class RoutedAnswer:
             "route_phase": self.route_phase,
             "evidence_provenance": self.evidence_provenance,
             "initial_test_summary": self.initial_test_summary,
+            "request_envelope_validated": self.request_envelope_validated,
+            "request_options_sha256": self.request_options_sha256,
+            "tested_request_options_sha256": self.tested_request_options_sha256,
+            "warnings": list(self.warnings),
+            "finish_reason": self.finish_reason,
+            "native_finish_reason": self.native_finish_reason,
+            "message": self.message,
+            "tool_calls": list(self.tool_calls),
         }
 
 
@@ -410,9 +434,25 @@ class DurableRouter:
                 ("selected_few_shot_json", "TEXT NOT NULL DEFAULT '[]'"),
                 ("evidence_provenance", "TEXT NOT NULL DEFAULT 'LEGACY_UNKNOWN'"),
                 ("last_test_summary_json", "TEXT NOT NULL DEFAULT '{}'"),
+                ("target_max_tokens", "INTEGER NOT NULL DEFAULT 600"),
+                ("tested_request_options_json", "TEXT NOT NULL DEFAULT '{}'"),
+                ("tested_request_options_sha256", "TEXT NOT NULL DEFAULT ''"),
             ):
                 if name not in columns:
                     db.execute(f"ALTER TABLE routes ADD COLUMN {name} {declaration}")
+            empty_options_hash = request_options_fingerprint({})
+            db.execute(
+                "UPDATE routes SET tested_request_options_sha256=? "
+                "WHERE tested_request_options_sha256=''",
+                (empty_options_hash,),
+            )
+            call_columns = {row["name"] for row in db.execute("PRAGMA table_info(calls)")}
+            for name, declaration in (
+                ("request_options_sha256", "TEXT NOT NULL DEFAULT ''"),
+                ("request_envelope_validated", "INTEGER NOT NULL DEFAULT 1"),
+            ):
+                if name not in call_columns:
+                    db.execute(f"ALTER TABLE calls ADD COLUMN {name} {declaration}")
 
     def _event(self, db: sqlite3.Connection, route: str, event_type: str, detail: Mapping[str, Any]) -> None:
         db.execute(
@@ -428,6 +468,8 @@ class DurableRouter:
         models: Sequence[str],
         quality_threshold: float,
         catalog_revision: str,
+        target_max_tokens: int | None = None,
+        request_options: Mapping[str, Any] | None = None,
     ) -> sqlite3.Row:
         if not route.strip():
             raise ValueError("route must be a stable non-empty name so Evalt can remember decisions.")
@@ -437,6 +479,15 @@ class DurableRouter:
         if not candidates:
             raise ValueError("At least one candidate model is required.")
         version = _hash(prompt.strip())[:16]
+        resolved_target_max_tokens = int(target_max_tokens or 600)
+        if not 1 <= resolved_target_max_tokens <= 131072:
+            raise ValueError("target_max_tokens must be between 1 and 131072.")
+        options_were_provided = request_options is not None
+        normalized_options = normalize_request_options(request_options)
+        options_json = json.dumps(
+            normalized_options, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+        options_hash = request_options_fingerprint(normalized_options)
         now = _now()
         with self._db() as db:
             current = db.execute("SELECT * FROM routes WHERE route = ?", (route,)).fetchone()
@@ -445,20 +496,49 @@ class DurableRouter:
                     "INSERT INTO routes(route,prompt,source_prompt_version,prompt_version,candidates_json,selected_model,selected_prompt,decision_reason,quality_threshold,catalog_revision,evidence_provenance,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (route, prompt.strip(), version, version, json.dumps(candidates), candidates[0], prompt.strip(), "bootstrap_unqualified", quality_threshold, catalog_revision, "UNTESTED_BOOTSTRAP", now, now),
                 )
+                db.execute(
+                    "UPDATE routes SET target_max_tokens=?,tested_request_options_json=?,"
+                    "tested_request_options_sha256=? WHERE route=?",
+                    (resolved_target_max_tokens, options_json, options_hash, route),
+                )
                 self._event(db, route, "route_created", {"prompt_version": version, "bootstrap_model": candidates[0], "candidates": candidates})
             else:
                 changed = current["source_prompt_version"] != version
                 candidates_changed = json.loads(current["candidates_json"]) != list(candidates)
                 if changed:
                     db.execute(
-                        "UPDATE routes SET prompt=?,source_prompt_version=?,prompt_version=?,candidates_json=?,selected_model=?,selected_prompt=?,selected_few_shot_json='[]',evidence_provenance='UNTESTED_BOOTSTRAP',last_test_summary_json='{}',decision_reason='prompt_changed_unqualified',feedback_count=0,last_optimized_feedback=0,last_optimized_calls=total_calls,tested_catalog_revision='',catalog_revision=?,updated_at=? WHERE route=?",
-                        (prompt.strip(), version, version, json.dumps(candidates), candidates[0], prompt.strip(), catalog_revision, now, route),
+                        "UPDATE routes SET prompt=?,source_prompt_version=?,prompt_version=?,candidates_json=?,selected_model=?,selected_prompt=?,selected_few_shot_json='[]',evidence_provenance='UNTESTED_BOOTSTRAP',last_test_summary_json='{}',decision_reason='prompt_changed_unqualified',feedback_count=0,last_optimized_feedback=0,last_optimized_calls=total_calls,tested_catalog_revision='',catalog_revision=?,target_max_tokens=?,tested_request_options_json=?,tested_request_options_sha256=?,updated_at=? WHERE route=?",
+                        (prompt.strip(), version, version, json.dumps(candidates), candidates[0], prompt.strip(), catalog_revision, resolved_target_max_tokens, options_json, options_hash, now, route),
                     )
                     self._event(db, route, "prompt_changed", {
                         "prompt_version": version,
                         "bootstrap_model": candidates[0],
                         "evidence_policy": "Prior prompt-version feedback remains in the audit log but cannot qualify the changed prompt.",
                     })
+                elif str(current["evidence_provenance"]) in {"LEGACY_UNKNOWN", "UNTESTED_BOOTSTRAP"}:
+                    retained_target_max_tokens = (
+                        resolved_target_max_tokens
+                        if target_max_tokens is not None
+                        else int(current["target_max_tokens"] or 600)
+                    )
+                    retained_options_json = (
+                        options_json
+                        if options_were_provided
+                        else str(current["tested_request_options_json"] or "{}")
+                    )
+                    retained_options_hash = (
+                        options_hash
+                        if options_were_provided
+                        else str(current["tested_request_options_sha256"])
+                    )
+                    db.execute(
+                        "UPDATE routes SET candidates_json=?,catalog_revision=?,target_max_tokens=?,"
+                        "tested_request_options_json=?,tested_request_options_sha256=?,updated_at=? WHERE route=?",
+                        (
+                            json.dumps(candidates), catalog_revision, retained_target_max_tokens,
+                            retained_options_json, retained_options_hash, now, route,
+                        ),
+                    )
                 elif candidates_changed or current["catalog_revision"] != catalog_revision:
                     db.execute(
                         "UPDATE routes SET candidates_json=?,catalog_revision=?,updated_at=? WHERE route=?",
@@ -493,6 +573,8 @@ class DurableRouter:
         designer_model: str,
         evaluator_model: str,
         judge_calibration_checks: int,
+        target_max_tokens: int,
+        request_options: Mapping[str, Any] | None,
     ) -> dict[str, Any]:
         """Durably install one split-tested first-route package or fail closed."""
         winner = result.winner
@@ -515,7 +597,14 @@ class DurableRouter:
             models=models,
             quality_threshold=quality_threshold,
             catalog_revision=catalog_revision,
+            target_max_tokens=target_max_tokens,
+            request_options=request_options,
         )
+        normalized_options = normalize_request_options(request_options)
+        options_json = json.dumps(
+            normalized_options, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+        options_hash = request_options_fingerprint(normalized_options)
         selected_ids = set(winner.few_shot_example_ids)
         few_shot_messages: list[dict[str, str]] = []
         for example in examples:
@@ -547,11 +636,13 @@ class DurableRouter:
             "evaluator_model": evaluator_model,
             "judge_calibrated": int(judge_calibration_checks) >= 3,
             "judge_calibration_checks": int(judge_calibration_checks),
+            "target_max_tokens": int(target_max_tokens),
+            "request_options_sha256": options_hash,
         }
         with self._db() as db:
             current = db.execute("SELECT * FROM routes WHERE route=?", (route,)).fetchone()
             db.execute(
-                "UPDATE routes SET selected_model=?,selected_prompt=?,selected_few_shot_json=?,prompt_version=?,decision_reason='provisional_ai_qualified',evidence_provenance=?,last_test_summary_json=?,last_optimized_calls=?,last_optimized_feedback=?,tested_catalog_revision=?,updated_at=? WHERE route=?",
+                "UPDATE routes SET selected_model=?,selected_prompt=?,selected_few_shot_json=?,prompt_version=?,decision_reason='provisional_ai_qualified',evidence_provenance=?,last_test_summary_json=?,last_optimized_calls=?,last_optimized_feedback=?,tested_catalog_revision=?,target_max_tokens=?,tested_request_options_json=?,tested_request_options_sha256=?,updated_at=? WHERE route=?",
                 (
                     winner.model,
                     winner.selected_prompt,
@@ -562,6 +653,9 @@ class DurableRouter:
                     current["total_calls"],
                     current["feedback_count"],
                     catalog_revision,
+                    int(target_max_tokens),
+                    options_json,
+                    options_hash,
                     _now(),
                     route,
                 ),
@@ -587,7 +681,9 @@ class DurableRouter:
         input: Any,
         max_cost_per_run_usd: float | None,
         models: Sequence[str] = DEFAULT_TARGETS,
-        max_tokens: int = 600,
+        max_tokens: int | None = None,
+        request_options: Mapping[str, Any] | None = None,
+        strict_request_options: bool = False,
         target_accuracy: float = 0.95,
         objective: str = "best_within_price",
         optimize_prompt: bool = True,
@@ -613,6 +709,8 @@ class DurableRouter:
             models=models,
             quality_threshold=target_accuracy,
             catalog_revision=catalog_revision,
+            target_max_tokens=max_tokens,
+            request_options=request_options,
         )
         set_performance_policy = getattr(self.client.transport, "set_performance_policy", None)
         if callable(set_performance_policy):
@@ -621,13 +719,66 @@ class DurableRouter:
                 provider_sort=("latency" if latency_value_usd_per_second > 0 else "price"),
             )
         input_text = _content(input)
+        tested_options = normalize_request_options(
+            json.loads(row["tested_request_options_json"] or "{}")
+        )
+        active_options = (
+            tested_options
+            if request_options is None
+            else normalize_request_options(request_options)
+        )
+        tested_options_hash = str(
+            row["tested_request_options_sha256"]
+            or request_options_fingerprint(tested_options)
+        )
+        active_options_hash = request_options_fingerprint(active_options)
+        tested_max_tokens = int(row["target_max_tokens"] or 600)
+        active_max_tokens = (
+            tested_max_tokens if max_tokens is None else int(max_tokens)
+        )
+        if not 1 <= active_max_tokens <= 131072:
+            raise ValueError("max_tokens must be between 1 and 131072.")
+        envelope_drift = (
+            active_options_hash != tested_options_hash
+            or active_max_tokens != tested_max_tokens
+        )
+        drift_message = (
+            "This Evalt call overrides the OpenRouter request settings used to "
+            "qualify the route; the saved accuracy result does not validate this response."
+        )
+        if envelope_drift and strict_request_options:
+            raise ValueError(drift_message + " Remove the override or set strict_request_options=False.")
+        if envelope_drift:
+            runtime_warnings.warn(
+                drift_message,
+                RequestEnvelopeDriftWarning,
+                stacklevel=3,
+            )
+            with self._db() as db:
+                self._event(db, route, "request_envelope_drift", {
+                    "tested_request_options_sha256": tested_options_hash,
+                    "request_options_sha256": active_options_hash,
+                    "tested_max_tokens": tested_max_tokens,
+                    "requested_max_tokens": active_max_tokens,
+                    "quality_claim_applies": False,
+                })
         few_shot_messages = json.loads(row["selected_few_shot_json"] or "[]")
+        if isinstance(input, Mapping) and input.get("role"):
+            input_messages = [dict(input)]
+        elif (
+            isinstance(input, (list, tuple))
+            and input
+            and all(isinstance(item, Mapping) and item.get("role") for item in input)
+        ):
+            input_messages = [dict(item) for item in input]
+        else:
+            input_messages = [{"role": "user", "content": input}]
         messages = [
             {"role": "system", "content": row["selected_prompt"]},
             *few_shot_messages,
-            {"role": "user", "content": input_text},
+            *input_messages,
         ]
-        estimate = self.client.transport.estimate_cost(row["selected_model"], messages, max_tokens=max_tokens)
+        estimate = self.client.transport.estimate_cost(row["selected_model"], messages, max_tokens=active_max_tokens)
         price_policy = "explicit" if max_cost_per_run_usd is not None else "automatic"
         effective_price_ceiling_usd = (
             float(max_cost_per_run_usd)
@@ -669,14 +820,26 @@ class DurableRouter:
             raise BudgetExceeded(
                 f"The selected route estimates ${estimate:.6f}, above this call's ${effective_price_ceiling_usd:.6f} price ceiling."
             )
-        completion: Completion = self.client.transport.complete(row["selected_model"], messages, max_tokens=max_tokens)
+        completion_kwargs: dict[str, Any] = {"max_tokens": active_max_tokens}
+        if active_options:
+            completion_kwargs["request_options"] = active_options
+        try:
+            completion: Completion = self.client.transport.complete(
+                row["selected_model"], messages, **completion_kwargs
+            )
+        except TypeError as error:
+            if active_options and "request_options" in str(error):
+                raise ValueError(
+                    "The custom transport does not support request_options."
+                ) from error
+            raise
         if completion.cost_usd > effective_price_ceiling_usd + 1e-12:
             raise BudgetExceeded("The provider-reported cost exceeded this call's hard cap.")
         call_id = f"call-{uuid.uuid4().hex}"
         with self._db() as db:
             db.execute(
-                "INSERT INTO calls VALUES (?,?,?,?,?,?,?,?,?,?)",
-                (call_id, route, _now(), input_text, completion.content, completion.model, row["prompt_version"], completion.cost_usd, effective_price_ceiling_usd, row["decision_reason"]),
+                "INSERT INTO calls(call_id,route,created_at,input_text,output_text,model,prompt_version,provider_cost_usd,budget_usd,decision_reason,request_options_sha256,request_envelope_validated) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                (call_id, route, _now(), input_text, completion.content, completion.model, row["prompt_version"], completion.cost_usd, effective_price_ceiling_usd, row["decision_reason"], active_options_hash, int(not envelope_drift)),
             )
             db.execute("UPDATE routes SET total_calls=total_calls+1,updated_at=? WHERE route=?", (_now(), route))
             current = db.execute("SELECT * FROM routes WHERE route=?", (route,)).fetchone()
@@ -695,6 +858,14 @@ class DurableRouter:
             ),
             evidence_provenance=row["evidence_provenance"],
             initial_test_summary=(json.loads(row["last_test_summary_json"] or "{}") or None),
+            request_envelope_validated=not envelope_drift,
+            request_options_sha256=active_options_hash,
+            tested_request_options_sha256=tested_options_hash,
+            warnings=((drift_message,) if envelope_drift else ()),
+            finish_reason=completion.finish_reason,
+            native_finish_reason=completion.native_finish_reason,
+            message=dict(completion.message),
+            tool_calls=tuple(completion.tool_calls),
             _router=self,
             _min_feedback=min_feedback,
             _retest_after_calls=retest_after_calls,
@@ -827,6 +998,8 @@ class DurableRouter:
                 adaptive_search=True,
                 max_p90_latency_seconds=row["max_p90_latency_seconds"],
                 latency_value_usd_per_second=row["latency_value_usd_per_second"],
+                target_max_tokens=int(row["target_max_tokens"] or 600),
+                request_options=json.loads(row["tested_request_options_json"] or "{}"),
             )
             winner = result.winner
             within_price = max_cost_per_run_usd is None or winner.estimated_production_cost_per_call_usd <= max_cost_per_run_usd + 1e-12
@@ -937,6 +1110,9 @@ class DurableRouter:
             "max_p90_latency_seconds": row["max_p90_latency_seconds"],
             "latency_value_usd_per_second": row["latency_value_usd_per_second"],
             "optimize_prompt": bool(row["optimize_prompt"]),
+            "target_max_tokens": int(row["target_max_tokens"] or 600),
+            "tested_request_options": json.loads(row["tested_request_options_json"] or "{}"),
+            "tested_request_options_sha256": row["tested_request_options_sha256"],
             "total_calls": row["total_calls"],
             "feedback_count": row["feedback_count"],
             "feedback_needed_for_first_test": max(
@@ -952,4 +1128,7 @@ class DurableRouter:
         Path(path).write_text(json.dumps(self.status(route), indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
-__all__ = ["DEFAULT_TARGETS", "DurableRouter", "RolePlan", "RoutedAnswer", "select_role_plan"]
+__all__ = [
+    "DEFAULT_TARGETS", "DurableRouter", "RequestEnvelopeDriftWarning",
+    "RolePlan", "RoutedAnswer", "select_role_plan",
+]

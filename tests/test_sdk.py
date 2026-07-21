@@ -13,7 +13,7 @@ import unittest
 from unittest import mock
 from urllib.error import HTTPError
 
-from evalt import BudgetExceeded, Client, Evalt, ProviderError, Suite, check_result, compare_results, render_comparison_html, render_html_report, render_junit_report, select_role_plan
+from evalt import BudgetExceeded, Client, Evalt, Example, ProviderError, RequestEnvelopeDriftWarning, Suite, check_result, compare_results, render_comparison_html, render_html_report, render_junit_report, select_role_plan
 from evalt.cli import STARTER_SUITE, main as cli_main, parser as cli_parser
 from evalt.acceptance import AcceptanceFailure, redact_trace, validate_auto_first_route_receipt
 from evalt.core import Completion, OpenRouterTransport, _safe_provider_error_detail
@@ -247,6 +247,27 @@ class FakeTransport:
             cost_usd=self.estimate_cost(model, messages, max_tokens=max_tokens),
             prompt_tokens=10,
             completion_tokens=3,
+        )
+
+
+class EnvelopeTransport(FakeTransport):
+    def __init__(self):
+        super().__init__()
+        self.request_envelopes = []
+
+    def complete(
+        self, model, messages, *, max_tokens, response_schema=None,
+        request_options=None,
+    ):
+        self.request_envelopes.append({
+            "model": model,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "response_schema": response_schema,
+            "request_options": request_options,
+        })
+        return super().complete(
+            model, messages, max_tokens=max_tokens, response_schema=response_schema
         )
 
 
@@ -573,6 +594,255 @@ EXAMPLES = [
 
 
 class SdkTests(unittest.TestCase):
+    def test_target_request_envelope_never_leaks_into_optimizer_or_judge(self):
+        transport = EnvelopeTransport()
+        request_options = {
+            "temperature": 0.25,
+            "response_format": {"type": "json_object"},
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "route_ticket",
+                    "description": "Route a ticket.",
+                    "parameters": {"type": "object"},
+                },
+            }],
+            "tool_choice": "auto",
+        }
+        result = Client(transport=transport).optimize(
+            prompt="Return the approved route label only.",
+            examples=EXAMPLES,
+            models=["target"],
+            optimizer_model="optimizer",
+            evaluator_model="evaluator",
+            max_optimization_cost_usd=1,
+            target_max_tokens=777,
+            request_options=request_options,
+        )
+        target_calls = [
+            call for call in transport.request_envelopes
+            if call["model"] == "target"
+        ]
+        orchestration_calls = [
+            call for call in transport.request_envelopes
+            if call["model"] in {"optimizer", "evaluator"}
+        ]
+        self.assertTrue(target_calls)
+        self.assertTrue(orchestration_calls)
+        self.assertTrue(all(call["max_tokens"] == 777 for call in target_calls))
+        self.assertTrue(all(call["request_options"] == request_options for call in target_calls))
+        self.assertTrue(all(call["request_options"] is None for call in orchestration_calls))
+        self.assertEqual(result.regression_suite["request_options"], request_options)
+        self.assertEqual(result.regression_suite["target_max_tokens"], 777)
+
+    def test_route_reuses_tested_envelope_and_warns_or_fails_on_drift(self):
+        transport = EnvelopeTransport()
+        options = {
+            "temperature": 0.2,
+            "provider": {"order": ["Together"], "allow_fallbacks": False},
+        }
+        with TemporaryDirectory(ignore_cleanup_errors=True) as directory:
+            evalt = Evalt(
+                transport=transport,
+                state_path=Path(directory) / "evalt.db",
+                show_progress=False,
+            )
+            first = evalt.run(
+                "Classify this request as billing, account, or technical.",
+                "The site is broken.",
+                route="envelope",
+                models=["target"],
+                first_run="bootstrap",
+                test_budget_usd=0,
+                max_tokens=777,
+                request_options=options,
+            )
+            with sqlite3.connect(Path(directory) / "evalt.db") as db:
+                db.execute(
+                    "UPDATE routes SET evidence_provenance='AI_GENERATED_AI_JUDGED', "
+                    "decision_reason='provisional_ai_qualified' WHERE route='envelope'"
+                )
+            second = evalt.run(
+                "Classify this request as billing, account, or technical.",
+                "I was charged twice.",
+                route="envelope",
+                models=["target"],
+                first_run="bootstrap",
+                test_budget_usd=0,
+            )
+            self.assertTrue(first.request_envelope_validated)
+            self.assertTrue(second.request_envelope_validated)
+            self.assertEqual(transport.request_envelopes[-1]["request_options"], options)
+            self.assertEqual(transport.request_envelopes[-1]["max_tokens"], 777)
+            before_drift = len(transport.request_envelopes)
+            with self.assertWarns(RequestEnvelopeDriftWarning):
+                drifted = evalt.run(
+                    "Classify this request as billing, account, or technical.",
+                    "Reset my password.",
+                    route="envelope",
+                    models=["target"],
+                    first_run="bootstrap",
+                    test_budget_usd=0,
+                    request_options={"temperature": 0.9},
+                )
+            self.assertFalse(drifted.request_envelope_validated)
+            self.assertTrue(drifted.warnings)
+            self.assertEqual(len(transport.request_envelopes), before_drift + 1)
+            before_strict = len(transport.request_envelopes)
+            with self.assertRaisesRegex(ValueError, "does not validate"):
+                evalt.run(
+                    "Classify this request as billing, account, or technical.",
+                    "Reset my password.",
+                    route="envelope",
+                    models=["target"],
+                    first_run="bootstrap",
+                    test_budget_usd=0,
+                    max_tokens=999,
+                    strict_request_options=True,
+                )
+            self.assertEqual(len(transport.request_envelopes), before_strict)
+            status = evalt.route_status("envelope")
+            self.assertEqual(status["target_max_tokens"], 777)
+            self.assertEqual(status["tested_request_options"], options)
+            self.assertTrue(any(
+                event["event_type"] == "request_envelope_drift"
+                for event in status["decisions"]
+            ))
+
+    def test_request_envelope_rejects_reserved_stream_reasoning_and_secrets(self):
+        for invalid in (
+            {"stream": True},
+            {"model": "other"},
+            {"reasoning": {"effort": "high"}},
+            {"metadata": {"authorization": "secret"}},
+        ):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises((TypeError, ValueError)):
+                    Suite(
+                        prompt="Return one label.",
+                        examples=tuple(
+                            Example.from_value(item, index)
+                            for index, item in enumerate(EXAMPLES)
+                        ),
+                        models=("target",),
+                        request_options=invalid,
+                    ).validate()
+
+    def test_openrouter_forwards_full_future_proof_envelope_and_returns_tool_calls(self):
+        sent_requests = []
+
+        def opener(request, timeout):
+            if request.data is not None:
+                sent_requests.append(json.loads(request.data))
+                return FakeResponse({
+                    "id": "gen-tool",
+                    "choices": [{
+                        "finish_reason": "tool_calls",
+                        "native_finish_reason": "tool_use",
+                        "message": {
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [{
+                                "id": "call-1",
+                                "type": "function",
+                                "function": {
+                                    "name": "route_ticket",
+                                    "arguments": "{\"label\":\"technical\"}",
+                                },
+                            }],
+                        },
+                    }],
+                    "usage": {"cost": 0.0001, "prompt_tokens": 8, "completion_tokens": 4},
+                })
+            if "endpoints/zdr" in request.full_url:
+                return FakeResponse({"data": [{
+                    "model_id": "tool-model", "tag": "fixture/tool", "context_length": 131072,
+                    "max_completion_tokens": 131072,
+                    "pricing": {"prompt": "0.000001", "completion": "0.000002"},
+                    "supported_parameters": [
+                        "max_completion_tokens", "temperature", "tools", "tool_choice",
+                        "response_format", "structured_outputs", "reasoning",
+                    ],
+                }]})
+            return FakeResponse({"data": [{
+                "id": "tool-model", "context_length": 131072,
+                "pricing": {"prompt": "0.000001", "completion": "0.000002"},
+                "supported_parameters": ["max_completion_tokens", "temperature", "tools"],
+            }]})
+
+        options = {
+            "temperature": 0.3,
+            "top_p": 0.91,
+            "top_k": 40,
+            "min_p": 0.04,
+            "top_a": 0.1,
+            "frequency_penalty": 0.2,
+            "presence_penalty": 0.1,
+            "repetition_penalty": 1.05,
+            "seed": 42,
+            "stop": ["END"],
+            "logit_bias": {"123": -1},
+            "logprobs": True,
+            "top_logprobs": 3,
+            "prediction": {"type": "content", "content": "technical"},
+            "response_format": {"type": "json_object"},
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "route_ticket",
+                    "description": "Route a support ticket.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"label": {"type": "string"}},
+                        "required": ["label"],
+                    },
+                },
+            }],
+            "tool_choice": {"type": "function", "function": {"name": "route_ticket"}},
+            "parallel_tool_calls": False,
+            "provider": {
+                "order": ["Together"],
+                "allow_fallbacks": False,
+                "require_parameters": True,
+                "data_collection": "deny",
+                "zdr": True,
+                "quantizations": ["fp8"],
+                "preferred_min_throughput": {"p90": 20},
+                "preferred_max_latency": {"p90": 4},
+                "max_price": {"prompt": 1, "completion": 2},
+            },
+            "plugins": [{"id": "response-healing"}],
+            "transforms": ["middle-out"],
+            "user": "stable-user-123",
+            "verbosity": "low",
+            "web_search_options": {"search_context_size": "low"},
+            "modalities": ["text"],
+            "future_openrouter_field": {"enabled": True},
+            "reasoning": {"exclude": False},
+        }
+        transport = OpenRouterTransport("sk-or-v1-test-key", opener=opener)
+        completion = transport.complete(
+            "tool-model#reasoning=low",
+            [{"role": "user", "content": "The website will not load."}],
+            max_tokens=2048,
+            request_options=options,
+        )
+        sent = sent_requests[-1]
+        for key, value in options.items():
+            if key == "provider":
+                for provider_key, provider_value in value.items():
+                    self.assertEqual(sent["provider"][provider_key], provider_value)
+            elif key == "reasoning":
+                self.assertEqual(sent["reasoning"]["effort"], "low")
+                self.assertFalse(sent["reasoning"]["exclude"])
+            else:
+                self.assertEqual(sent[key], value)
+        self.assertEqual(sent["usage"], {"include": True})
+        self.assertEqual(completion.finish_reason, "tool_calls")
+        self.assertEqual(completion.native_finish_reason, "tool_use")
+        self.assertEqual(completion.tool_calls[0]["function"]["name"], "route_ticket")
+        self.assertIn('"tool_calls"', completion.content)
+
     def test_parallel_budget_reservations_wait_instead_of_creating_a_false_failure(self):
         budget = _Budget(0.10)
         first_reserved = threading.Event()
@@ -2004,9 +2274,21 @@ class SdkTests(unittest.TestCase):
             "examples": EXAMPLES,
             "models": ["cheap"],
             "request_timeout_seconds": 1200,
+            "target_max_tokens": 4096,
+            "request_options": {
+                "temperature": 0.2,
+                "response_format": {"type": "json_object"},
+            },
         })
         self.assertEqual(suite.request_timeout_seconds, 1200)
         self.assertEqual(suite.to_dict()["request_timeout_seconds"], 1200)
+        self.assertEqual(suite.optimize_kwargs()["target_max_tokens"], 4096)
+        self.assertEqual(suite.optimize_kwargs()["request_options"]["temperature"], 0.2)
+        self.assertEqual(
+            Suite.from_dict(suite.to_dict()).request_options,
+            suite.request_options,
+        )
+        self.assertEqual(len(suite.to_dict()["request_options_sha256"]), 64)
         latency_suite = Suite.from_dict({
             "prompt": "Return the approved route label only.",
             "examples": EXAMPLES,

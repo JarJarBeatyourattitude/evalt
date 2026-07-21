@@ -14,7 +14,7 @@ import ssl
 import statistics
 import threading
 import time
-from typing import Any, Callable, Iterable, Protocol
+from typing import Any, Callable, Iterable, Mapping, Protocol
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -25,6 +25,83 @@ from dotenv import load_dotenv
 OPENROUTER_CHAT_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models?output_modalities=text&sort=intelligence-high-to-low"
 OPENROUTER_ZDR_ENDPOINTS_URL = "https://openrouter.ai/api/v1/endpoints/zdr"
+
+
+# These fields define Evalt's own routing and accounting contract. Everything else
+# in the Chat Completions body is accepted through ``request_options`` so new
+# OpenRouter fields do not require an Evalt release merely to round-trip them.
+_RESERVED_OPENROUTER_REQUEST_FIELDS = {
+    "model", "models", "messages", "prompt", "stream", "usage",
+    "max_tokens", "max_completion_tokens",
+}
+_SECRET_FIELD_NAMES = {
+    "api_key", "apikey", "authorization", "openrouter_api_key",
+}
+
+
+def normalize_request_options(
+    value: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Return a canonical, persistence-safe OpenRouter target request envelope.
+
+    The envelope intentionally covers the Chat Completions body rather than other
+    OpenRouter endpoint families. Model selection, messages, streaming lifecycle,
+    cost accounting, output-token safety and the tuned reasoning effort remain
+    Evalt-owned so tests and production cannot silently disagree about them.
+    """
+    if value is None:
+        return {}
+    if not isinstance(value, Mapping):
+        raise TypeError("request_options must be a JSON-serializable mapping.")
+    try:
+        normalized = json.loads(
+            json.dumps(dict(value), ensure_ascii=False, sort_keys=True)
+        )
+    except (TypeError, ValueError) as error:
+        raise ValueError("request_options must contain only JSON-serializable values.") from error
+    if not isinstance(normalized, dict):
+        raise TypeError("request_options must be a JSON object.")
+    reserved = sorted(_RESERVED_OPENROUTER_REQUEST_FIELDS & normalized.keys())
+    if reserved:
+        if "stream" in reserved:
+            raise ValueError(
+                "Evalt.run() is a durable non-streaming call; stream belongs to a "
+                "separate iterator lifecycle and cannot be hidden in request_options."
+            )
+        raise ValueError(
+            "Evalt owns these request fields: " + ", ".join(reserved) + "."
+        )
+
+    def reject_secrets(item: Any, path: str = "request_options") -> None:
+        if isinstance(item, dict):
+            for key, child in item.items():
+                label = str(key)
+                if label.casefold() in _SECRET_FIELD_NAMES:
+                    raise ValueError(f"Secret-bearing field {path}.{label} is not allowed.")
+                reject_secrets(child, f"{path}.{label}")
+        elif isinstance(item, list):
+            for index, child in enumerate(item):
+                reject_secrets(child, f"{path}[{index}]")
+
+    reject_secrets(normalized)
+    reasoning = normalized.get("reasoning")
+    if isinstance(reasoning, dict) and "effort" in reasoning:
+        raise ValueError(
+            "Evalt tunes reasoning effort as part of the model configuration; "
+            "do not set request_options['reasoning']['effort']."
+        )
+    if "reasoning_effort" in normalized:
+        raise ValueError(
+            "Evalt tunes reasoning_effort as part of the model configuration."
+        )
+    return normalized
+
+
+def request_options_fingerprint(value: Mapping[str, Any] | None) -> str:
+    normalized = normalize_request_options(value)
+    return hashlib.sha256(
+        json.dumps(normalized, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
 
 
 class ProviderError(RuntimeError):
@@ -85,6 +162,10 @@ class Completion:
     prompt_tokens: int = 0
     completion_tokens: int = 0
     latency_ms: int = 0
+    finish_reason: str | None = None
+    native_finish_reason: str | None = None
+    message: dict[str, Any] = field(default_factory=dict)
+    tool_calls: tuple[dict[str, Any], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -213,6 +294,7 @@ class ChatTransport(Protocol):
         *,
         max_tokens: int,
         response_schema: dict[str, Any] | None = None,
+        request_options: Mapping[str, Any] | None = None,
     ) -> Completion: ...
 
     def estimate_cost(
@@ -553,6 +635,7 @@ class OpenRouterTransport:
         *,
         max_tokens: int,
         response_schema: dict[str, Any] | None = None,
+        request_options: Mapping[str, Any] | None = None,
     ) -> Completion:
         configuration = model
         explicit_reasoning = "#reasoning=" in model
@@ -563,6 +646,7 @@ class OpenRouterTransport:
             reasoning_effort = str(reasoning_metadata.get("default_effort") or "medium")
         max_tokens = self._bounded_output_tokens(model, messages, max_tokens, reasoning_effort)
         supported = self._supported_parameters.get(model, set())
+        target_options = normalize_request_options(request_options)
         body: dict[str, Any] = {
             "model": model,
             "messages": messages,
@@ -614,6 +698,32 @@ class OpenRouterTransport:
                     "schema": response_schema,
                 },
             }
+        # The customer envelope wins over Evalt defaults but never over the
+        # route-owned fields rejected by normalize_request_options(). Provider
+        # preferences are merged so callers can use every OpenRouter routing
+        # control without accidentally dropping Evalt's safe defaults.
+        requested_provider = target_options.pop("provider", None)
+        if requested_provider is not None:
+            if not isinstance(requested_provider, dict):
+                raise ValueError("request_options['provider'] must be a JSON object.")
+            body["provider"].update(requested_provider)
+        # Privacy and parameter compatibility are Evalt safety invariants, not
+        # tunable production behavior. All other OpenRouter provider-routing
+        # controls remain available in the tested request envelope.
+        body["provider"].update({
+            "zdr": True,
+            "data_collection": "deny",
+            "require_parameters": True,
+        })
+        requested_reasoning = target_options.pop("reasoning", None)
+        if requested_reasoning is not None:
+            if not isinstance(requested_reasoning, dict):
+                raise ValueError("request_options['reasoning'] must be a JSON object.")
+            body.setdefault("reasoning", {}).update(requested_reasoning)
+        body.update(target_options)
+        body["model"] = model
+        body["messages"] = messages
+        body["usage"] = {"include": True}
         started = time.monotonic()
         fallback_spend_usd = 0.0
         while True:
@@ -642,7 +752,12 @@ class OpenRouterTransport:
                 continue
             try:
                 choice = payload["choices"][0]
-                content = (choice.get("message") or {}).get("content")
+                message = dict(choice.get("message") or {})
+                content = message.get("content")
+                tool_calls = tuple(
+                    dict(item) for item in (message.get("tool_calls") or [])
+                    if isinstance(item, dict)
+                )
                 usage = payload.get("usage") or {}
                 billed_cost = float(usage.get("cost") or 0)
                 if choice.get("finish_reason") == "length":
@@ -653,6 +768,16 @@ class OpenRouterTransport:
                     error.cost_usd = fallback_spend_usd + billed_cost
                     error.generation_id = str(payload.get("id") or "")
                     raise error
+                if (content is None or not str(content).strip()) and tool_calls:
+                    # A tool call is a valid assistant answer. Canonical JSON keeps
+                    # it judgeable in suites while the structured form remains on
+                    # Completion/RoutedAnswer for production execution.
+                    content = json.dumps(
+                        {"tool_calls": list(tool_calls)},
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
                 if content is None or not str(content).strip():
                     # An empty answer is not evidence that more output allowance is
                     # needed. If OpenRouter identifies the serving provider, move to
@@ -688,6 +813,16 @@ class OpenRouterTransport:
                     prompt_tokens=int(usage.get("prompt_tokens") or 0),
                     completion_tokens=int(usage.get("completion_tokens") or 0),
                     latency_ms=round((time.monotonic() - started) * 1000),
+                    finish_reason=(
+                        str(choice.get("finish_reason"))
+                        if choice.get("finish_reason") is not None else None
+                    ),
+                    native_finish_reason=(
+                        str(choice.get("native_finish_reason"))
+                        if choice.get("native_finish_reason") is not None else None
+                    ),
+                    message=message,
+                    tool_calls=tool_calls,
                 )
             except (KeyError, IndexError, TypeError, ValueError) as error:
                 detail = _safe_provider_error_detail(json.dumps(payload, ensure_ascii=False))
@@ -824,6 +959,7 @@ class Client:
         *,
         max_tokens: int,
         response_schema: dict[str, Any] | None = None,
+        request_options: Mapping[str, Any] | None = None,
     ) -> Completion:
         for output_expansion_attempt in range(2):
             # A simple 2x retry was ineffective for reasoning models: 600 -> 1,200
@@ -837,12 +973,23 @@ class Client:
             estimate = self.transport.estimate_cost(model, messages, max_tokens=attempt_max_tokens)
             budget.authorize(estimate)
             try:
-                completion = self.transport.complete(
-                    model,
-                    messages,
-                    max_tokens=attempt_max_tokens,
-                    response_schema=response_schema,
-                )
+                complete_kwargs: dict[str, Any] = {
+                    "max_tokens": attempt_max_tokens,
+                    "response_schema": response_schema,
+                }
+                if request_options:
+                    complete_kwargs["request_options"] = request_options
+                try:
+                    completion = self.transport.complete(
+                        model, messages, **complete_kwargs
+                    )
+                except TypeError as error:
+                    if request_options and "request_options" in str(error):
+                        raise ProviderError(
+                            "The custom transport does not implement Evalt's "
+                            "request_options contract."
+                        ) from error
+                    raise
             except ProviderError as error:
                 billed_cost = float(getattr(error, "cost_usd", 0) or 0)
                 if billed_cost:
@@ -912,6 +1059,8 @@ class Client:
         max_parallel_scenarios: int = 32,
         max_p90_latency_seconds: float | None = None,
         latency_value_usd_per_second: float = 0.0,
+        target_max_tokens: int | None = None,
+        request_options: Mapping[str, Any] | None = None,
         progress_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> OptimizationResult:
         optimization_started = time.monotonic()
@@ -948,6 +1097,9 @@ class Client:
             raise ValueError("max_p90_latency_seconds must be positive when provided.")
         if latency_value_usd_per_second < 0:
             raise ValueError("latency_value_usd_per_second cannot be negative.")
+        if target_max_tokens is not None and not 1 <= int(target_max_tokens) <= 131072:
+            raise ValueError("target_max_tokens must be between one and 131072.")
+        target_request_options = normalize_request_options(request_options)
         evaluator_policy = _validate_evaluator_policy(evaluator)
         difficulty_floor_policy = _validate_difficulty_thresholds(difficulty_thresholds)
         performance_setter = getattr(self.transport, "set_performance_policy", None)
@@ -1062,6 +1214,8 @@ class Client:
                     optimize_prompt and model not in fixed_prompt_models
                 ),
                 progress_callback=emit_progress,
+                target_max_tokens=(int(target_max_tokens) if target_max_tokens is not None else None),
+                request_options=target_request_options,
             )
 
         def run_batch(configurations: list[str]) -> list[ModelResult]:
@@ -1137,6 +1291,8 @@ class Client:
                 prompt_text, "screening-baseline", dev, "dev", model,
                 evaluator_model, model_budget, evaluator=evaluator_policy,
                 max_parallel_scenarios=int(max_parallel_scenarios),
+                target_max_tokens=(int(target_max_tokens) if target_max_tokens is not None else None),
+                request_options=target_request_options,
             )
             screening_cases_by_model[model] = cases
             costs = sorted(case.target_cost_usd for case in cases if case.target_cost_usd > 0)
@@ -1386,6 +1542,8 @@ class Client:
                             few_shot_ids,
                             evaluator=evaluator_policy,
                             max_parallel_scenarios=int(max_parallel_scenarios),
+                            target_max_tokens=(int(target_max_tokens) if target_max_tokens is not None else None),
+                            request_options=target_request_options,
                         )
                         candidate = {
                             "model": model,
@@ -1872,6 +2030,11 @@ class Client:
             "latency_value_usd_per_second": latency_value_usd_per_second,
             "representative_input_chars": representative_input_chars,
             "representative_output_tokens": representative_output_tokens,
+            "target_max_tokens": (
+                int(target_max_tokens) if target_max_tokens is not None else None
+            ),
+            "request_options": target_request_options,
+            "request_options_sha256": request_options_fingerprint(target_request_options),
             "holdout_repeats": int(holdout_repeats),
             "holdout_unique_scenarios": len(holdout),
             "minimum_meaningful_quality_gain": minimum_meaningful_quality_gain,
@@ -2063,6 +2226,8 @@ class Client:
         prompt_origin: str = "starting_prompt",
         optimize_prompt: bool = True,
         progress_callback: Callable[[dict[str, Any]], None] | None = None,
+        target_max_tokens: int | None = None,
+        request_options: Mapping[str, Any] | None = None,
     ) -> ModelResult:
         started_spend = budget.spent_usd
         initial_prompt = seed_prompt or prompt
@@ -2076,12 +2241,14 @@ class Client:
             initial_prompt, "baseline", dev, "dev", model, evaluator_model, budget,
             train, initial_few_shot_ids, evaluator=evaluator,
             max_parallel_scenarios=max_parallel_scenarios,
+            target_max_tokens=target_max_tokens, request_options=request_options,
         )
         baseline_dev_rate = _pass_rate(baseline_dev)
         baseline_train = self._run_cases(
             initial_prompt, "baseline", train, "train", model, evaluator_model, budget,
             train, initial_few_shot_ids, evaluator=evaluator,
             max_parallel_scenarios=max_parallel_scenarios,
+            target_max_tokens=target_max_tokens, request_options=request_options,
         )
         baseline_train_rate = _pass_rate(baseline_train)
         selected_prompt = initial_prompt
@@ -2130,9 +2297,10 @@ class Client:
                 revised_few_shot_ids,
                 evaluator=evaluator,
                 max_parallel_scenarios=max_parallel_scenarios,
+                target_max_tokens=target_max_tokens, request_options=request_options,
             )
             candidate_cases += revised_train
-            revised_dev = self._run_cases(revised_prompt, f"candidate-{round_number}", dev, "dev", model, evaluator_model, budget, train, revised_few_shot_ids, evaluator=evaluator, max_parallel_scenarios=max_parallel_scenarios)
+            revised_dev = self._run_cases(revised_prompt, f"candidate-{round_number}", dev, "dev", model, evaluator_model, budget, train, revised_few_shot_ids, evaluator=evaluator, max_parallel_scenarios=max_parallel_scenarios, target_max_tokens=target_max_tokens, request_options=request_options)
             candidate_cases += revised_dev
             revised_rate = _pass_rate(revised_dev)
             revised_train_rate = _pass_rate(revised_train)
@@ -2185,6 +2353,7 @@ class Client:
                 repeats=holdout_repeats,
                 evaluator=evaluator,
                 max_parallel_scenarios=max_parallel_scenarios,
+                target_max_tokens=target_max_tokens, request_options=request_options,
             )
             if selected_kind == "baseline":
                 selected_holdout = baseline_holdout
@@ -2193,6 +2362,7 @@ class Client:
                     selected_prompt, "candidate", holdout, "holdout", model, evaluator_model, budget
                     , train, selected_few_shot_ids, holdout_repeats, evaluator=evaluator,
                     max_parallel_scenarios=max_parallel_scenarios,
+                    target_max_tokens=target_max_tokens, request_options=request_options,
                 )
         else:
             baseline_holdout = []
@@ -2303,9 +2473,12 @@ class Client:
         repeats: int = 1,
         evaluator: dict[str, Any] | None = None,
         max_parallel_scenarios: int = 1,
+        target_max_tokens: int | None = None,
+        request_options: Mapping[str, Any] | None = None,
     ) -> list[CaseResult]:
         evaluator_policy = evaluator or {"type": "semantic"}
-        target_max_tokens = {
+        normalized_target_options = normalize_request_options(request_options)
+        resolved_target_max_tokens = int(target_max_tokens) if target_max_tokens is not None else {
             "exact_text": 64,
             "exact_json": 1024,
             "numeric_tolerance": 64,
@@ -2321,12 +2494,14 @@ class Client:
                     budget,
                     target_model,
                     [{"role": "system", "content": prompt}] + demonstrations + transcript + [{"role": "user", "content": turn.input}],
-                    max_tokens=target_max_tokens,
+                    max_tokens=resolved_target_max_tokens,
                     response_schema=(
                         _exact_json_response_schema(turn.approved_output, evaluator_policy)
                         if evaluator_policy["type"] == "exact_json"
+                        and "response_format" not in normalized_target_options
                         else None
                     ),
+                    request_options=normalized_target_options,
                 )
                 transcript += [{"role": "user", "content": turn.input}, {"role": "assistant", "content": target.content}]
                 judgment, judge_completion = self._judge(example, turn, turn_index, transcript, target.content, evaluator_model, budget, evaluator_policy)

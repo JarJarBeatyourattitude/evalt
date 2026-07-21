@@ -31,7 +31,7 @@ repository checkout:
 
 ```bash
 python -m venv .venv
-python -m pip install dist/evalt-0.9.4-py3-none-any.whl
+python -m pip install dist/evalt-0.9.5-py3-none-any.whl
 evalt --version
 ```
 
@@ -174,6 +174,58 @@ fraud = evalt.run(risk_prompt, transaction, route="fraud-review")
 Feedback on `support-routing` cannot enter the evaluation set for `call-summary` or
 `fraud-review`. Reusing a route name means “this is the same repeated task”; using a new
 name creates a separate optimization track in the same local state database.
+
+### OpenRouter request settings are part of the route
+
+Use `request_options` for the OpenRouter Chat Completions settings your production
+task needs. Target-model tests receive the exact same canonical envelope; Evalt's test
+designer, prompt optimizer, and judge do not.
+
+```python
+answer = evalt.run(
+    prompt,
+    ticket,
+    route="support-routing",
+    max_tokens=2048,
+    request_options={
+        "temperature": 0.2,
+        "top_p": 0.95,
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "support_route",
+                "strict": True,
+                "schema": route_schema,
+            },
+        },
+        "tools": tools,
+        "tool_choice": "auto",
+        "parallel_tool_calls": False,
+        "provider": {
+            "require_parameters": True,
+            "data_collection": "deny",
+            "zdr": True,
+        },
+        "plugins": [{"id": "response-healing"}],
+    },
+)
+```
+
+The forward-compatible mapping also passes sampling and penalty controls, stop
+conditions, prediction, provider preferences, transforms, web search, verbosity, and
+new JSON-serializable OpenRouter request fields. Evalt owns `model`, fallback `models`,
+`messages`, `prompt`, usage accounting, streaming lifecycle, output-token fields, and
+the reasoning effort encoded in each tested model configuration. Zero Data Retention,
+denied provider data collection, and required-parameter routing remain enforced safety
+defaults even if a conflicting provider option is supplied.
+
+The winning route stores the envelope and its SHA-256 fingerprint. Later calls that
+omit `request_options` and `max_tokens` reuse the tested values. An explicit change is
+allowed, but emits `RequestEnvelopeDriftWarning`, records an audit event, and returns
+`answer.request_envelope_validated == False`. Set `strict_request_options=True` to stop
+before provider spend instead. Normalized tool responses are available as
+`answer.tool_calls`; multimodal content parts or complete user/tool/assistant message
+lists may be supplied as the production input.
 
 Automatic first-route requests give the one-time AI suite designer 300 seconds, then
 use a 120-second per-provider deadline for candidate and production responses. Set
