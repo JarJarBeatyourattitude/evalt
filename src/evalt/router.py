@@ -109,9 +109,22 @@ def select_role_plan(
         if model and intelligence >= 0 and price >= 0:
             reasoning = item.get("reasoning") or {}
             reasoning_supported = bool({"reasoning", "reasoning_effort"} & supported)
-            efforts = tuple(str(value) for value in reasoning.get("supported_efforts") or ()) if reasoning_supported else ()
-            if not efforts and reasoning_supported:
+            reported_efforts = tuple(
+                str(value) for value in reasoning.get("supported_efforts") or ()
+            ) if reasoning_supported else ()
+            # Preserve every endpoint-advertised effort. The optimizer stages
+            # xhigh/max behind measured validation and latency evidence instead
+            # of either launching them eagerly or hiding them from search.
+            efforts = tuple(
+                value for value in reported_efforts
+                if value in {
+                    "minimal", "low", "medium", "high", "xhigh", "max"
+                }
+            )
+            if not reported_efforts and reasoning_supported:
                 efforts = ("low", "medium", "high")
+            if reasoning.get("mandatory") and not efforts:
+                continue
             if not reasoning.get("mandatory"):
                 efforts = ("none", *efforts)
             try:
@@ -129,11 +142,11 @@ def select_role_plan(
             })
 
     if maintenance_budget_usd < 0.50:
-        tier, designer_delta, judge_delta, breadth = "lean", 16.0, 26.0, 3
+        tier, designer_delta, judge_delta, breadth = "lean", 16.0, 26.0, 5
     elif maintenance_budget_usd < 2.00:
-        tier, designer_delta, judge_delta, breadth = "standard", 9.0, 18.0, 6
+        tier, designer_delta, judge_delta, breadth = "standard", 9.0, 18.0, 10
     else:
-        tier, designer_delta, judge_delta, breadth = "deep", 4.0, 11.0, 12
+        tier, designer_delta, judge_delta, breadth = "deep", 4.0, 11.0, 16
 
     if not normalized:
         targets = tuple(dict.fromkeys(fallback_targets))[:breadth]

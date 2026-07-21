@@ -972,6 +972,7 @@ class Client:
         seed_prompt_by_model: dict[str, str] = {}
         seed_few_shot_ids_by_model: dict[str, list[str]] = {}
         prompt_origin_by_model: dict[str, str] = {}
+        fixed_prompt_models: set[str] = set()
         omitted_configurations = []
         progress_lock = threading.Lock()
 
@@ -1040,6 +1041,9 @@ class Client:
         def evaluate(model: str) -> ModelResult:
             emit_progress({
                 "event": "model_started", "model": model,
+                "optimize_prompt": bool(
+                    optimize_prompt and model not in fixed_prompt_models
+                ),
                 "elapsed_seconds": round(time.monotonic() - optimization_started, 3),
             })
             model_budget = _BudgetScope(budget)
@@ -1054,7 +1058,9 @@ class Client:
                 seed_prompt=seed_prompt_by_model.get(model),
                 seed_few_shot_ids=seed_few_shot_ids_by_model.get(model),
                 prompt_origin=prompt_origin_by_model.get(model, "starting_prompt"),
-                optimize_prompt=bool(optimize_prompt),
+                optimize_prompt=bool(
+                    optimize_prompt and model not in fixed_prompt_models
+                ),
                 progress_callback=emit_progress,
             )
 
@@ -1495,22 +1501,32 @@ class Client:
                     if stop_after_first_pass and any(item.passed_quality_floor for item in results):
                         pruned_models.extend(ordered_broad[wave_start + broad_wave_size :])
                         break
-            passing_broad = [item for item in results if item.passed_quality_floor]
-            if passing_broad:
-                cheapest_pass_cost = min(item.estimated_production_cost_per_call_usd for item in passing_broad)
+            # The final test qualifies a route; it must not choose which reasoning
+            # rung Evalt tries next. Adaptive search decisions use validation only.
+            validation_passing_broad = [
+                item for item in results
+                if item.selected_pass_rate >= quality_threshold
+            ]
+            if validation_passing_broad:
+                cheapest_pass_cost = min(
+                    item.estimated_production_cost_per_call_usd
+                    for item in validation_passing_broad
+                )
                 hone_base_models = {
                     item.model.split("#reasoning=", 1)[0]
                     for item in results
-                    if item.passed_quality_floor
+                    if item.selected_pass_rate >= quality_threshold
                     or item.estimated_production_cost_per_call_usd <= cheapest_pass_cost * 1.25 + 1e-12
                 }
             else:
-                best_quality = max((item.holdout_pass_rate for item in results), default=0.0)
+                best_quality = max(
+                    (item.selected_pass_rate for item in results), default=0.0
+                )
                 near_floor = max(0.0, min(best_quality - 0.20, quality_threshold - 0.20))
                 hone_base_models = {
                     item.model.split("#reasoning=", 1)[0]
                     for item in results
-                    if item.holdout_pass_rate >= near_floor
+                    if item.selected_pass_rate >= near_floor
                 }
             hone_models = model_list[len(broad_models):]
             broad_result_by_base = {
@@ -1542,7 +1558,7 @@ class Client:
                 _broad_model, broad_effort = split_effort(broad_result.model)
                 candidate_rank = effort_rank[candidate_effort]
                 broad_rank = effort_rank[broad_effort]
-                if broad_result.passed_quality_floor:
+                if broad_result.selected_pass_rate >= quality_threshold:
                     # Once a base model clears the quality gate, more reasoning is
                     # strictly dominated for a lowest-cost search.  A cheaper lower
                     # effort can still be worth measuring.
@@ -1551,43 +1567,177 @@ class Client:
                 # repair accuracy.  Do not spend on a still-weaker configuration.
                 return candidate_rank > broad_rank
 
-            eligible_hone = [
+            ordinary_hone = [
                 model for model in hone_models
-                if reasoning_hone_can_improve(model)
+                if split_effort(model)[1] not in {"xhigh", "max"}
+                and reasoning_hone_can_improve(model)
             ]
-            pruned_models.extend(model for model in hone_models if model not in eligible_hone)
-            # Reasoning effort should be the lever under test, not a hidden change
-            # to the prompt package. Seed each hone configuration from the cheapest
-            # passing result for the same base model (or the cheapest global passing
-            # package when needed). It may still rewrite if training/validation says
-            # the shared package is inadequate, and every variant still faces the
-            # untouched final test.
-            passing_packages = sorted(
-                (item for item in results if item.passed_quality_floor),
-                key=lambda item: (
-                    item.estimated_production_cost_per_call_usd,
-                    item.model,
-                ),
+            extreme_hone = [
+                model for model in hone_models
+                if split_effort(model)[1] in {"xhigh", "max"}
+                and reasoning_hone_can_improve(model)
+            ]
+            pruned_models.extend(
+                model for model in hone_models
+                if model not in ordinary_hone and model not in extreme_hone
             )
-            for model in eligible_hone:
-                base_model = model.split("#reasoning=", 1)[0]
-                source = next(
-                    (
-                        item for item in passing_packages
-                        if item.model.split("#reasoning=", 1)[0] == base_model
+            # Reasoning effort should be the lever under test, not a hidden change
+            # to the prompt package. Seed each rung from the strongest validation
+            # package already measured for that model. It may still rewrite from
+            # training/validation, and every completed variant faces the untouched
+            # final test.
+            def seed_reasoning_hone(
+                configurations: list[str], available: list[ModelResult]
+            ) -> None:
+                for configuration in configurations:
+                    base_model, _effort = split_effort(configuration)
+                    same_base = [
+                        item for item in available
+                        if split_effort(item.model)[0] == base_model
+                    ]
+                    candidates = same_base or available
+                    if not candidates:
+                        continue
+                    source = min(
+                        candidates,
+                        key=lambda item: (
+                            -item.selected_pass_rate,
+                            item.estimated_production_cost_per_call_usd,
+                            -effort_rank[split_effort(item.model)[1]],
+                            item.model,
+                        ),
+                    )
+                    seed_prompt_by_model[configuration] = source.selected_prompt
+                    seed_few_shot_ids_by_model[configuration] = list(
+                        source.few_shot_example_ids
+                    )
+                    prompt_origin_by_model[configuration] = (
+                        f"reasoning_hone_from:{source.model}"
+                    )
+                    # Hold the learned prompt package fixed so reasoning effort is
+                    # the only lever under test. This also prevents optional hone
+                    # lanes from repeating a full prompt-search tournament.
+                    fixed_prompt_models.add(configuration)
+
+            seed_reasoning_hone(ordinary_hone, results)
+            results.extend(run_batch(ordinary_hone))
+
+            # Extreme reasoning is a sequential evidence ladder. High must land
+            # within one validation case of the requested quality gate and inside
+            # the production latency ceiling before xhigh earns spend. Max earns
+            # spend only when xhigh stays close, does not regress, and also remains
+            # inside the ceiling. Final-test performance is never consulted here.
+            validation_step = 1.0 / max(1, len(dev))
+            close_floor = max(0.0, quality_threshold - validation_step - 1e-12)
+
+            def completed_effort(base_model: str, effort: str) -> ModelResult | None:
+                matches = [
+                    item for item in results
+                    if split_effort(item.model) == (base_model, effort)
+                ]
+                return min(
+                    matches,
+                    key=lambda item: (
+                        -item.selected_pass_rate,
+                        item.estimated_production_cost_per_call_usd,
                     ),
-                    passing_packages[0] if passing_packages else None,
+                ) if matches else None
+
+            def inside_latency(item: ModelResult | None) -> bool:
+                return bool(
+                    item is not None
+                    and (
+                        max_p90_latency_seconds is None
+                        or item.target_latency_p90_ms
+                        <= max_p90_latency_seconds * 1000
+                    )
                 )
-                if source is None:
+
+            xhigh_candidates: list[str] = []
+            for configuration in extreme_hone:
+                base_model, effort = split_effort(configuration)
+                if effort != "xhigh":
                     continue
-                seed_prompt_by_model[model] = source.selected_prompt
-                seed_few_shot_ids_by_model[model] = list(
-                    source.few_shot_example_ids
+                high_result = completed_effort(base_model, "high")
+                earned = bool(
+                    high_result is not None
+                    and high_result.selected_pass_rate < quality_threshold
+                    and high_result.selected_pass_rate >= close_floor
+                    and inside_latency(high_result)
                 )
-                prompt_origin_by_model[model] = (
-                    f"reasoning_hone_from:{source.model}"
+                emit_progress({
+                    "event": (
+                        "reasoning_escalation_started"
+                        if earned else "reasoning_escalation_skipped"
+                    ),
+                    "model": base_model,
+                    "from_effort": "high",
+                    "to_effort": "xhigh",
+                    "validation_pass_rate": (
+                        high_result.selected_pass_rate if high_result else None
+                    ),
+                    "target_latency_p90_ms": (
+                        high_result.target_latency_p90_ms if high_result else None
+                    ),
+                    "quality_threshold": quality_threshold,
+                    "close_floor": close_floor,
+                    "reason": (
+                        "high is within one validation case and the latency ceiling"
+                        if earned else
+                        "high was absent, not close enough, already passed, or too slow"
+                    ),
+                })
+                if earned:
+                    xhigh_candidates.append(configuration)
+                else:
+                    pruned_models.append(configuration)
+            seed_reasoning_hone(xhigh_candidates, results)
+            results.extend(run_batch(xhigh_candidates))
+
+            max_candidates: list[str] = []
+            for configuration in extreme_hone:
+                base_model, effort = split_effort(configuration)
+                if effort != "max":
+                    continue
+                high_result = completed_effort(base_model, "high")
+                xhigh_result = completed_effort(base_model, "xhigh")
+                earned = bool(
+                    high_result is not None
+                    and xhigh_result is not None
+                    and xhigh_result.selected_pass_rate < quality_threshold
+                    and xhigh_result.selected_pass_rate >= close_floor
+                    and xhigh_result.selected_pass_rate
+                    >= high_result.selected_pass_rate
+                    and inside_latency(xhigh_result)
                 )
-            results.extend(run_batch(eligible_hone))
+                emit_progress({
+                    "event": (
+                        "reasoning_escalation_started"
+                        if earned else "reasoning_escalation_skipped"
+                    ),
+                    "model": base_model,
+                    "from_effort": "xhigh",
+                    "to_effort": "max",
+                    "validation_pass_rate": (
+                        xhigh_result.selected_pass_rate if xhigh_result else None
+                    ),
+                    "target_latency_p90_ms": (
+                        xhigh_result.target_latency_p90_ms if xhigh_result else None
+                    ),
+                    "quality_threshold": quality_threshold,
+                    "close_floor": close_floor,
+                    "reason": (
+                        "xhigh stayed close without regressing and met the latency ceiling"
+                        if earned else
+                        "xhigh was absent, regressed, already passed, not close, or too slow"
+                    ),
+                })
+                if earned:
+                    max_candidates.append(configuration)
+                else:
+                    pruned_models.append(configuration)
+            seed_reasoning_hone(max_candidates, results)
+            results.extend(run_batch(max_candidates))
         else:
             results = run_batch(model_list)
         if not results:

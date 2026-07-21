@@ -20,7 +20,7 @@ from evalt.core import Completion, OpenRouterTransport, _safe_provider_error_det
 from evalt.migration import migrate_openai_results
 from modelsieve import Client as ModelSieveClient
 from last_good_prompt import Client as LegacyClient
-from last_good_prompt.core import _Budget
+from last_good_prompt.core import _Budget, ModelResult
 
 
 class CompatibilityTests(unittest.TestCase):
@@ -270,12 +270,13 @@ class CaseDesignerTransport(FakeTransport):
                     input_text, approved = f"The app freezes, case {index}", "technical"
                 scenarios.append({
                     "id": f"designed-{index + 1}",
+                    "group": f"family-{index % 5 + 1}",
                     "difficulty": ("routine", "complex", "adversarial")[category],
                     "critical": category == 2,
                     "turns": [{"input": input_text, "approved_output": approved}],
                     "rationale": "Exercise a distinct support-routing boundary.",
                 })
-            content = json.dumps({
+            design_payload = {
                 "evaluator": {
                     "type": "exact_text",
                     "reason": "The production contract requires one exact lowercase label.",
@@ -303,9 +304,26 @@ class CaseDesignerTransport(FakeTransport):
                         "should_pass": False,
                     },
                 ],
-                "scenarios": scenarios,
                 "design_notes": ["Balanced three routing labels before splitting."],
-            })
+            }
+            if "strata" in response_schema.get("properties", {}):
+                design_payload["strata"] = [
+                    {
+                        "group": f"family-{group_index + 1}",
+                        "scenarios": [
+                            {
+                                key: value for key, value in scenario.items()
+                                if key != "group"
+                            }
+                            for scenario in scenarios
+                            if scenario["group"] == f"family-{group_index + 1}"
+                        ],
+                    }
+                    for group_index in range(5)
+                ]
+            else:
+                design_payload["scenarios"] = scenarios
+            content = json.dumps(design_payload)
             return Completion(
                 content, model, f"gen-{len(self.calls)}",
                 self.estimate_cost(model, messages, max_tokens=max_tokens),
@@ -331,6 +349,41 @@ class CaseDesignerFewShotTransport(CaseDesignerTransport):
                 f"gen-{len(self.calls)}",
                 self.estimate_cost(model, messages, max_tokens=max_tokens),
             )
+        return super().complete(
+            model, messages, max_tokens=max_tokens, response_schema=response_schema
+        )
+
+
+class DesignerFallbackTransport(CaseDesignerTransport):
+    def model_catalog(self):
+        return [
+            {
+                "id": "primary-designer",
+                "intelligence": 100,
+                "blended_price": 1.0,
+                "supported_parameters": ["max_tokens"],
+            },
+            {
+                "id": "secondary-designer",
+                "intelligence": 90,
+                "blended_price": 0.2,
+                "supported_parameters": ["max_tokens"],
+            },
+            {
+                "id": "cheap-target",
+                "intelligence": 65,
+                "blended_price": 0.01,
+                "supported_parameters": ["max_tokens"],
+            },
+        ]
+
+    def complete(self, model, messages, *, max_tokens, response_schema=None):
+        if (
+            model == "primary-designer"
+            and response_schema
+            and "Design a balanced evaluation suite" in messages[0]["content"]
+        ):
+            raise ProviderError("primary designer timed out")
         return super().complete(
             model, messages, max_tokens=max_tokens, response_schema=response_schema
         )
@@ -1014,27 +1067,52 @@ class SdkTests(unittest.TestCase):
         evalt = Evalt(transport=FakeTransport(), show_progress=True)
         with redirect_stderr(stream):
             evalt._emit_progress({
+                "event": "suite_design_started",
+                "route": "support-routing",
+                "case_count": 25,
+                "workflow_budget_usd": 1,
+                "designer_model": "smart-designer",
+                "designer_timeout_seconds": 300,
+            })
+            evalt._emit_progress({
+                "event": "suite_design_heartbeat",
+                "route": "support-routing",
+                "designer_model": "smart-designer",
+                "elapsed_seconds": 20,
+            })
+            evalt._emit_progress({
                 "event": "broad_screen_started",
+                "route": "support-routing",
                 "configurations": 12,
                 "parallel_models": 12,
             })
             evalt._emit_progress({
                 "event": "model_screen_completed",
+                "route": "support-routing",
                 "model": "cheap#reasoning=low",
                 "validation_pass_rate": 0.8,
                 "target_latency_p90_ms": 432,
                 "screening_spend_usd": 0.0042,
             })
             evalt._emit_progress({
+                "event": "model_started",
+                "route": "support-routing",
+                "model": "cheap#reasoning=low",
+            })
+            evalt._emit_progress({
                 "event": "broad_screen_completed",
+                "route": "support-routing",
                 "configurations": 12,
                 "completed_configurations": 11,
                 "elapsed_seconds": 24.6,
             })
         rendered = stream.getvalue()
-        self.assertIn("BROAD SCREEN · 12 model configuration(s) · up to 12 in parallel", rendered)
-        self.assertIn("SCREENED · cheap#reasoning=low · 80% validation", rendered)
-        self.assertIn("BROAD SCREEN COMPLETE · 11/12 configuration(s) settled · 24.6s", rendered)
+        self.assertIn("25 cases · smart-designer · deadline 300s", rendered)
+        self.assertIn("smart-designer · 20s elapsed · still working", rendered)
+        self.assertIn("support-routing · BROAD SCREEN · 12 model configuration(s) · up to 12 in parallel", rendered)
+        self.assertIn("support-routing · SCREENED · cheap#reasoning=low · 80% validation", rendered)
+        self.assertIn("support-routing · DEEP TEST STARTED · cheap#reasoning=low", rendered)
+        self.assertIn("support-routing · BROAD SCREEN COMPLETE · 11/12 configuration(s) settled · 24.6s", rendered)
 
     def test_primary_run_is_a_durable_budget_bounded_router_not_a_json_export(self):
         with TemporaryDirectory() as directory:
@@ -1425,6 +1503,41 @@ class SdkTests(unittest.TestCase):
         self.assertGreaterEqual(len(deep.target_models), len(lean.target_models))
         self.assertNotEqual(lean.judge_model, "tiny")
 
+    def test_standard_role_policy_screens_ten_distinct_models_before_reasoning_hone(self):
+        catalog = [
+            {
+                "id": f"model-{index}",
+                "intelligence": 60 + index,
+                "blended_price": 0.05 * (index + 1),
+                "supported_parameters": ["max_tokens", "reasoning"],
+                "reasoning": {"supported_efforts": ["low", "medium", "high"]},
+            }
+            for index in range(14)
+        ]
+        plan = select_role_plan(catalog, maintenance_budget_usd=1.00)
+        broad = plan.target_models[:10]
+        self.assertEqual(plan.tier, "standard")
+        self.assertEqual(len(broad), 10)
+        self.assertEqual(len({item.split("#", 1)[0] for item in broad}), 10)
+
+    def test_automatic_role_policy_preserves_extreme_efforts_for_staged_search(self):
+        catalog = [
+            {
+                "id": "wide-effort-model",
+                "intelligence": 90,
+                "blended_price": 0.1,
+                "supported_parameters": ["max_tokens", "reasoning"],
+                "reasoning": {
+                    "supported_efforts": ["low", "medium", "high", "xhigh", "max"]
+                },
+            },
+            {"id": "plain-model", "intelligence": 80, "blended_price": 0.2},
+        ]
+        plan = select_role_plan(catalog, maintenance_budget_usd=1.0)
+        self.assertTrue(any("reasoning=xhigh" in item for item in plan.target_models))
+        self.assertTrue(any("reasoning=max" in item for item in plan.target_models))
+        self.assertTrue(any("reasoning=high" in item for item in plan.target_models))
+
     def test_role_policy_bootstraps_on_a_capable_redundant_route_not_a_fragile_cheapest_model(self):
         catalog = [
             {"id": "fragile-cheap", "intelligence": 80, "blended_price": 0.1, "private_provider_routes": 1},
@@ -1552,6 +1665,33 @@ class SdkTests(unittest.TestCase):
             self.assertEqual(suite.evaluator["type"], "exact_text")
             self.assertEqual(suite.max_optimization_cost_usd, draft.remaining_optimization_budget_usd)
 
+    def test_ai_suite_design_falls_back_to_the_independent_judge_role(self):
+        events: list[dict] = []
+        evalt = Evalt(
+            transport=DesignerFallbackTransport(),
+            progress_callback=events.append,
+        )
+        draft = evalt.design_suite(
+            task="Classify recurring support tickets into one routing label.",
+            prompt="Return exactly one lowercase label: billing, account, or technical.",
+            route="designer-fallback",
+            case_count=25,
+            workflow_budget_usd=1,
+        )
+        self.assertEqual(draft.designer_model, "secondary-designer")
+        self.assertTrue(any("Designer fallback" in note for note in draft.design_notes))
+        self.assertEqual(
+            [event["event"] for event in events if event["event"] == "suite_designer_unavailable"],
+            ["suite_designer_unavailable"],
+        )
+        self.assertEqual(
+            [
+                event["designer_model"] for event in events
+                if event["event"] == "suite_design_attempt_started"
+            ],
+            ["primary-designer", "secondary-designer"],
+        )
+
     def test_ai_suite_design_rejects_a_judge_that_cannot_detect_known_failure(self):
         with TemporaryDirectory() as directory:
             evalt = Evalt(
@@ -1559,7 +1699,7 @@ class SdkTests(unittest.TestCase):
                 state_path=Path(directory) / "evalt.db",
             )
             with self.assertRaisesRegex(
-                ProviderError, "No candidate judge passed the AI-designed calibration"
+                ProviderError, "No candidate judge passed the calibration"
             ):
                 evalt.design_suite(
                     task="Classify recurring support tickets into one routing label.",
@@ -1625,6 +1765,34 @@ class SdkTests(unittest.TestCase):
                 "models": ["cheap"],
                 "request_timeout_seconds": 0,
             })
+
+    def test_automatic_first_route_uses_a_separate_longer_ai_design_deadline(self):
+        with TemporaryDirectory() as directory:
+            evalt = Evalt(
+                api_key="sk-or-v1-test-key",
+                state_path=Path(directory) / "evalt.db",
+                show_progress=False,
+            )
+            observed: dict[str, float] = {}
+
+            def stop_after_observation(**_kwargs):
+                observed["timeout_seconds"] = evalt.client.transport.timeout_seconds
+                raise RuntimeError("design observation complete")
+
+            evalt.design_suite = stop_after_observation  # type: ignore[method-assign]
+            with self.assertRaisesRegex(RuntimeError, "design observation complete"):
+                evalt.run(
+                    "Return exactly one lowercase route label.",
+                    "the website will not load",
+                    task="Route recurring customer support tickets.",
+                    route="deadline-before-design",
+                    models=["cheap"],
+                    test_budget_usd=0.25,
+                    max_test_budget_usd=0.25,
+                    test_request_timeout_seconds=37,
+                    designer_request_timeout_seconds=211,
+                )
+            self.assertEqual(observed["timeout_seconds"], 211)
 
     def test_transport_defaults_to_ten_minutes_and_allows_long_complex_jobs(self):
         transport = OpenRouterTransport("sk-or-v1-test-key")
@@ -2265,7 +2433,177 @@ class SdkTests(unittest.TestCase):
         self.assertNotIn("cheap#reasoning=high", result.pruned_models)
         self.assertIn("near#reasoning=high", result.pruned_models)
         self.assertEqual(result.winner.model, "near#reasoning=low")
+        self.assertTrue(all(
+            item.prompt_rewrites_tested == 0
+            for item in result.models
+            if item.model == "cheap#reasoning=high"
+        ))
         self.assertIn("adaptive search band", result.winner_scope)
+
+    def test_extreme_reasoning_requires_close_validation_not_a_lucky_final_test(self):
+        class LadderClient(Client):
+            def __init__(self):
+                super().__init__(transport=FakeTransport())
+                self.evaluated = []
+
+            def _evaluate_model(self, *args, **kwargs):
+                model = args[4]
+                self.evaluated.append(model)
+                effort = model.rsplit("#reasoning=", 1)[-1]
+                validation = {"low": 0.40, "high": 0.40}.get(effort, 1.0)
+                return ModelResult(
+                    model=model,
+                    selected_prompt=args[0],
+                    baseline_pass_rate=validation,
+                    selected_pass_rate=validation,
+                    holdout_pass_rate=1.0,
+                    baseline_holdout_pass_rate=1.0,
+                    estimated_production_cost_per_call_usd=0.001,
+                    estimated_cost_per_successful_call_usd=0.001,
+                    optimization_spend_usd=0.0,
+                    passed_quality_floor=True,
+                    target_latency_p90_ms=500,
+                )
+
+        client = LadderClient()
+        examples = [
+            {
+                "id": f"case-{index}",
+                "input": f"request {index}",
+                "approved_output": "billing",
+            }
+            for index in range(25)
+        ]
+        events = []
+        client.optimize(
+            prompt="Return one label.",
+            examples=examples,
+            models=[
+                "candidate#reasoning=low", "candidate#reasoning=high",
+                "candidate#reasoning=xhigh", "candidate#reasoning=max",
+            ],
+            optimizer_model="optimizer",
+            evaluator_model="evaluator",
+            adaptive_search=True,
+            max_optimization_cost_usd=1,
+            progress_callback=events.append,
+        )
+        self.assertIn("candidate#reasoning=high", client.evaluated)
+        self.assertNotIn("candidate#reasoning=xhigh", client.evaluated)
+        self.assertNotIn("candidate#reasoning=max", client.evaluated)
+        self.assertTrue(any(
+            event["event"] == "reasoning_escalation_skipped"
+            and event["to_effort"] == "xhigh"
+            for event in events
+        ))
+
+    def test_extreme_reasoning_climbs_one_rung_at_a_time_and_stops_on_regression(self):
+        class LadderClient(Client):
+            def __init__(self):
+                super().__init__(transport=FakeTransport())
+                self.evaluated = []
+
+            def _evaluate_model(self, *args, **kwargs):
+                model = args[4]
+                self.evaluated.append(model)
+                effort = model.rsplit("#reasoning=", 1)[-1]
+                validation = {
+                    "low": 0.60, "high": 0.80, "xhigh": 0.60, "max": 1.0,
+                }[effort]
+                return ModelResult(
+                    model=model,
+                    selected_prompt=args[0],
+                    baseline_pass_rate=validation,
+                    selected_pass_rate=validation,
+                    holdout_pass_rate=validation,
+                    baseline_holdout_pass_rate=validation,
+                    estimated_production_cost_per_call_usd=0.001,
+                    estimated_cost_per_successful_call_usd=0.001,
+                    optimization_spend_usd=0.0,
+                    passed_quality_floor=validation >= 0.95,
+                    target_latency_p90_ms=500,
+                )
+
+        client = LadderClient()
+        examples = [
+            {
+                "id": f"case-{index}",
+                "input": f"request {index}",
+                "approved_output": "billing",
+            }
+            for index in range(25)
+        ]
+        events = []
+        client.optimize(
+            prompt="Return one label.",
+            examples=examples,
+            models=[
+                "candidate#reasoning=low", "candidate#reasoning=high",
+                "candidate#reasoning=xhigh", "candidate#reasoning=max",
+            ],
+            optimizer_model="optimizer",
+            evaluator_model="evaluator",
+            adaptive_search=True,
+            max_optimization_cost_usd=1,
+            progress_callback=events.append,
+        )
+        self.assertIn("candidate#reasoning=xhigh", client.evaluated)
+        self.assertNotIn("candidate#reasoning=max", client.evaluated)
+        self.assertTrue(any(
+            event["event"] == "reasoning_escalation_skipped"
+            and event["to_effort"] == "max"
+            for event in events
+        ))
+
+    def test_extreme_reasoning_does_not_escalate_past_the_latency_ceiling(self):
+        class LadderClient(Client):
+            def __init__(self):
+                super().__init__(transport=FakeTransport())
+                self.evaluated = []
+
+            def _evaluate_model(self, *args, **kwargs):
+                model = args[4]
+                self.evaluated.append(model)
+                effort = model.rsplit("#reasoning=", 1)[-1]
+                validation = {"low": 0.60, "high": 0.80}.get(effort, 1.0)
+                return ModelResult(
+                    model=model,
+                    selected_prompt=args[0],
+                    baseline_pass_rate=validation,
+                    selected_pass_rate=validation,
+                    holdout_pass_rate=validation,
+                    baseline_holdout_pass_rate=validation,
+                    estimated_production_cost_per_call_usd=0.001,
+                    estimated_cost_per_successful_call_usd=0.001,
+                    optimization_spend_usd=0.0,
+                    passed_quality_floor=False,
+                    target_latency_p90_ms=4_000 if effort == "high" else 500,
+                )
+
+        client = LadderClient()
+        examples = [
+            {
+                "id": f"case-{index}",
+                "input": f"request {index}",
+                "approved_output": "billing",
+            }
+            for index in range(25)
+        ]
+        client.optimize(
+            prompt="Return one label.",
+            examples=examples,
+            models=[
+                "candidate#reasoning=low", "candidate#reasoning=high",
+                "candidate#reasoning=xhigh", "candidate#reasoning=max",
+            ],
+            optimizer_model="optimizer",
+            evaluator_model="evaluator",
+            adaptive_search=True,
+            max_optimization_cost_usd=1,
+            max_p90_latency_seconds=3.0,
+        )
+        self.assertNotIn("candidate#reasoning=xhigh", client.evaluated)
+        self.assertNotIn("candidate#reasoning=max", client.evaluated)
 
     def test_adaptive_cheapest_passing_stops_before_an_expensive_rescue_wave(self):
         transport = FakeTransport()

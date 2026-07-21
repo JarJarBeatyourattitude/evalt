@@ -6,11 +6,13 @@ new code should use :class:`Suite` and :class:`Evalt` from this module.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+from dataclasses import asdict, dataclass, field, replace
 import json
 from pathlib import Path
 import sys
 import threading
+import time
 from typing import Any, Callable, Iterable, Mapping
 
 from last_good_prompt.core import (
@@ -494,10 +496,26 @@ class Evalt:
                     f"{count}/{minimum} labeled examples · tournament eligible"
                 )
         elif kind == "suite_design_started":
+            deadline = event.get("designer_timeout_seconds")
+            deadline_text = (
+                f" · deadline {float(deadline):g}s" if deadline is not None else ""
+            )
             message = (
                 f"Evalt · {route} · TEST DESIGN STARTED · "
                 f"{int(event.get('case_count') or 0)} cases · "
+                f"{event.get('designer_model', 'designer route')}{deadline_text} · "
                 f"one workflow cap ${float(event.get('workflow_budget_usd') or 0):.2f}"
+            )
+        elif kind == "suite_design_attempt_started":
+            message = (
+                f"Evalt · {route} · DESIGNING TESTS · "
+                f"{event.get('designer_model', 'model')} · request started"
+            )
+        elif kind == "suite_design_heartbeat":
+            message = (
+                f"Evalt · {route} · DESIGNING TESTS · "
+                f"{event.get('designer_model', 'model')} · "
+                f"{float(event.get('elapsed_seconds') or 0):.0f}s elapsed · still working"
             )
         elif kind == "suite_design_completed":
             message = (
@@ -505,6 +523,25 @@ class Evalt:
                 f"{int(event.get('case_count') or 0)} AI-authored cases · "
                 f"spent ${float(event.get('designer_spend_usd') or 0):.6f} · "
                 f"${float(event.get('remaining_budget_usd') or 0):.6f} remains for the tournament"
+            )
+        elif kind == "suite_designer_unavailable":
+            message = (
+                f"Evalt · {route} · DESIGNER ROUTE UNAVAILABLE · "
+                f"{event.get('designer_model', 'model')} · trying the next cost-qualified role"
+            )
+        elif kind == "judge_calibration_started":
+            message = (
+                f"Evalt · {route} · CALIBRATING JUDGE · "
+                f"{event.get('evaluator_model', 'model')} · "
+                f"{int(event.get('checks') or 0)} known pass/fail checks"
+            )
+        elif kind == "judge_calibration_completed":
+            status = "PASSED" if event.get("passed") else "REJECTED"
+            message = (
+                f"Evalt · {route} · JUDGE {status} · "
+                f"{event.get('evaluator_model', 'model')} · "
+                f"{int(event.get('matched_checks') or 0)}/"
+                f"{int(event.get('checks') or 0)} checks matched"
             )
         elif kind == "initial_optimization_started":
             message = (
@@ -535,26 +572,52 @@ class Evalt:
             message = f"Evalt · {route} · bounded retest stopped: {event.get('error')}"
         elif kind == "model_completed":
             message = (
-                f"Evalt · {event.get('model', 'route')} · "
+                f"Evalt · {route} · {event.get('model', 'model')} · "
                 f"{float(event.get('final_test_pass_rate') or 0):.0%} final test · "
                 f"{int(event.get('prompt_candidates_tested') or 1)} prompt package(s) · "
                 f"${float(event.get('optimization_spend_usd') or 0):.6f} spent"
             )
+        elif kind == "model_started":
+            work = (
+                "prompt search + final test"
+                if event.get("optimize_prompt", True)
+                else "shared prompt + final test"
+            )
+            message = (
+                f"Evalt · {route} · DEEP TEST STARTED · "
+                f"{event.get('model', 'model')} · {work}"
+            )
+        elif kind in {"reasoning_escalation_started", "reasoning_escalation_skipped"}:
+            decision = "TRYING" if kind.endswith("started") else "SKIPPING"
+            measured = event.get("validation_pass_rate")
+            measured_text = (
+                f"{float(measured):.0%} validation"
+                if measured is not None else "no completed prior rung"
+            )
+            latency = event.get("target_latency_p90_ms")
+            latency_text = (
+                f" · p90 {int(latency)} ms" if latency is not None else ""
+            )
+            message = (
+                f"Evalt · {route} · {decision} {event.get('to_effort')} REASONING · "
+                f"{event.get('model', 'model')} · {measured_text}{latency_text} · "
+                f"{event.get('reason', '')}"
+            )
         elif kind == "broad_screen_started":
             message = (
-                f"Evalt · BROAD SCREEN · {int(event.get('configurations') or 0)} "
+                f"Evalt · {route} · BROAD SCREEN · {int(event.get('configurations') or 0)} "
                 f"model configuration(s) · up to {int(event.get('parallel_models') or 1)} in parallel"
             )
         elif kind == "model_screen_completed":
             message = (
-                f"Evalt · SCREENED · {event.get('model', 'model')} · "
+                f"Evalt · {route} · SCREENED · {event.get('model', 'model')} · "
                 f"{float(event.get('validation_pass_rate') or 0):.0%} validation · "
                 f"p90 {int(event.get('target_latency_p90_ms') or 0)} ms · "
                 f"${float(event.get('screening_spend_usd') or 0):.6f} spent"
             )
         elif kind == "broad_screen_completed":
             message = (
-                f"Evalt · BROAD SCREEN COMPLETE · "
+                f"Evalt · {route} · BROAD SCREEN COMPLETE · "
                 f"{int(event.get('completed_configurations') or 0)}/"
                 f"{int(event.get('configurations') or 0)} configuration(s) settled · "
                 f"{float(event.get('elapsed_seconds') or 0):.1f}s elapsed"
@@ -562,7 +625,7 @@ class Evalt:
         elif kind in {"model_unavailable", "model_incomplete"}:
             label = "UNAVAILABLE" if kind == "model_unavailable" else "INCOMPLETE"
             message = (
-                f"Evalt · {label} · {event.get('model', 'model')} · "
+                f"Evalt · {route} · {label} · {event.get('model', 'model')} · "
                 f"{event.get('reason', 'provider did not settle')}"
             )
         elif kind == "prompt_candidate_completed":
@@ -570,7 +633,7 @@ class Evalt:
             label = "original prompt" if candidate == 0 else f"prompt rewrite {candidate}"
             decision = "selected so far" if event.get("selected") else "not selected"
             message = (
-                f"Evalt · {event.get('model', 'model')} · {label} · "
+                f"Evalt · {route} · {event.get('model', 'model')} · {label} · "
                 f"{float(event.get('validation_pass_rate') or 0):.0%} validation · "
                 f"{int(event.get('few_shot_examples') or 0)} example(s) · {decision}"
             )
@@ -729,12 +792,16 @@ class Evalt:
         judge_calibration_checks = 0
 
         if generated_count:
+            use_generated_groups = int(case_count) >= 25 and not seeds
             self._emit_progress({
                 "event": "suite_design_started",
                 "route": route,
                 "case_count": int(case_count),
                 "workflow_budget_usd": float(workflow_budget_usd),
                 "designer_model": selected_designer,
+                "designer_timeout_seconds": getattr(
+                    self.client.transport, "timeout_seconds", None
+                ),
             })
             schema = {
                 "type": "object",
@@ -776,9 +843,10 @@ class Evalt:
                         "items": {
                             "type": "object",
                             "additionalProperties": False,
-                            "required": ["id", "difficulty", "critical", "turns", "rationale"],
+                            "required": ["id", "group", "difficulty", "critical", "turns", "rationale"],
                             "properties": {
                                 "id": {"type": "string"},
+                                "group": {"type": "string"},
                                 "difficulty": {"type": "string", "enum": ["routine", "complex", "adversarial"]},
                                 "critical": {"type": "boolean"},
                                 "turns": {
@@ -811,39 +879,153 @@ class Evalt:
                 "quality_target": quality_threshold,
             }
             max_tokens = min(32768, max(4000, generated_count * 500))
-            completion = self.client._call(
-                budget,
-                selected_designer,
-                [
-                    {
-                        "role": "system",
-                        "content": (
-                            "Design a balanced evaluation suite for a recurring production AI task. "
-                            "Create genuinely distinct routine, complex, adversarial, boundary, format, "
-                            "and multi-turn cases where relevant; do not merely paraphrase seeds. Expected "
-                            "outputs describe the desired behavior, not what the current prompt happens to "
-                            "produce. Make each case concrete enough for a human to approve or edit. All "
-                            "cases are drafted before any train/validation/final-test split, so never label "
-                            "or target a split. Recommend exact_text or exact_json only when equivalent "
-                            "answers truly must match that deterministic contract; otherwise use semantic. "
-                            "Also create judge-calibration checks outside the scenario suite: at least two "
-                            "clear passes and one clear failure, each labeled with should_pass. These are "
-                            "unapproved AI drafts. Representative inputs have no approved outputs; use them "
-                            "only to understand realistic shape, length, and domain, and do not copy them "
-                            "into the suite. Return only the required JSON."
-                        ),
+            if use_generated_groups:
+                # A flat list plus prose could not guarantee balanced strata in
+                # live structured output. Make the balance part of the schema:
+                # five named strata, each carrying its own bounded case list.
+                scenario_schema = schema["properties"].pop("scenarios")["items"]
+                scenario_schema["required"] = [
+                    value for value in scenario_schema["required"]
+                    if value != "group"
+                ]
+                scenario_schema["properties"].pop("group", None)
+                schema["required"] = [
+                    "evaluator", "judge_calibration", "strata", "design_notes"
+                ]
+                group_floor = generated_count // 5
+                group_ceiling = (generated_count + 4) // 5
+                schema["properties"]["strata"] = {
+                    "type": "array",
+                    "minItems": 5,
+                    "maxItems": 5,
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": ["group", "scenarios"],
+                        "properties": {
+                            "group": {"type": "string"},
+                            "scenarios": {
+                                "type": "array",
+                                "minItems": group_floor,
+                                "maxItems": group_ceiling,
+                                "items": scenario_schema,
+                            },
+                        },
                     },
-                    {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
-                ],
-                max_tokens=max_tokens,
-                response_schema=schema,
+                }
+                payload["required_output_shape"] = (
+                    f"Exactly five named behavior strata containing {generated_count} total scenarios; "
+                    f"each stratum must contain {group_floor} to {group_ceiling} scenarios."
+                )
+            group_instruction = (
+                "Return exactly five distinct, concise behavior strata in the required "
+                "nested shape. Put each scenario under its stratum; do not repeat cases "
+                "across strata. This ensures every behavior reaches training, validation, "
+                "and final-test splits."
+                if use_generated_groups
+                else "Set every scenario group to an empty string for this small exploratory draft."
             )
+            design_messages = [
+                {
+                    "role": "system",
+                    "content": (
+                        "Design a balanced evaluation suite for a recurring production AI task. "
+                        "Create genuinely distinct routine, complex, adversarial, boundary, format, "
+                        "and multi-turn cases where relevant; do not merely paraphrase seeds. "
+                        f"{group_instruction} "
+                        "Expected outputs describe the desired behavior, not what the current prompt happens to "
+                        "produce. Make each case concrete enough for a human to approve or edit. All "
+                        "cases are drafted before any train/validation/final-test split, so never label "
+                        "or target a split. Recommend exact_text or exact_json only when equivalent "
+                        "answers truly must match that deterministic contract; otherwise use semantic. "
+                        "Also create judge-calibration checks outside the scenario suite: at least two "
+                            "clear passes and one clear failure, each labeled with should_pass. A pass must "
+                            "fully satisfy every material requirement. A failure must be unmistakably wrong: "
+                            "contradict a required fact, omit a required field, choose an explicitly wrong "
+                            "label, or violate a hard format contract; never use a merely debatable wording. These are "
+                        "unapproved AI drafts. Representative inputs have no approved outputs; use them "
+                        "only to understand realistic shape, length, and domain, and do not copy them "
+                        "into the suite. Return only the required JSON."
+                    ),
+                },
+                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+            ]
+            designer_candidates = (
+                (selected_designer,)
+                if designer_model is not None
+                else tuple(dict.fromkeys((selected_designer, selected_evaluator)))
+            )
+            designer_failures: list[str] = []
+            completion = None
+            for designer_candidate in designer_candidates:
+                self._emit_progress({
+                    "event": "suite_design_attempt_started",
+                    "route": route,
+                    "designer_model": designer_candidate,
+                })
+                attempt_started = time.monotonic()
+                try:
+                    with ThreadPoolExecutor(max_workers=1) as pool:
+                        future = pool.submit(
+                            self.client._call,
+                            budget,
+                            designer_candidate,
+                            design_messages,
+                            max_tokens=max_tokens,
+                            response_schema=schema,
+                        )
+                        while True:
+                            try:
+                                completion = future.result(timeout=10)
+                                break
+                            except FutureTimeoutError:
+                                self._emit_progress({
+                                    "event": "suite_design_heartbeat",
+                                    "route": route,
+                                    "designer_model": designer_candidate,
+                                    "elapsed_seconds": round(
+                                        time.monotonic() - attempt_started, 1
+                                    ),
+                                })
+                    selected_designer = designer_candidate
+                    break
+                except ProviderError as error:
+                    designer_failures.append(
+                        f"{designer_candidate}: {error}"
+                    )
+                    self._emit_progress({
+                        "event": "suite_designer_unavailable",
+                        "route": route,
+                        "designer_model": designer_candidate,
+                        "error": str(error),
+                    })
+            if completion is None:
+                raise ProviderError(
+                    "No cost-qualified suite designer completed: "
+                    + "; ".join(designer_failures)
+                )
             try:
                 text = str(completion.content).strip()
                 if text.startswith("```"):
                     text = text.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
                 parsed = json.loads(text)
-                scenarios = list(parsed["scenarios"])
+                if use_generated_groups:
+                    strata = list(parsed["strata"])
+                    if len(strata) != 5:
+                        raise ValueError("wrong stratum count")
+                    group_names = [
+                        str(item.get("group") or "").strip() for item in strata
+                    ]
+                    if any(not name for name in group_names) or len(set(group_names)) != 5:
+                        raise ValueError("behavior strata must have five distinct names")
+                    scenarios = []
+                    for stratum, group_name in zip(strata, group_names):
+                        for raw_scenario in list(stratum.get("scenarios") or []):
+                            scenario = dict(raw_scenario)
+                            scenario["group"] = group_name
+                            scenarios.append(scenario)
+                else:
+                    scenarios = list(parsed["scenarios"])
                 if len(scenarios) != generated_count:
                     raise ValueError("wrong scenario count")
                 for index, item in enumerate(scenarios):
@@ -861,11 +1043,59 @@ class Evalt:
                         })
                     design_notes.insert(0, f"Evaluator: {str(raw_evaluator.get('reason') or '').strip()}")
                 calibration_rows = list(parsed.get("judge_calibration") or [])
-                if len(calibration_rows) < 3:
-                    raise ValueError("insufficient judge calibration")
+                evaluator_type = str(suggested_evaluator.get("type") or "semantic")
+                if evaluator_type in {"exact_text", "exact_json"}:
+                    # AI-authored labels are unnecessary and can be internally
+                    # inconsistent for deterministic evaluators. Construct known
+                    # anchors whose outcomes follow directly from the evaluator's
+                    # executable contract.
+                    anchor_examples = drafted_examples[:2]
+                    if len(anchor_examples) < 2:
+                        raise ValueError("insufficient deterministic calibration anchors")
+                    calibration_rows = []
+                    for anchor in anchor_examples:
+                        turn = anchor.conversation()[0]
+                        calibration_rows.append({
+                            "input": turn.input,
+                            "approved_output": turn.approved_output,
+                            "candidate_output": turn.approved_output,
+                            "should_pass": True,
+                        })
+                    failure_turn = anchor_examples[0].conversation()[0]
+                    calibration_rows.append({
+                        "input": failure_turn.input,
+                        "approved_output": failure_turn.approved_output,
+                        "candidate_output": (
+                            "{not valid json"
+                            if evaluator_type == "exact_json"
+                            else failure_turn.approved_output
+                            + "\n__EVALT_INTENTIONALLY_WRONG__"
+                        ),
+                        "should_pass": False,
+                    })
+                    evaluator_candidates = (f"deterministic/{evaluator_type}",)
+                    design_notes.insert(
+                        1,
+                        f"Deterministic calibration: Evalt constructed two known passes and one known failure for {evaluator_type}.",
+                    )
+                else:
+                    if len(calibration_rows) < 3:
+                        raise ValueError("insufficient judge calibration")
+                    evaluator_candidates = tuple(
+                        dict.fromkeys((selected_evaluator, selected_designer))
+                    )
                 calibrated_evaluator: str | None = None
-                for candidate in tuple(dict.fromkeys((selected_evaluator, selected_designer))):
+                calibration_summaries: list[str] = []
+                for candidate in evaluator_candidates:
+                    self._emit_progress({
+                        "event": "judge_calibration_started",
+                        "route": route,
+                        "evaluator_model": candidate,
+                        "checks": len(calibration_rows),
+                    })
                     matched = True
+                    matched_checks = 0
+                    mismatch_reason = ""
                     for calibration_index, calibration in enumerate(calibration_rows):
                         calibration_example = Example.from_value({
                             "id": f"judge-calibration-{calibration_index + 1}",
@@ -884,13 +1114,33 @@ class Evalt:
                         )
                         if judgment.passed is not bool(calibration["should_pass"]):
                             matched = False
+                            mismatch_reason = (
+                                f"check {calibration_index + 1}: expected "
+                                f"{'pass' if calibration['should_pass'] else 'fail'}, got "
+                                f"{'pass' if judgment.passed else 'fail'} ({judgment.reason[:160]})"
+                            )
                             break
+                        matched_checks += 1
+                    self._emit_progress({
+                        "event": "judge_calibration_completed",
+                        "route": route,
+                        "evaluator_model": candidate,
+                        "checks": len(calibration_rows),
+                        "matched_checks": matched_checks,
+                        "passed": matched,
+                        "mismatch_reason": mismatch_reason,
+                    })
+                    calibration_summaries.append(
+                        f"{candidate}: {matched_checks}/{len(calibration_rows)}"
+                        + (f"; {mismatch_reason}" if mismatch_reason else "")
+                    )
                     if matched:
                         calibrated_evaluator = candidate
                         break
                 if calibrated_evaluator is None:
                     raise ProviderError(
-                        "No candidate judge passed the AI-designed calibration checks; no tournament ran."
+                        "No candidate judge passed the calibration checks; no tournament ran. "
+                        + " | ".join(calibration_summaries)
                     )
                 selected_evaluator = calibrated_evaluator
                 judge_calibration_checks = len(calibration_rows)
@@ -898,13 +1148,35 @@ class Evalt:
                     1,
                     f"Judge calibration: {selected_evaluator} matched {len(calibration_rows)} labeled checks.",
                 )
+                if designer_failures:
+                    design_notes.insert(
+                        2,
+                        f"Designer fallback: {selected_designer} completed after {len(designer_failures)} unavailable route(s).",
+                    )
             except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
                 raise ProviderError("The test designer returned an invalid structured suite; no draft was approved.") from error
+
+        if generated_count and not (int(case_count) >= 25 and not seeds):
+            drafted_examples = [replace(item, group="") for item in drafted_examples]
 
         all_examples = (*seeds, *drafted_examples)
         ids = [item.id for item in all_examples]
         if len(set(ids)) != len(ids):
             raise ProviderError("The test designer returned duplicate scenario IDs; no draft was approved.")
+        if generated_count >= 25 and not seeds:
+            generated_group_counts: dict[str, int] = {}
+            for item in drafted_examples:
+                if item.group.strip():
+                    generated_group_counts[item.group.strip()] = (
+                        generated_group_counts.get(item.group.strip(), 0) + 1
+                    )
+            if (
+                len(generated_group_counts) < 5
+                or any(count < 5 for count in generated_group_counts.values())
+            ):
+                raise ProviderError(
+                    "The test designer did not provide at least five behavior strata with five cases each; no draft was approved."
+                )
         if not suggested_evaluator:
             suggested_evaluator = {"type": "semantic"}
         _validate_evaluator_policy(suggested_evaluator)
@@ -1012,6 +1284,7 @@ class Evalt:
         designer_model: str | None = None,
         evaluator_model: str | None = None,
         test_request_timeout_seconds: float = 120,
+        designer_request_timeout_seconds: float = 300,
     ) -> OptimizationResult | RoutedAnswer:
         if isinstance(suite_or_prompt, Suite):
             if input is not None:
@@ -1030,7 +1303,12 @@ class Evalt:
                 )
             optimize_kwargs = suite_or_prompt.optimize_kwargs()
             if self._show_progress or self._progress_callback is not None:
-                optimize_kwargs["progress_callback"] = self._emit_progress
+                def route_progress(event: dict[str, Any]) -> None:
+                    scoped = dict(event)
+                    scoped.setdefault("route", suite_or_prompt.name)
+                    self._emit_progress(scoped)
+
+                optimize_kwargs["progress_callback"] = route_progress
             result = self.client.optimize(**optimize_kwargs)
             result.regression_suite["evidence_provenance"] = suite_or_prompt.evidence_provenance
             if suite_or_prompt.evidence_provenance == "AI_GENERATED_AI_JUDGED":
@@ -1046,6 +1324,17 @@ class Evalt:
         if not 0 < float(test_request_timeout_seconds) <= 7200:
             raise ValueError(
                 "test_request_timeout_seconds must be greater than zero and no more than 7200 seconds."
+            )
+        if not 0 < float(designer_request_timeout_seconds) <= 7200:
+            raise ValueError(
+                "designer_request_timeout_seconds must be greater than zero and no more than 7200 seconds."
+            )
+        if isinstance(self.client.transport, OpenRouterTransport):
+            self.client.transport.set_performance_policy(
+                preferred_max_latency_seconds=max_p90_latency_seconds,
+                provider_sort=(
+                    "latency" if latency_value_usd_per_second > 0 else "price"
+                ),
             )
         if price_usd is not None and budget_usd is not None and float(price_usd) != float(budget_usd):
             raise ValueError("Use price_usd; budget_usd is only a backward-compatible alias.")
@@ -1125,6 +1414,12 @@ class Evalt:
                     "case_count": int(case_count),
                     "workflow_budget_usd": resolved_test_budget_usd,
                 })
+                if isinstance(self.client.transport, OpenRouterTransport):
+                    # Suite design is a one-time orchestration job and may need
+                    # materially longer than an acceptable production response.
+                    self.client.transport.set_timeout_seconds(
+                        float(designer_request_timeout_seconds)
+                    )
                 draft = self.design_suite(
                     task=(task or suite_or_prompt),
                     prompt=suite_or_prompt,
@@ -1133,8 +1428,8 @@ class Evalt:
                     workflow_budget_usd=resolved_test_budget_usd,
                     quality_threshold=target_accuracy,
                     models=requested_models,
-                    designer_model=designer_model or role_plan.test_designer_model,
-                    evaluator_model=evaluator_model or role_plan.judge_model,
+                    designer_model=designer_model,
+                    evaluator_model=evaluator_model,
                     representative_inputs=(input,),
                     objective=objective,
                     optimize_prompt=bool(optimize_prompt),
@@ -1169,6 +1464,12 @@ class Evalt:
                     "route": route,
                     **summary,
                 })
+            if isinstance(self.client.transport, OpenRouterTransport):
+                # Candidate tests and the production call use the tighter task
+                # deadline. A timed-out effort cannot earn a higher reasoning rung.
+                self.client.transport.set_timeout_seconds(
+                    float(test_request_timeout_seconds)
+                )
             self._emit_progress({
                 "event": "production_call_started",
                 "route": route,
