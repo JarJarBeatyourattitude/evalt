@@ -42,6 +42,7 @@ class Suite:
     optimizer_model: str = "openai/gpt-5.6-luna"
     evaluator_model: str = "openai/gpt-5.6-luna"
     evaluator: Mapping[str, Any] = field(default_factory=lambda: {"type": "semantic"})
+    difficulty_thresholds: Mapping[str, float] = field(default_factory=dict)
     objective: str = "lowest_cost_at_accuracy"
     quality_threshold: float = 0.95
     max_optimization_cost_usd: float = 2.00
@@ -75,6 +76,10 @@ class Suite:
                 optimizer_model=str(value.get("optimizer_model", "openai/gpt-5.6-luna")),
                 evaluator_model=str(value.get("evaluator_model", "openai/gpt-5.6-luna")),
                 evaluator=dict(value.get("evaluator") or {"type": "semantic"}),
+                difficulty_thresholds={
+                    str(name): float(floor)
+                    for name, floor in dict(value.get("difficulty_thresholds") or {}).items()
+                },
                 objective=str(value.get("objective", "lowest_cost_at_accuracy")),
                 quality_threshold=float(value.get("quality_threshold", 0.95)),
                 max_optimization_cost_usd=float(value.get("max_optimization_cost_usd", 2.00)),
@@ -140,6 +145,8 @@ class Suite:
         if self.latency_value_usd_per_second < 0:
             raise ValueError("latency_value_usd_per_second cannot be negative.")
         _validate_evaluator_policy(dict(self.evaluator))
+        if any(not str(name).strip() or not 0 < float(floor) <= 1 for name, floor in self.difficulty_thresholds.items()):
+            raise ValueError("difficulty_thresholds must map non-empty names to values greater than zero and at most one.")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -151,6 +158,7 @@ class Suite:
             "optimizer_model": self.optimizer_model,
             "evaluator_model": self.evaluator_model,
             "evaluator": dict(self.evaluator),
+            "difficulty_thresholds": dict(self.difficulty_thresholds),
             "objective": self.objective,
             "quality_threshold": self.quality_threshold,
             "max_optimization_cost_usd": self.max_optimization_cost_usd,
@@ -182,6 +190,7 @@ class Suite:
             "optimizer_model": self.optimizer_model,
             "evaluator_model": self.evaluator_model,
             "evaluator": dict(self.evaluator),
+            "difficulty_thresholds": dict(self.difficulty_thresholds),
             "objective": self.objective,
             "quality_threshold": self.quality_threshold,
             "max_optimization_cost_usd": self.max_optimization_cost_usd,

@@ -45,6 +45,10 @@ class Example:
     approved_output: str
     id: str = ""
     turns: tuple[Turn, ...] = ()
+    group: str = ""
+    difficulty: str = "typical"
+    weight: float = 1.0
+    critical: bool = False
 
     def conversation(self) -> tuple[Turn, ...]:
         return self.turns or (Turn(self.input, self.approved_output),)
@@ -58,7 +62,16 @@ class Example:
             for item in value.get("turns", [])
         )
         first = turns[0] if turns else Turn(str(value.get("input", "")).strip(), str(value.get("approved_output", "")).strip())
-        return cls(first.input, turns[-1].approved_output if turns else first.approved_output, str(value.get("id", "")).strip() or f"example-{index + 1}", turns)
+        return cls(
+            first.input,
+            turns[-1].approved_output if turns else first.approved_output,
+            str(value.get("id", "")).strip() or f"example-{index + 1}",
+            turns,
+            str(value.get("group", "")).strip(),
+            str(value.get("difficulty", "typical")).strip() or "typical",
+            float(value.get("weight", 1.0)),
+            bool(value.get("critical", False)),
+        )
 
 
 @dataclass(frozen=True)
@@ -95,6 +108,10 @@ class CaseResult:
     evaluator_generation_id: str
     target_latency_ms: int = 0
     evaluator_latency_ms: int = 0
+    group: str = ""
+    difficulty: str = "typical"
+    weight: float = 1.0
+    critical: bool = False
 
 
 @dataclass
@@ -116,6 +133,8 @@ class ModelResult:
     holdout_executions: int = 0
     holdout_execution_pass_rate: float = 0.0
     baseline_holdout_execution_pass_rate: float = 0.0
+    holdout_pass_rates_by_difficulty: dict[str, float] = field(default_factory=dict)
+    passed_difficulty_floors: bool = True
     few_shot_example_ids: list[str] = field(default_factory=list)
     cases: list[CaseResult] = field(default_factory=list)
 
@@ -457,8 +476,12 @@ class OpenRouterTransport:
     def estimate_cost(
         self, model: str, messages: list[dict[str, str]], *, max_tokens: int
     ) -> float:
+        explicit_reasoning = "#reasoning=" in model
         model, effort = self._split_configuration(model)
         prices = self._load_prices()
+        reasoning_metadata = self._reasoning.get(model, {})
+        if not explicit_reasoning and reasoning_metadata.get("mandatory"):
+            effort = str(reasoning_metadata.get("default_effort") or "medium")
         max_tokens = self._bounded_output_tokens(model, messages, max_tokens, effort)
         if model not in prices:
             raise ProviderError(
@@ -481,6 +504,9 @@ class OpenRouterTransport:
         explicit_reasoning = "#reasoning=" in model
         model, reasoning_effort = self._split_configuration(model)
         self._load_prices()
+        reasoning_metadata = self._reasoning.get(model, {})
+        if not explicit_reasoning and reasoning_metadata.get("mandatory"):
+            reasoning_effort = str(reasoning_metadata.get("default_effort") or "medium")
         max_tokens = self._bounded_output_tokens(model, messages, max_tokens, reasoning_effort)
         supported = self._supported_parameters.get(model, set())
         body: dict[str, Any] = {
@@ -514,7 +540,6 @@ class OpenRouterTransport:
         if "temperature" in supported:
             body["temperature"] = 0
         reasoning_supported = bool({"reasoning", "reasoning_effort"} & supported)
-        reasoning_metadata = self._reasoning.get(model, {})
         if explicit_reasoning and reasoning_effort != "none" and not reasoning_supported:
             raise ProviderError(f"The current ZDR endpoint for {model!r} does not support adjustable reasoning.")
         if explicit_reasoning and reasoning_effort == "none" and reasoning_metadata.get("mandatory"):
@@ -525,8 +550,6 @@ class OpenRouterTransport:
                 f"The current ZDR endpoint for {model!r} does not list reasoning effort {reasoning_effort!r}."
             )
         if reasoning_supported:
-            if not explicit_reasoning and reasoning_metadata.get("mandatory"):
-                reasoning_effort = str(reasoning_metadata.get("default_effort") or "medium")
             body["reasoning"] = {"effort": reasoning_effort, "exclude": True}
         if response_schema and ({"structured_outputs", "response_format"} & supported):
             body["response_format"] = {
@@ -588,7 +611,7 @@ class OpenRouterTransport:
         # defaults deliberately generous so a paid evaluation is not thrown away by
         # an allowance tuned to visible output length.
         minimums = {
-            "none": 32768,
+            "none": 0,
             "minimal": 32768,
             "low": 65536,
             "medium": 98304,
@@ -772,6 +795,7 @@ class Client:
         adaptive_search: bool = False,
         holdout_repeats: int = 2,
         evaluator: dict[str, Any] | None = None,
+        difficulty_thresholds: dict[str, float] | None = None,
         max_parallel_models: int = 16,
         max_parallel_scenarios: int = 32,
         max_p90_latency_seconds: float | None = None,
@@ -813,6 +837,7 @@ class Client:
         if latency_value_usd_per_second < 0:
             raise ValueError("latency_value_usd_per_second cannot be negative.")
         evaluator_policy = _validate_evaluator_policy(evaluator)
+        difficulty_floor_policy = _validate_difficulty_thresholds(difficulty_thresholds)
         performance_setter = getattr(self.transport, "set_performance_policy", None)
         if callable(performance_setter):
             performance_setter(
@@ -897,7 +922,7 @@ class Client:
                 evaluator_model, quality_threshold, model_budget, rounds, allow_few_shot,
                 max_few_shot_examples, representative_input_chars,
                 representative_output_tokens, int(holdout_repeats), evaluator_policy,
-                int(max_parallel_scenarios),
+                difficulty_floor_policy, int(max_parallel_scenarios),
             )
 
         def run_batch(configurations: list[str]) -> list[ModelResult]:
@@ -1133,6 +1158,7 @@ class Client:
             "optimizer_model": optimizer_model,
             "evaluator_model": evaluator_model,
             "evaluator": evaluator_policy,
+            "difficulty_thresholds": difficulty_floor_policy,
             "quality_threshold": quality_threshold,
             "incumbent_model": baseline.model,
             "incumbent_baseline_holdout_pass_rate": baseline.baseline_holdout_pass_rate,
@@ -1160,6 +1186,7 @@ class Client:
             "distinct_final_test_scenarios": len(holdout),
             "executions_per_final_test_scenario": int(holdout_repeats),
             "evaluator": evaluator_policy,
+            "difficulty_thresholds": difficulty_floor_policy,
             "configurations": [
                 {
                     "configuration": configuration,
@@ -1223,6 +1250,21 @@ class Client:
             raise ValueError("minimum_meaningful_quality_gain must be between zero and one.")
         if any(any(not turn.input or not turn.approved_output for turn in item.conversation()) for item in examples):
             raise ValueError("Every scenario turn requires an input and approved output.")
+        if any(not math.isfinite(item.weight) or item.weight <= 0 for item in examples):
+            raise ValueError("Every scenario weight must be positive and finite.")
+        grouped = [item for item in examples if item.group]
+        if grouped:
+            if len(grouped) != len(examples):
+                raise ValueError("Either every scenario must declare a group or none may declare one.")
+            group_counts: dict[str, int] = {}
+            for item in examples:
+                group_counts[item.group] = group_counts.get(item.group, 0) + 1
+            undersized = sorted(group for group, count in group_counts.items() if count < 5)
+            if undersized:
+                raise ValueError(
+                    "Every stratified group needs at least five scenarios: "
+                    + ", ".join(undersized)
+                )
 
     def _evaluate_model(
         self,
@@ -1242,34 +1284,37 @@ class Client:
         representative_output_tokens: int | None,
         holdout_repeats: int,
         evaluator: dict[str, Any],
+        difficulty_thresholds: dict[str, float],
         max_parallel_scenarios: int,
     ) -> ModelResult:
         started_spend = budget.spent_usd
-        # Validation comes first because a prompt that already generalizes perfectly
-        # should not pay for a full training pass and an optimizer rewrite.  The
-        # frozen final test remains the promotion gate, so this saves work without
-        # weakening the reliability claim or peeking at final-test answers.
+        # Validation remains the selection gate, but a small validation slice can
+        # reach 100% by chance while the starting prompt still fails much of the
+        # approved training evidence. Always measure both disclosed splits before
+        # deciding that prompt learning is unnecessary. The frozen final test is
+        # still never used to select or rewrite a prompt.
         baseline_dev = self._run_cases(
             prompt, "baseline", dev, "dev", model, evaluator_model, budget,
             evaluator=evaluator, max_parallel_scenarios=max_parallel_scenarios,
         )
         baseline_dev_rate = _pass_rate(baseline_dev)
-        if baseline_dev_rate >= 1:
-            baseline_train: list[CaseResult] = []
-            baseline_train_rate = baseline_dev_rate
-        else:
-            baseline_train = self._run_cases(
-                prompt, "baseline", train, "train", model, evaluator_model, budget,
-                evaluator=evaluator, max_parallel_scenarios=max_parallel_scenarios,
-            )
-            baseline_train_rate = _pass_rate(baseline_train)
+        baseline_train = self._run_cases(
+            prompt, "baseline", train, "train", model, evaluator_model, budget,
+            evaluator=evaluator, max_parallel_scenarios=max_parallel_scenarios,
+        )
+        baseline_train_rate = _pass_rate(baseline_train)
         selected_prompt = prompt
         selected_few_shot_ids: list[str] = []
         selected_train = baseline_train or baseline_dev
+        selected_train_rate = baseline_train_rate
         selected_dev = baseline_dev
         selected_rate = baseline_dev_rate
         candidate_cases: list[CaseResult] = []
-        for round_number in (range(1, int(rounds) + 1) if selected_rate < 1 else ()):
+        for round_number in (
+            range(1, int(rounds) + 1)
+            if selected_rate < 1 or selected_train_rate < 1
+            else ()
+        ):
             revised_prompt, revised_few_shot_ids = self._propose_prompt(
                 selected_prompt,
                 model,
@@ -1280,36 +1325,41 @@ class Client:
                 allow_few_shot,
                 max_few_shot_examples,
             )
-            # Selection happens on validation and promotion happens on the frozen
-            # final test. The terminal candidate needs no redundant training replay;
-            # earlier rounds still collect training feedback for the next rewrite.
-            if round_number < int(rounds):
-                revised_train = self._run_cases(
-                    revised_prompt,
-                    f"candidate-{round_number}",
-                    train,
-                    "train",
-                    model,
-                    evaluator_model,
-                    budget,
-                    train,
-                    revised_few_shot_ids,
-                    evaluator=evaluator,
-                    max_parallel_scenarios=max_parallel_scenarios,
-                )
-                candidate_cases += revised_train
-            else:
-                revised_train = []
+            # Training evidence breaks a validation tie; the candidate must never
+            # regress on validation. This avoids silently skipping a useful rewrite
+            # after a lucky perfect score on a small validation slice.
+            revised_train = self._run_cases(
+                revised_prompt,
+                f"candidate-{round_number}",
+                train,
+                "train",
+                model,
+                evaluator_model,
+                budget,
+                train,
+                revised_few_shot_ids,
+                evaluator=evaluator,
+                max_parallel_scenarios=max_parallel_scenarios,
+            )
+            candidate_cases += revised_train
             revised_dev = self._run_cases(revised_prompt, f"candidate-{round_number}", dev, "dev", model, evaluator_model, budget, train, revised_few_shot_ids, evaluator=evaluator, max_parallel_scenarios=max_parallel_scenarios)
             candidate_cases += revised_dev
             revised_rate = _pass_rate(revised_dev)
-            if revised_rate > selected_rate:
+            revised_train_rate = _pass_rate(revised_train)
+            if (
+                revised_rate > selected_rate
+                or (
+                    revised_rate == selected_rate
+                    and revised_train_rate > selected_train_rate
+                )
+            ):
                 selected_prompt = revised_prompt
                 selected_few_shot_ids = revised_few_shot_ids
-                selected_train = revised_train or selected_train
+                selected_train = revised_train
+                selected_train_rate = revised_train_rate
                 selected_dev = revised_dev
                 selected_rate = revised_rate
-            if selected_rate >= 1:
+            if selected_rate >= 1 and selected_train_rate >= 1:
                 break
         selected_kind = "baseline" if selected_prompt == prompt else "candidate"
         baseline_holdout = self._run_cases(
@@ -1328,6 +1378,12 @@ class Client:
             )
         holdout_execution_rate = _pass_rate(selected_holdout)
         holdout_rate = _scenario_pass_rate(selected_holdout)
+        holdout_by_difficulty = _scenario_pass_rates_by_difficulty(selected_holdout)
+        passed_difficulty_floors = all(
+            difficulty in holdout_by_difficulty
+            and holdout_by_difficulty[difficulty] >= floor
+            for difficulty, floor in difficulty_thresholds.items()
+        )
         observed_inputs = [sum(len(turn.input) for turn in item.conversation()) for item in train + dev + holdout]
         observed_outputs = [sum(len(turn.approved_output) for turn in item.conversation()) for item in train + dev + holdout]
         typical_input = representative_input_chars or _percentile(observed_inputs, 0.90)
@@ -1367,13 +1423,15 @@ class Client:
             estimated_production_cost_per_call_usd=round(production_cost, 10),
             estimated_cost_per_successful_call_usd=round(cost_per_success, 10),
             optimization_spend_usd=round(budget.spent_usd - started_spend, 10),
-            passed_quality_floor=holdout_rate >= threshold,
+            passed_quality_floor=holdout_rate >= threshold and passed_difficulty_floors,
             target_latency_p50_ms=round(latency_p50),
             target_latency_p90_ms=round(latency_p90),
             holdout_unique_scenarios=len(holdout),
             holdout_executions=len(selected_holdout),
             holdout_execution_pass_rate=round(holdout_execution_rate, 6),
             baseline_holdout_execution_pass_rate=round(_pass_rate(baseline_holdout), 6),
+            holdout_pass_rates_by_difficulty=holdout_by_difficulty,
+            passed_difficulty_floors=passed_difficulty_floors,
             few_shot_example_ids=selected_few_shot_ids,
             cases=all_cases,
         )
@@ -1393,14 +1451,26 @@ class Client:
         evaluator: dict[str, Any] | None = None,
         max_parallel_scenarios: int = 1,
     ) -> list[CaseResult]:
+        evaluator_policy = evaluator or {"type": "semantic"}
+        target_max_tokens = {
+            "exact_text": 64,
+            "exact_json": 1024,
+            "semantic": 8192,
+        }[evaluator_policy["type"]]
+
         def run_execution(example: Example, repeat_index: int) -> list[CaseResult]:
             scenario_results: list[CaseResult] = []
             transcript: list[dict[str, str]] = []
             demonstrations = _few_shot_messages(few_shot_source or [], few_shot_ids or [], exclude_id=example.id if split == "train" else "")
             for turn_index, turn in enumerate(example.conversation()):
-                target = self._call(budget, target_model, [{"role": "system", "content": prompt}] + demonstrations + transcript + [{"role": "user", "content": turn.input}], max_tokens=8192)
+                target = self._call(
+                    budget,
+                    target_model,
+                    [{"role": "system", "content": prompt}] + demonstrations + transcript + [{"role": "user", "content": turn.input}],
+                    max_tokens=target_max_tokens,
+                )
                 transcript += [{"role": "user", "content": turn.input}, {"role": "assistant", "content": target.content}]
-                judgment, judge_completion = self._judge(example, turn, turn_index, transcript, target.content, evaluator_model, budget, evaluator or {"type": "semantic"})
+                judgment, judge_completion = self._judge(example, turn, turn_index, transcript, target.content, evaluator_model, budget, evaluator_policy)
                 repeat_suffix = f":repeat-{repeat_index + 1}" if repeats > 1 else ""
                 scenario_results.append(
                     CaseResult(
@@ -1418,6 +1488,10 @@ class Client:
                         evaluator_generation_id=judge_completion.generation_id,
                         target_latency_ms=target.latency_ms,
                         evaluator_latency_ms=judge_completion.latency_ms,
+                        group=example.group,
+                        difficulty=example.difficulty,
+                        weight=example.weight,
+                        critical=example.critical,
                     )
                 )
             return scenario_results
@@ -1546,8 +1620,13 @@ class Client:
                     "content": (
                         "Improve the current prompt package for the named target model. "
                         "You may rewrite the system prompt, select approved training examples as "
-                        "few-shot demonstrations, do both, or keep the package. Use only allowed IDs; "
-                        "demonstrations add production token cost. Return the package and hypothesis as JSON."
+                        "few-shot demonstrations, do both, or keep the package. Before proposing, audit "
+                        "every approved training scenario and every observed failure. Preserve every "
+                        "label-changing boundary, exception, precedence rule, output constraint, and "
+                        "multi-turn dependency; do not collapse cases with different approved behavior. "
+                        "Mentally replay the proposed package against all supplied scenarios. Use only "
+                        "allowed IDs; demonstrations add production token cost. Return the package and "
+                        "hypothesis as JSON."
                     ),
                 },
                 {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
@@ -1588,6 +1667,19 @@ def _validate_evaluator_policy(value: dict[str, Any] | None) -> dict[str, Any]:
         policy["allow_additional_properties"] = bool(policy.get("allow_additional_properties", True))
         policy["normalize_rational_strings"] = bool(policy.get("normalize_rational_strings", False))
     return policy
+
+
+def _validate_difficulty_thresholds(value: dict[str, float] | None) -> dict[str, float]:
+    thresholds: dict[str, float] = {}
+    for raw_name, raw_floor in dict(value or {}).items():
+        name = str(raw_name).strip()
+        floor = float(raw_floor)
+        if not name:
+            raise ValueError("difficulty_thresholds keys must be non-empty.")
+        if not math.isfinite(floor) or not 0 < floor <= 1:
+            raise ValueError("Every difficulty threshold must be greater than zero and at most one.")
+        thresholds[name] = floor
+    return thresholds
 
 
 def _deterministic_judgment(
@@ -1644,6 +1736,24 @@ def _safe_provider_error_detail(value: str) -> str:
 
 
 def _split_examples(examples: list[Example], seed: str) -> tuple[list[Example], list[Example], list[Example]]:
+    if examples and all(item.group for item in examples):
+        grouped: dict[str, list[Example]] = {}
+        for item in examples:
+            grouped.setdefault(item.group, []).append(item)
+        train: list[Example] = []
+        dev: list[Example] = []
+        holdout: list[Example] = []
+        for group, items in sorted(grouped.items()):
+            ranked_group = sorted(
+                items,
+                key=lambda item: hashlib.sha256(f"{seed}:{group}:{item.id}".encode()).hexdigest(),
+            )
+            holdout_count = max(1, len(ranked_group) // 5)
+            dev_count = max(1, len(ranked_group) // 5)
+            holdout.extend(ranked_group[:holdout_count])
+            dev.extend(ranked_group[holdout_count : holdout_count + dev_count])
+            train.extend(ranked_group[holdout_count + dev_count :])
+        return train, dev, holdout
     ranked = sorted(
         examples,
         key=lambda item: hashlib.sha256(f"{seed}:{item.id}".encode()).hexdigest(),
@@ -1665,19 +1775,40 @@ def _few_shot_messages(examples: list[Example], selected_ids: list[str], exclude
 
 
 def _pass_rate(results: list[CaseResult]) -> float:
-    return sum(1 for item in results if item.passed) / len(results) if results else 0.0
+    total_weight = sum(item.weight for item in results)
+    return (
+        sum(item.weight for item in results if item.passed) / total_weight
+        if total_weight > 0
+        else 0.0
+    )
 
 
 def _scenario_pass_rate(results: list[CaseResult]) -> float:
     """Count distinct scenarios once; every repeated execution must pass."""
-    scenarios: dict[str, list[bool]] = {}
+    scenarios: dict[str, dict[str, Any]] = {}
     for item in results:
         scenario_id = item.example_id.split(":turn-", 1)[0]
-        scenarios.setdefault(scenario_id, []).append(item.passed)
-    return (
-        sum(1 for outcomes in scenarios.values() if all(outcomes)) / len(scenarios)
-        if scenarios else 0.0
+        scenario = scenarios.setdefault(scenario_id, {"outcomes": [], "weight": item.weight})
+        scenario["outcomes"].append(item.passed)
+    total_weight = sum(float(value["weight"]) for value in scenarios.values())
+    if total_weight <= 0:
+        return 0.0
+    passed_weight = sum(
+        float(value["weight"])
+        for value in scenarios.values()
+        if all(value["outcomes"])
     )
+    return passed_weight / total_weight
+
+
+def _scenario_pass_rates_by_difficulty(results: list[CaseResult]) -> dict[str, float]:
+    by_difficulty: dict[str, list[CaseResult]] = {}
+    for item in results:
+        by_difficulty.setdefault(item.difficulty or "typical", []).append(item)
+    return {
+        difficulty: round(_scenario_pass_rate(items), 6)
+        for difficulty, items in sorted(by_difficulty.items())
+    }
 
 
 def _percentile(values: list[int], fraction: float) -> int:

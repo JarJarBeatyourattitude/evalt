@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 from contextlib import redirect_stderr, redirect_stdout
@@ -401,7 +402,7 @@ class SdkTests(unittest.TestCase):
         self.assertEqual(result.winner.holdout_pass_rate, 0)
         self.assertTrue(any("Unexpected JSON key" in case.reason for case in result.winner.cases))
 
-    def test_perfect_validation_skips_training_and_prompt_rewrite(self):
+    def test_perfect_training_and_validation_skip_prompt_rewrite(self):
         class AlreadyCorrectTransport(FakeTransport):
             def complete(self, model, messages, *, max_tokens, response_schema=None):
                 self.calls.append((model, messages, max_tokens, response_schema))
@@ -421,8 +422,124 @@ class SdkTests(unittest.TestCase):
 
         called_models = [model for model, *_rest in transport.calls]
         self.assertNotIn("optimizer", called_models)
-        self.assertFalse(any(case.split == "train" for case in result.winner.cases))
+        self.assertTrue(any(case.split == "train" for case in result.winner.cases))
+        self.assertTrue(all(max_tokens == 64 for model, _messages, max_tokens, _schema in transport.calls if model == "target"))
         self.assertEqual(result.winner.holdout_pass_rate, 1)
+
+    def test_perfect_small_validation_does_not_hide_training_failures(self):
+        prompt = "Apply the private policy and return approved or rejected."
+        examples = [
+            {"id": f"policy-{index}", "input": f"case {index}", "approved_output": "approved"}
+            for index in range(10)
+        ]
+        ranked = sorted(
+            examples,
+            key=lambda item: hashlib.sha256(f"{prompt}:{item['id']}".encode()).hexdigest(),
+        )
+        dev_ids = {item["id"] for item in ranked[2:4]}
+
+        class ValidationFlukeTransport(FakeTransport):
+            def complete(self, model, messages, *, max_tokens, response_schema=None):
+                self.calls.append((model, messages, max_tokens, response_schema))
+                system = messages[0]["content"]
+                user = messages[-1]["content"]
+                if response_schema and "Improve the current prompt" in system:
+                    return Completion(
+                        json.dumps({
+                            "prompt": "Rewritten policy: always return approved.",
+                            "hypothesis": "Encode the rule demonstrated across training evidence.",
+                            "few_shot_example_ids": [],
+                        }),
+                        model, f"gen-{len(self.calls)}", 0.0001,
+                    )
+                case_id = user.removeprefix("case ")
+                original_is_lucky = f"policy-{case_id}" in dev_ids
+                content = "approved" if "Rewritten policy" in system or original_is_lucky else "rejected"
+                return Completion(content, model, f"gen-{len(self.calls)}", 0.0001)
+
+        result = Client(transport=ValidationFlukeTransport()).optimize(
+            prompt=prompt,
+            examples=examples,
+            models=["target"],
+            optimizer_model="optimizer",
+            evaluator_model="unused",
+            evaluator={"type": "exact_text"},
+            rounds=1,
+            max_optimization_cost_usd=1,
+            holdout_repeats=1,
+        )
+
+        self.assertEqual(result.winner.baseline_pass_rate, 0)
+        self.assertEqual(result.winner.selected_pass_rate, 1)
+        self.assertEqual(result.winner.baseline_holdout_pass_rate, 0)
+        self.assertEqual(result.winner.holdout_pass_rate, 1)
+        self.assertEqual(result.winner.selected_prompt, "Rewritten policy: always return approved.")
+
+    def test_stratified_groups_reach_every_split_and_hard_floor_blocks_promotion(self):
+        class DifficultyTransport(FakeTransport):
+            def complete(self, model, messages, *, max_tokens, response_schema=None):
+                self.calls.append((model, messages, max_tokens, response_schema))
+                if response_schema and "Improve the current prompt" in messages[0]["content"]:
+                    return Completion(
+                        json.dumps({
+                            "prompt": "Return approved for routine cases and rejected for hard cases.",
+                            "hypothesis": "Preserve the observed difficulty behavior.",
+                            "few_shot_example_ids": [],
+                        }),
+                        model, f"gen-{len(self.calls)}", 0.0001,
+                    )
+                content = "rejected" if "hard" in messages[-1]["content"] else "approved"
+                return Completion(content, model, f"gen-{len(self.calls)}", 0.0001)
+
+        examples = [
+            {
+                "id": f"routine-{index}", "group": "routine-policy",
+                "difficulty": "routine", "input": f"routine case {index}",
+                "approved_output": "approved",
+            }
+            for index in range(5)
+        ] + [
+            {
+                "id": f"hard-{index}", "group": "hard-policy",
+                "difficulty": "hard", "input": f"hard case {index}",
+                "approved_output": "approved", "critical": True,
+            }
+            for index in range(5)
+        ]
+        result = Client(transport=DifficultyTransport()).optimize(
+            prompt="Return the approved policy label only.",
+            examples=examples,
+            models=["target"],
+            optimizer_model="optimizer",
+            evaluator_model="unused",
+            evaluator={"type": "exact_text"},
+            difficulty_thresholds={"routine": 1.0, "hard": 1.0},
+            quality_threshold=0.5,
+            rounds=1,
+            holdout_repeats=1,
+            max_optimization_cost_usd=1,
+        )
+
+        self.assertEqual(result.winner.holdout_pass_rate, 0.5)
+        self.assertEqual(result.winner.holdout_pass_rates_by_difficulty, {"hard": 0.0, "routine": 1.0})
+        self.assertFalse(result.winner.passed_difficulty_floors)
+        self.assertFalse(result.winner.passed_quality_floor)
+        final_groups = {case.group for case in result.winner.cases if case.split == "holdout"}
+        validation_groups = {case.group for case in result.winner.cases if case.split == "dev"}
+        self.assertEqual(final_groups, {"routine-policy", "hard-policy"})
+        self.assertEqual(validation_groups, {"routine-policy", "hard-policy"})
+
+    def test_stratified_group_requires_five_scenarios(self):
+        with self.assertRaisesRegex(ValueError, "at least five"):
+            Client(transport=FakeTransport()).optimize(
+                prompt="Return the approved policy label only.",
+                examples=[
+                    {"id": f"thin-{index}", "group": "thin", "input": f"case {index}", "approved_output": "ok"}
+                    for index in range(4)
+                ],
+                models=["target"],
+                max_optimization_cost_usd=1,
+            )
 
     def test_price_first_api_keeps_test_budget_and_accuracy_as_separate_controls(self):
         with TemporaryDirectory() as directory:
@@ -846,7 +963,7 @@ class SdkTests(unittest.TestCase):
             max_tokens=25, response_schema={"type": "object"},
         )
         sent = requests[-1]
-        self.assertEqual(sent["max_completion_tokens"], 32768)
+        self.assertEqual(sent["max_completion_tokens"], 25)
         self.assertNotIn("max_tokens", sent)
         self.assertNotIn("temperature", sent)
         self.assertEqual(sent["provider"]["sort"], "price")
@@ -1309,7 +1426,7 @@ class SdkTests(unittest.TestCase):
         result = client.optimize(
             prompt="Write a helpful classification for this message.", examples=EXAMPLES,
             models=["cheap", "expensive", "later"], optimizer_model="optimizer",
-            evaluator_model="evaluator", max_optimization_cost_usd=0.0025,
+            evaluator_model="evaluator", max_optimization_cost_usd=0.004, rounds=1,
             max_parallel_models=1, max_parallel_scenarios=1,
         )
         self.assertEqual(result.winner.model, "cheap")

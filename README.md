@@ -32,7 +32,7 @@ repository checkout:
 
 ```bash
 python -m venv .venv
-python -m pip install dist/evalt-0.8.16-py3-none-any.whl
+python -m pip install dist/evalt-0.8.17-py3-none-any.whl
 evalt --version
 ```
 
@@ -128,6 +128,55 @@ held-out cases are repeated twice before promotion. A measured 100% means every 
 approved final-test scenario passed on every configured repeat; it is not a guarantee
 about every future input. Reports show distinct scenario count and execution count
 separately.
+
+### Represent the real workload, including its hard tail
+
+An overall score can hide a model that is excellent on frequent easy inputs and unsafe
+on rarer difficult ones. Evalt therefore supports a production-weighted, stratified
+suite. Give related variants the same `group`, label their `difficulty`, and optionally
+set a `weight` that reflects expected traffic. The splitter puts examples from every
+group into training, validation, and final test. `difficulty_thresholds` then makes the
+hard tail a separate promotion gate instead of letting routine volume average it away.
+
+The excerpt below shows the added fields; a valid suite includes at least five cases in
+each declared group.
+
+```json
+{
+  "examples": [
+    {
+      "id": "routine-01",
+      "group": "ordinary-refund",
+      "difficulty": "routine",
+      "weight": 6,
+      "input": "Unopened item, receipt, 12 days after delivery.",
+      "approved_output": "approve"
+    },
+    {
+      "id": "adversarial-01",
+      "group": "policy-conflict",
+      "difficulty": "adversarial",
+      "weight": 1,
+      "critical": true,
+      "input": "A damaged final-sale item arrived after the normal window.",
+      "approved_output": "manual_review"
+    }
+  ],
+  "quality_threshold": 0.95,
+  "difficulty_thresholds": {
+    "routine": 0.95,
+    "complex": 0.90,
+    "adversarial": 0.85
+  }
+}
+```
+
+If one example declares a group, every example must declare one, and every group needs
+at least five scenarios so it can contribute evidence to all three splits. Weights
+affect measured pass rates; they do not decide which examples are hidden. A production
+route is promoted only when it clears both the overall weighted target and every named
+difficulty floor. Keep rare catastrophic rules in an explicit hard-constraint judge as
+well; a statistical slice is not a substitute for a deterministic veto.
 
 Speed is durable route state, not a one-time benchmark option. There is no latency
 ceiling by default. Set
@@ -261,8 +310,11 @@ Independent model lanes run concurrently (eight by default) and each lane evalua
 to sixteen independent case executions concurrently. Model lanes are configurable up to
 16 and case execution concurrency up to 64. Repeated executions are parallel work units;
 turns inside one multi-turn scenario remain ordered. Every in-flight estimate is reserved
-against the one hard suite budget. A prompt that already scores 100% on the validation
-split skips training replay and rewriting and moves directly to the frozen final test.
+against the one hard suite budget. Evalt measures both training evidence and validation
+before skipping prompt learning; a perfect score on a small validation slice alone does
+not suppress a potentially useful rewrite. The frozen final test remains promotion-only.
+Exact-text and exact-JSON suites use contract-sized visible-output reservations, while
+explicit reasoning configurations retain large hidden-reasoning headroom.
 
 ## Provider and data contract
 
