@@ -13,6 +13,7 @@ from .core import (
     RolePlan,
     RoutedAnswer,
     Suite,
+    SuiteDraft,
     Turn,
     check_result,
     select_role_plan,
@@ -38,6 +39,7 @@ __all__ = [
     "RolePlan",
     "RoutedAnswer",
     "Suite",
+    "SuiteDraft",
     "Turn",
     "check_result",
     "select_role_plan",
@@ -48,4 +50,4 @@ __all__ = [
     "write_reports",
 ]
 
-__version__ = "0.8.21"
+__version__ = "0.8.22"

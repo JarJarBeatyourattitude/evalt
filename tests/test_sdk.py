@@ -175,6 +175,46 @@ class CostlyBootstrapTransport(FakeTransport):
         return 0.057045
 
 
+class CaseDesignerTransport(FakeTransport):
+    def complete(self, model, messages, *, max_tokens, response_schema=None):
+        if response_schema and "Design a balanced evaluation suite" in messages[0]["content"]:
+            self.calls.append((model, messages, max_tokens, response_schema))
+            scenarios = []
+            for index in range(25):
+                category = index % 3
+                if category == 0:
+                    input_text, approved = f"I was charged twice, case {index}", "billing"
+                elif category == 1:
+                    input_text, approved = f"My reset link expired, case {index}", "account"
+                else:
+                    input_text, approved = f"The app freezes, case {index}", "technical"
+                scenarios.append({
+                    "id": f"designed-{index + 1}",
+                    "difficulty": ("routine", "complex", "adversarial")[category],
+                    "critical": category == 2,
+                    "turns": [{"input": input_text, "approved_output": approved}],
+                    "rationale": "Exercise a distinct support-routing boundary.",
+                })
+            content = json.dumps({
+                "evaluator": {
+                    "type": "exact_text",
+                    "reason": "The production contract requires one exact lowercase label.",
+                    "required_keys": [],
+                    "allow_additional_properties": True,
+                    "normalize_rational_strings": False,
+                },
+                "scenarios": scenarios,
+                "design_notes": ["Balanced three routing labels before splitting."],
+            })
+            return Completion(
+                content, model, f"gen-{len(self.calls)}",
+                self.estimate_cost(model, messages, max_tokens=max_tokens),
+            )
+        return super().complete(
+            model, messages, max_tokens=max_tokens, response_schema=response_schema
+        )
+
+
 class PartlyUnavailableTransport(FakeTransport):
     def complete(self, model, messages, *, max_tokens, response_schema=None):
         if model == "unavailable":
@@ -771,9 +811,11 @@ class SdkTests(unittest.TestCase):
                 )
             rendered = stream.getvalue()
             self.assertEqual(answer.content, "technical")
-            self.assertIn("future retest cap $0.25", rendered)
+            self.assertIn("$0.25 test cap is not spent unless a tournament starts", rendered)
             self.assertIn("$0.057045", rendered)
-            self.assertIn("automatic ceiling $0.0627", rendered)
+            self.assertIn("UNTESTED BOOTSTRAP", rendered)
+            self.assertIn("0/5 labeled examples", rendered)
+            self.assertIn("no tournament ran", rendered)
             self.assertEqual(
                 [event["event"] for event in events],
                 ["production_call_started", "production_call_completed"],
@@ -791,6 +833,7 @@ class SdkTests(unittest.TestCase):
                 incumbent_model="cheap",
                 retest_after_calls=2,
                 min_feedback=1,
+                auto_maintain=False,
             )
             self.assertEqual(first.content, "billing")
             self.assertEqual(first.model, "cheap")
@@ -883,6 +926,7 @@ class SdkTests(unittest.TestCase):
                     route="latency-gated", price_usd=0.01, models=["cheap"],
                     incumbent_model="cheap", min_feedback=5,
                     max_p90_latency_seconds=1,
+                    auto_maintain=False,
                 )
                 answer.correct(approved)
             plan = select_role_plan([], maintenance_budget_usd=1, fallback_targets=["cheap"], fallback_designer="optimizer", fallback_judge="evaluator")
@@ -906,12 +950,55 @@ class SdkTests(unittest.TestCase):
         with TemporaryDirectory() as directory:
             state = Path(directory) / "evalt.db"
             evalt = Evalt(transport=FakeTransport(), state_path=state)
-            first = evalt.run("Return the approved route label only.", "charged", route="support", budget_usd=0.01, models=["cheap"], incumbent_model="cheap")
-            second = evalt.run("Return only billing, account, or technical.", "charged", route="support", budget_usd=0.01, models=["cheap"], incumbent_model="cheap")
+            first = evalt.run("Return the approved route label only.", "charged", route="support", budget_usd=0.01, models=["cheap"], incumbent_model="cheap", auto_maintain=False)
+            first.accept()
+            self.assertEqual(evalt.route_status("support")["feedback_count"], 1)
+            second = evalt.run("Return only billing, account, or technical.", "charged", route="support", budget_usd=0.01, models=["cheap"], incumbent_model="cheap", auto_maintain=False)
             self.assertNotEqual(first.prompt_version, second.prompt_version)
             self.assertEqual(second.decision_reason, "prompt_changed_unqualified")
-            events = [item["event_type"] for item in evalt.route_status("support")["decisions"]]
+            status = evalt.route_status("support")
+            self.assertEqual(status["feedback_count"], 0)
+            self.assertEqual(status["route_phase"], "untested_bootstrap")
+            events = [item["event_type"] for item in status["decisions"]]
             self.assertIn("prompt_changed", events)
+
+    def test_feedback_progress_is_explicit_and_launches_first_real_tournament(self):
+        with TemporaryDirectory() as directory:
+            stream = StringIO()
+            evalt = Evalt(
+                transport=FakeTransport(),
+                state_path=Path(directory) / "evalt.db",
+                show_progress=True,
+            )
+            cases = [
+                ("charged twice", "billing"),
+                ("reset expired", "account"),
+                ("app freezes", "technical"),
+                ("charged again", "billing"),
+                ("reset broken", "account"),
+            ]
+            with redirect_stderr(stream):
+                for input_text, approved in cases:
+                    answer = evalt.run(
+                        "Write a helpful classification for this message.",
+                        input_text,
+                        route="automatic-maintenance",
+                        budget_usd=0.01,
+                        models=["cheap"],
+                        incumbent_model="cheap",
+                        min_feedback=5,
+                    )
+                    answer.correct(approved)
+                evalt.wait_for_maintenance()
+            rendered = stream.getvalue()
+            self.assertIn("1/5 labeled examples", rendered)
+            self.assertIn("5/5 labeled examples · tournament eligible", rendered)
+            self.assertIn("TOURNAMENT STARTED", rendered)
+            self.assertIn("TOURNAMENT COMPLETE", rendered)
+            self.assertEqual(
+                evalt.route_status("automatic-maintenance")["route_phase"],
+                "qualified",
+            )
 
     def test_durable_route_persists_fixed_prompt_policy(self):
         with TemporaryDirectory() as directory:
@@ -1011,7 +1098,7 @@ class SdkTests(unittest.TestCase):
             for input_text, approved in cases:
                 answer = evalt.run(
                     "Write a helpful classification for this message.", input_text,
-                    route="maintained", budget_usd=0.01, models=["cheap"], incumbent_model="cheap", min_feedback=5,
+                    route="maintained", budget_usd=0.01, models=["cheap"], incumbent_model="cheap", min_feedback=5, auto_maintain=False,
                 )
                 answers.append(answer)
                 answer.correct(approved)
@@ -1043,6 +1130,56 @@ class SdkTests(unittest.TestCase):
         self.assertEqual(result.winner.model, "cheap")
         self.assertFalse(check_result(result.to_dict(), min_pass_rate=0.9).passed)
         self.assertIn("exploratory", check_result(result.to_dict(), min_pass_rate=0.9).failures[0])
+
+    def test_ai_suite_design_is_budgeted_reviewable_and_not_silently_approved(self):
+        with TemporaryDirectory() as directory:
+            evalt = Evalt(
+                transport=CaseDesignerTransport(),
+                state_path=Path(directory) / "evalt.db",
+            )
+            draft = evalt.design_suite(
+                task="Classify recurring support tickets into one routing label.",
+                prompt="Return exactly one lowercase label: billing, account, or technical.",
+                route="designed-support",
+                case_count=25,
+                workflow_budget_usd=1,
+                models=["cheap"],
+                designer_model="designer",
+                evaluator_model="evaluator",
+            )
+            self.assertEqual(len(draft.examples), 25)
+            self.assertEqual(draft.evidence_provenance, "AI_DRAFT_UNAPPROVED")
+            self.assertGreater(draft.designer_spend_usd, 0)
+            self.assertLess(draft.remaining_optimization_budget_usd, 1)
+            suite = draft.approve()
+            self.assertEqual(suite.evidence_provenance, "HUMAN_APPROVED_AI_DRAFT")
+            self.assertEqual(suite.evaluator["type"], "exact_text")
+            self.assertEqual(suite.max_optimization_cost_usd, draft.remaining_optimization_budget_usd)
+
+    def test_autopilot_design_runs_full_tournament_but_labels_ai_evidence(self):
+        with TemporaryDirectory() as directory:
+            evalt = Evalt(
+                transport=CaseDesignerTransport(),
+                state_path=Path(directory) / "evalt.db",
+            )
+            result = evalt.optimize_task(
+                task="Classify recurring support tickets into one routing label.",
+                prompt="Return exactly one lowercase label: billing, account, or technical.",
+                route="autopilot-support",
+                case_control="autopilot",
+                case_count=25,
+                workflow_budget_usd=1,
+                models=["cheap"],
+                designer_model="designer",
+                evaluator_model="evaluator",
+            )
+            self.assertEqual(
+                result.regression_suite["evidence_provenance"],
+                "AI_GENERATED_AI_JUDGED",
+            )
+            self.assertIn("AI-generated", result.warnings[0])
+            self.assertEqual(result.regression_suite["holdout_unique_scenarios"], 5)
+            self.assertGreater(result.total_provider_spend_usd, 0)
 
     def test_suite_persists_a_long_configurable_provider_deadline(self):
         suite = Suite.from_dict({

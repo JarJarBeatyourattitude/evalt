@@ -27,6 +27,7 @@ from last_good_prompt.core import (
     OptimizationResult,
     ProviderError,
     Turn,
+    _Budget,
     _safe_provider_error_detail,
     _validate_evaluator_policy,
 )
@@ -61,6 +62,7 @@ class Suite:
     incumbent_model: str | None = None
     allowed_accuracy_regression: float = 0.0
     adaptive_search: bool = True
+    evidence_provenance: str = "HUMAN_APPROVED"
     name: str = "evalt-suite"
 
     @classmethod
@@ -102,6 +104,9 @@ class Suite:
                 incumbent_model=str(value["incumbent_model"]) if value.get("incumbent_model") else None,
                 allowed_accuracy_regression=float(value.get("allowed_accuracy_regression", 0.0)),
                 adaptive_search=bool(value.get("adaptive_search", True)),
+                evidence_provenance=str(
+                    value.get("evidence_provenance", "HUMAN_APPROVED")
+                ),
             )
         except (KeyError, TypeError, ValueError) as error:
             raise ValueError(f"Invalid Evalt suite: {error}") from error
@@ -150,6 +155,12 @@ class Suite:
         _validate_evaluator_policy(dict(self.evaluator))
         if any(not str(name).strip() or not 0 < float(floor) <= 1 for name, floor in self.difficulty_thresholds.items()):
             raise ValueError("difficulty_thresholds must map non-empty names to values greater than zero and at most one.")
+        if self.evidence_provenance not in {
+            "HUMAN_APPROVED",
+            "HUMAN_APPROVED_AI_DRAFT",
+            "AI_GENERATED_AI_JUDGED",
+        }:
+            raise ValueError("evidence_provenance is not a supported trust level.")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -179,6 +190,7 @@ class Suite:
             "incumbent_model": self.incumbent_model,
             "allowed_accuracy_regression": self.allowed_accuracy_regression,
             "adaptive_search": self.adaptive_search,
+            "evidence_provenance": self.evidence_provenance,
         }
 
     def save(self, path: str | Path) -> None:
@@ -214,6 +226,139 @@ class Suite:
         }
 
 
+@dataclass(frozen=True)
+class SuiteDraft:
+    """AI-authored cases that cannot count as human evidence until approved."""
+
+    task: str
+    prompt: str
+    examples: tuple[Example, ...]
+    models: tuple[str, ...]
+    designer_model: str
+    evaluator_model: str
+    evaluator: Mapping[str, Any]
+    quality_threshold: float
+    workflow_budget_usd: float
+    designer_spend_usd: float
+    optimize_prompt: bool = True
+    holdout_repeats: int = 2
+    name: str = "evalt-suite"
+    evidence_provenance: str = "AI_DRAFT_UNAPPROVED"
+    design_notes: tuple[str, ...] = ()
+
+    @property
+    def remaining_optimization_budget_usd(self) -> float:
+        return max(0.0, self.workflow_budget_usd - self.designer_spend_usd)
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> "SuiteDraft":
+        try:
+            draft = cls(
+                name=str(value.get("name") or "evalt-suite"),
+                task=str(value["task"]),
+                prompt=str(value["prompt"]),
+                examples=tuple(
+                    Example.from_value(item, index)
+                    for index, item in enumerate(value["examples"])
+                ),
+                models=tuple(str(item) for item in value["models"]),
+                designer_model=str(value["designer_model"]),
+                evaluator_model=str(value["evaluator_model"]),
+                evaluator=dict(value.get("evaluator") or {"type": "semantic"}),
+                quality_threshold=float(value.get("quality_threshold", 0.95)),
+                workflow_budget_usd=float(value["workflow_budget_usd"]),
+                designer_spend_usd=float(value.get("designer_spend_usd", 0)),
+                optimize_prompt=bool(value.get("optimize_prompt", True)),
+                holdout_repeats=int(value.get("holdout_repeats", 2)),
+                evidence_provenance="AI_DRAFT_UNAPPROVED",
+                design_notes=tuple(str(item) for item in value.get("design_notes", [])),
+            )
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError(f"Invalid Evalt suite draft: {error}") from error
+        if len(draft.examples) < 5:
+            raise ValueError("An AI suite draft must contain at least five scenarios.")
+        if draft.remaining_optimization_budget_usd <= 0:
+            raise ValueError("The suite draft has no remaining tournament budget.")
+        _validate_evaluator_policy(dict(draft.evaluator))
+        return draft
+
+    @classmethod
+    def load(cls, path: str | Path) -> "SuiteDraft":
+        with Path(path).open(encoding="utf-8") as handle:
+            return cls.from_dict(json.load(handle))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema": "evalt-suite-draft-v1",
+            "name": self.name,
+            "task": self.task,
+            "prompt": self.prompt,
+            "examples": [asdict(example) for example in self.examples],
+            "models": list(self.models),
+            "designer_model": self.designer_model,
+            "evaluator_model": self.evaluator_model,
+            "evaluator": dict(self.evaluator),
+            "quality_threshold": self.quality_threshold,
+            "workflow_budget_usd": self.workflow_budget_usd,
+            "designer_spend_usd": self.designer_spend_usd,
+            "remaining_optimization_budget_usd": self.remaining_optimization_budget_usd,
+            "optimize_prompt": self.optimize_prompt,
+            "holdout_repeats": self.holdout_repeats,
+            "evidence_provenance": self.evidence_provenance,
+            "design_notes": list(self.design_notes),
+        }
+
+    def save(self, path: str | Path) -> None:
+        with Path(path).open("w", encoding="utf-8") as handle:
+            json.dump(self.to_dict(), handle, indent=2, ensure_ascii=False)
+            handle.write("\n")
+
+    def approve(
+        self,
+        examples: Iterable[Example | Mapping[str, Any]] | None = None,
+    ) -> Suite:
+        """Explicitly approve the draft, optionally replacing/editing its cases."""
+        approved = tuple(
+            Example.from_value(item, index)
+            for index, item in enumerate(examples if examples is not None else self.examples)
+        )
+        suite = Suite(
+            name=self.name,
+            prompt=self.prompt,
+            examples=approved,
+            models=self.models,
+            optimizer_model=self.designer_model,
+            evaluator_model=self.evaluator_model,
+            evaluator=dict(self.evaluator),
+            quality_threshold=self.quality_threshold,
+            max_optimization_cost_usd=self.remaining_optimization_budget_usd,
+            optimize_prompt=self.optimize_prompt,
+            holdout_repeats=self.holdout_repeats,
+            evidence_provenance="HUMAN_APPROVED_AI_DRAFT",
+        )
+        suite.validate()
+        return suite
+
+    def autopilot_suite(self) -> Suite:
+        """Use the AI-authored contract without implying human verification."""
+        suite = Suite(
+            name=self.name,
+            prompt=self.prompt,
+            examples=self.examples,
+            models=self.models,
+            optimizer_model=self.designer_model,
+            evaluator_model=self.evaluator_model,
+            evaluator=dict(self.evaluator),
+            quality_threshold=self.quality_threshold,
+            max_optimization_cost_usd=self.remaining_optimization_budget_usd,
+            optimize_prompt=self.optimize_prompt,
+            holdout_repeats=self.holdout_repeats,
+            evidence_provenance="AI_GENERATED_AI_JUDGED",
+        )
+        suite.validate()
+        return suite
+
+
 class Evalt:
     """Execute durable routes or run explicit optimization suites.
 
@@ -245,6 +390,9 @@ class Evalt:
             if show_progress is None else bool(show_progress)
         )
         self._progress_callback = progress_callback
+        self._maintenance_guard = threading.Lock()
+        self._maintenance_routes: set[str] = set()
+        self._maintenance_threads: list[threading.Thread] = []
 
     def _emit_progress(self, event: dict[str, Any]) -> None:
         if self._progress_callback is not None:
@@ -255,8 +403,8 @@ class Evalt:
         route = str(event.get("route") or "route")
         if kind == "production_call_started":
             message = (
-                f"Evalt · {route} · routing call at {float(event['target_accuracy']):.0%} target; "
-                f"future retest cap ${float(event['test_budget_usd']):.2f}"
+                f"Evalt · {route} · serving one production call; "
+                f"${float(event['test_budget_usd']):.2f} test cap is not spent unless a tournament starts"
             )
         elif kind == "production_call_completed":
             model = str(event.get("model") or "model")
@@ -264,26 +412,61 @@ class Evalt:
             ceiling = float(event.get("effective_price_ceiling_usd") or 0)
             policy = str(event.get("price_policy") or "explicit")
             raw_reason = str(event.get("decision_reason") or "route")
-            reason = {
-                "bootstrap_unqualified": "initial route; collecting approved examples",
-                "prompt_changed_unqualified": "prompt changed; collecting fresh evidence",
-            }.get(raw_reason, raw_reason.replace("_", " "))
-            message = (
-                f"Evalt · {route} · {model} · ${cost:.6f} · {policy} ceiling "
-                f"${ceiling:.6f} · {reason}"
-            )
+            feedback_count = int(event.get("feedback_count") or 0)
+            min_feedback = int(event.get("min_feedback") or 0)
+            if raw_reason in {"bootstrap_unqualified", "prompt_changed_unqualified"}:
+                message = (
+                    f"Evalt · {route} · UNTESTED BOOTSTRAP · one provider call only · "
+                    f"{model} · ${cost:.6f} · {feedback_count}/{min_feedback} labeled examples · "
+                    "no tournament ran"
+                )
+            else:
+                message = (
+                    f"Evalt · {route} · QUALIFIED ROUTE · {model} · ${cost:.6f} · "
+                    f"{policy} ceiling ${ceiling:.6f}"
+                )
         elif kind == "production_call_failed":
             message = f"Evalt · {route} · stopped before completion: {event.get('error')}"
+        elif kind == "feedback_recorded":
+            count = int(event.get("feedback_count") or 0)
+            minimum = int(event.get("min_feedback") or 0)
+            remaining = max(0, minimum - count)
+            if remaining:
+                message = (
+                    f"Evalt · {route} · {event.get('verdict')} feedback saved · "
+                    f"{count}/{minimum} labeled examples · {remaining} more before the first tournament"
+                )
+            else:
+                message = (
+                    f"Evalt · {route} · {event.get('verdict')} feedback saved · "
+                    f"{count}/{minimum} labeled examples · tournament eligible"
+                )
+        elif kind == "suite_design_started":
+            message = (
+                f"Evalt · {route} · TEST DESIGN STARTED · "
+                f"{int(event.get('case_count') or 0)} cases · "
+                f"one workflow cap ${float(event.get('workflow_budget_usd') or 0):.2f}"
+            )
+        elif kind == "suite_design_completed":
+            message = (
+                f"Evalt · {route} · TEST DRAFT READY · "
+                f"{int(event.get('case_count') or 0)} AI-authored cases · "
+                f"spent ${float(event.get('designer_spend_usd') or 0):.6f} · "
+                f"${float(event.get('remaining_budget_usd') or 0):.6f} remains for the tournament"
+            )
         elif kind == "maintenance_started":
             message = (
-                f"Evalt · {route} · bounded retest started in background; "
+                f"Evalt · {route} · TOURNAMENT STARTED · "
                 f"cap ${float(event['test_budget_usd']):.2f}"
             )
         elif kind == "maintenance_completed":
             message = (
-                f"Evalt · {route} · bounded retest settled; "
+                f"Evalt · {route} · TOURNAMENT COMPLETE · "
+                f"{event.get('promoted_model') or 'no route promoted'} · "
                 f"spent ${float(event.get('provider_spend_usd') or 0):.6f}"
             )
+        elif kind == "maintenance_skipped":
+            message = f"Evalt · {route} · NO TOURNAMENT RAN · {event.get('reason')}"
         elif kind == "maintenance_failed":
             message = f"Evalt · {route} · bounded retest stopped: {event.get('error')}"
         elif kind == "model_completed":
@@ -300,18 +483,301 @@ class Evalt:
         route = str(kwargs.get("route") or "route")
         try:
             result = self.router.maintain(**kwargs)
-            self._emit_progress({
-                "event": "maintenance_completed",
-                "route": route,
-                "provider_spend_usd": (
-                    0.0 if result is None else result.total_provider_spend_usd
-                ),
-                "promoted_model": None if result is None else result.winner.model,
-            })
+            if result is None:
+                status = self.router.status(route)
+                last_event = status["decisions"][-1] if status["decisions"] else {}
+                event_type = last_event.get("event_type")
+                if event_type == "judge_calibration_waiting":
+                    reason = (
+                        "semantic judging needs at least two approved outputs and one corrected "
+                        "failure; no provider budget was spent"
+                    )
+                elif event_type == "judge_calibration_failed":
+                    reason = "the judge failed calibration; the existing route was kept"
+                else:
+                    reason = "another maintenance run owns this route or the evidence was not ready"
+                self._emit_progress({
+                    "event": "maintenance_skipped", "route": route, "reason": reason
+                })
+            else:
+                self._emit_progress({
+                    "event": "maintenance_completed",
+                    "route": route,
+                    "provider_spend_usd": result.total_provider_spend_usd,
+                    "promoted_model": result.winner.model,
+                })
         except Exception as error:  # background failures stay visible without killing the caller
             self._emit_progress({
                 "event": "maintenance_failed", "route": route, "error": str(error)
             })
+        finally:
+            with self._maintenance_guard:
+                self._maintenance_routes.discard(route)
+
+    def _start_maintenance(self, *, route: str, test_budget_usd: float, **kwargs: Any) -> bool:
+        with self._maintenance_guard:
+            if route in self._maintenance_routes:
+                return False
+            self._maintenance_routes.add(route)
+        self._emit_progress({
+            "event": "maintenance_started",
+            "route": route,
+            "test_budget_usd": test_budget_usd,
+        })
+        thread = threading.Thread(
+            target=self._maintain_in_background,
+            kwargs={"route": route, "test_budget_usd": test_budget_usd, **kwargs},
+            name=f"evalt-maintain-{route}",
+            # Do not abandon already-authorized provider work when a short script exits.
+            daemon=False,
+        )
+        with self._maintenance_guard:
+            self._maintenance_threads.append(thread)
+        thread.start()
+        return True
+
+    def wait_for_maintenance(self) -> None:
+        """Wait for currently launched bounded tournaments to finish."""
+        with self._maintenance_guard:
+            threads = list(self._maintenance_threads)
+        for thread in threads:
+            thread.join()
+
+    def design_suite(
+        self,
+        *,
+        task: str,
+        prompt: str,
+        route: str = "evalt-suite",
+        seed_examples: Iterable[Example | Mapping[str, Any]] = (),
+        case_count: int = 25,
+        workflow_budget_usd: float = 1.00,
+        quality_threshold: float = 0.95,
+        models: Iterable[str] | None = None,
+        designer_model: str | None = None,
+        evaluator_model: str | None = None,
+        evaluator: Mapping[str, Any] | None = None,
+        optimize_prompt: bool = True,
+        holdout_repeats: int = 2,
+    ) -> SuiteDraft:
+        """Use a smart model to draft a reviewable, budget-accounted test contract."""
+        task_text = str(task).strip()
+        prompt_text = str(prompt).strip()
+        if len(task_text) < 8:
+            raise ValueError("task must explain the recurring job in at least eight characters.")
+        if len(prompt_text) < 8:
+            raise ValueError("prompt must contain at least eight characters.")
+        if not 5 <= int(case_count) <= 100:
+            raise ValueError("case_count must be between 5 and 100; use 25 or more for five final-test cases.")
+        if not 0 < float(workflow_budget_usd) <= 100:
+            raise ValueError("workflow_budget_usd must be greater than zero and no more than 100.")
+        if not 0 < float(quality_threshold) <= 1:
+            raise ValueError("quality_threshold must be greater than zero and at most one.")
+        seeds = tuple(
+            Example.from_value(item, index)
+            for index, item in enumerate(seed_examples)
+        )
+        if len(seeds) > int(case_count):
+            raise ValueError("seed_examples cannot outnumber case_count.")
+
+        requested_models = tuple(models) if models is not None else DEFAULT_TARGETS
+        catalog: list[Mapping[str, Any]] = []
+        if models is None and hasattr(self.client.transport, "model_catalog"):
+            catalog = self.client.transport.model_catalog()
+        role_plan = select_role_plan(
+            catalog,
+            maintenance_budget_usd=float(workflow_budget_usd),
+            fallback_targets=requested_models,
+        )
+        if models is None and role_plan.catalog_revision != "fallback":
+            requested_models = role_plan.target_models
+        requested_models = tuple(dict.fromkeys(str(item).strip() for item in requested_models if str(item).strip()))
+        if not requested_models:
+            raise ValueError("At least one target model is required.")
+        selected_designer = designer_model or role_plan.test_designer_model
+        selected_evaluator = evaluator_model or role_plan.judge_model
+        generated_count = int(case_count) - len(seeds)
+        budget = _Budget(float(workflow_budget_usd))
+        drafted_examples: list[Example] = []
+        design_notes: list[str] = []
+        suggested_evaluator: dict[str, Any] = dict(evaluator or {})
+
+        if generated_count:
+            self._emit_progress({
+                "event": "suite_design_started",
+                "route": route,
+                "case_count": int(case_count),
+                "workflow_budget_usd": float(workflow_budget_usd),
+                "designer_model": selected_designer,
+            })
+            schema = {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["evaluator", "scenarios", "design_notes"],
+                "properties": {
+                    "evaluator": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": ["type", "reason", "required_keys", "allow_additional_properties", "normalize_rational_strings"],
+                        "properties": {
+                            "type": {"type": "string", "enum": ["semantic", "exact_text", "exact_json"]},
+                            "reason": {"type": "string"},
+                            "required_keys": {"type": "array", "items": {"type": "string"}},
+                            "allow_additional_properties": {"type": "boolean"},
+                            "normalize_rational_strings": {"type": "boolean"},
+                        },
+                    },
+                    "scenarios": {
+                        "type": "array",
+                        "minItems": generated_count,
+                        "maxItems": generated_count,
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "required": ["id", "difficulty", "critical", "turns", "rationale"],
+                            "properties": {
+                                "id": {"type": "string"},
+                                "difficulty": {"type": "string", "enum": ["routine", "complex", "adversarial"]},
+                                "critical": {"type": "boolean"},
+                                "turns": {
+                                    "type": "array",
+                                    "minItems": 1,
+                                    "maxItems": 4,
+                                    "items": {
+                                        "type": "object",
+                                        "additionalProperties": False,
+                                        "required": ["input", "approved_output"],
+                                        "properties": {
+                                            "input": {"type": "string"},
+                                            "approved_output": {"type": "string"},
+                                        },
+                                    },
+                                },
+                                "rationale": {"type": "string"},
+                            },
+                        },
+                    },
+                    "design_notes": {"type": "array", "items": {"type": "string"}},
+                },
+            }
+            payload = {
+                "task": task_text,
+                "current_prompt": prompt_text,
+                "required_new_scenarios": generated_count,
+                "seed_examples": [asdict(item) for item in seeds],
+                "quality_target": quality_threshold,
+            }
+            max_tokens = min(32768, max(4000, generated_count * 500))
+            completion = self.client._call(
+                budget,
+                selected_designer,
+                [
+                    {
+                        "role": "system",
+                        "content": (
+                            "Design a balanced evaluation suite for a recurring production AI task. "
+                            "Create genuinely distinct routine, complex, adversarial, boundary, format, "
+                            "and multi-turn cases where relevant; do not merely paraphrase seeds. Expected "
+                            "outputs describe the desired behavior, not what the current prompt happens to "
+                            "produce. Make each case concrete enough for a human to approve or edit. All "
+                            "cases are drafted before any train/validation/final-test split, so never label "
+                            "or target a split. Recommend exact_text or exact_json only when equivalent "
+                            "answers truly must match that deterministic contract; otherwise use semantic. "
+                            "These are unapproved AI drafts. Return only the required JSON."
+                        ),
+                    },
+                    {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+                ],
+                max_tokens=max_tokens,
+                response_schema=schema,
+            )
+            try:
+                text = str(completion.content).strip()
+                if text.startswith("```"):
+                    text = text.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+                parsed = json.loads(text)
+                scenarios = list(parsed["scenarios"])
+                if len(scenarios) != generated_count:
+                    raise ValueError("wrong scenario count")
+                for index, item in enumerate(scenarios):
+                    drafted_examples.append(Example.from_value(item, len(seeds) + index))
+                    design_notes.append(f"{item.get('id')}: {str(item.get('rationale') or '').strip()}")
+                design_notes.extend(str(item).strip() for item in parsed.get("design_notes", []) if str(item).strip())
+                if not suggested_evaluator:
+                    raw_evaluator = dict(parsed["evaluator"])
+                    suggested_evaluator = {"type": raw_evaluator.get("type", "semantic")}
+                    if suggested_evaluator["type"] == "exact_json":
+                        suggested_evaluator.update({
+                            "required_keys": list(raw_evaluator.get("required_keys") or []),
+                            "allow_additional_properties": bool(raw_evaluator.get("allow_additional_properties", True)),
+                            "normalize_rational_strings": bool(raw_evaluator.get("normalize_rational_strings", False)),
+                        })
+                    design_notes.insert(0, f"Evaluator: {str(raw_evaluator.get('reason') or '').strip()}")
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+                raise ProviderError("The test designer returned an invalid structured suite; no draft was approved.") from error
+
+        all_examples = (*seeds, *drafted_examples)
+        ids = [item.id for item in all_examples]
+        if len(set(ids)) != len(ids):
+            raise ProviderError("The test designer returned duplicate scenario IDs; no draft was approved.")
+        if not suggested_evaluator:
+            suggested_evaluator = {"type": "semantic"}
+        _validate_evaluator_policy(suggested_evaluator)
+        draft = SuiteDraft(
+            name=route,
+            task=task_text,
+            prompt=prompt_text,
+            examples=tuple(all_examples),
+            models=requested_models,
+            designer_model=selected_designer,
+            evaluator_model=selected_evaluator,
+            evaluator=suggested_evaluator,
+            quality_threshold=float(quality_threshold),
+            workflow_budget_usd=float(workflow_budget_usd),
+            designer_spend_usd=round(budget.spent_usd, 10),
+            optimize_prompt=bool(optimize_prompt),
+            holdout_repeats=int(holdout_repeats),
+            design_notes=tuple(design_notes),
+        )
+        if draft.remaining_optimization_budget_usd <= 0:
+            raise BudgetExceeded("Test design consumed the workflow cap before a tournament could run.")
+        self._emit_progress({
+            "event": "suite_design_completed",
+            "route": route,
+            "case_count": len(draft.examples),
+            "designer_spend_usd": draft.designer_spend_usd,
+            "remaining_budget_usd": draft.remaining_optimization_budget_usd,
+            "evidence_provenance": draft.evidence_provenance,
+        })
+        return draft
+
+    def optimize_task(
+        self,
+        *,
+        task: str,
+        prompt: str,
+        case_control: str = "review",
+        **kwargs: Any,
+    ) -> SuiteDraft | OptimizationResult:
+        """Draft a suite for review, or run a clearly labeled AI-only exploratory flow."""
+        if case_control not in {"review", "autopilot"}:
+            raise ValueError("case_control must be 'review' or 'autopilot'.")
+        draft = self.design_suite(task=task, prompt=prompt, **kwargs)
+        if case_control == "review":
+            return draft
+        result = self.run(draft.autopilot_suite())
+        result.regression_suite["designer_spend_usd"] = draft.designer_spend_usd
+        result.regression_suite["tournament_spend_usd"] = result.total_provider_spend_usd
+        result.regression_suite["workflow_budget_usd"] = draft.workflow_budget_usd
+        result.regression_suite["evidence_provenance"] = "AI_GENERATED_AI_JUDGED"
+        result.total_provider_spend_usd = round(
+            draft.designer_spend_usd + result.total_provider_spend_usd, 10
+        )
+        result.warnings.insert(
+            0,
+            "Autopilot used AI-generated cases and AI judging; treat this as directional evidence until a human approves the contract or real feedback reproduces it.",
+        )
+        return result
 
     @property
     def router(self) -> DurableRouter:
@@ -362,7 +828,14 @@ class Evalt:
             optimize_kwargs = suite_or_prompt.optimize_kwargs()
             if self._show_progress or self._progress_callback is not None:
                 optimize_kwargs["progress_callback"] = self._emit_progress
-            return self.client.optimize(**optimize_kwargs)
+            result = self.client.optimize(**optimize_kwargs)
+            result.regression_suite["evidence_provenance"] = suite_or_prompt.evidence_provenance
+            if suite_or_prompt.evidence_provenance == "AI_GENERATED_AI_JUDGED":
+                result.warnings.insert(
+                    0,
+                    "This suite was AI-generated and AI-judged; it is directional evidence, not a human-verified regression contract.",
+                )
+            return result
         if input is None:
             raise ValueError("input is required when executing a prompt through Evalt.")
         if price_usd is not None and budget_usd is not None and float(price_usd) != float(budget_usd):
@@ -474,27 +947,29 @@ class Evalt:
             "effective_price_ceiling_usd": status["effective_price_ceiling_usd"],
             "decision_reason": answer.decision_reason,
             "maintenance_due": list(answer.maintenance_due),
+            "feedback_count": status["feedback_count"],
+            "min_feedback": min_feedback,
         })
-        if auto_maintain and resolved_test_budget_usd > 0 and answer.maintenance_due:
-            if status["feedback_count"] >= min_feedback:
-                self._emit_progress({
-                    "event": "maintenance_started",
-                    "route": route,
-                    "test_budget_usd": resolved_test_budget_usd,
-                })
-                threading.Thread(
-                    target=self._maintain_in_background,
-                    kwargs={
-                        "route": route,
-                        "test_budget_usd": resolved_test_budget_usd,
-                        "role_plan": role_plan,
-                        "objective": objective,
-                        "max_cost_per_run_usd": max_cost_per_run_usd,
-                        "min_feedback": min_feedback,
-                    },
-                    name=f"evalt-maintain-{route}",
-                    daemon=True,
-                ).start()
+
+        def on_feedback(receipt: dict[str, Any]) -> None:
+            self._emit_progress(receipt)
+            if (
+                auto_maintain
+                and receipt.get("is_new")
+                and resolved_test_budget_usd > 0
+                and receipt.get("maintenance_due")
+                and int(receipt.get("feedback_count") or 0) >= min_feedback
+            ):
+                self._start_maintenance(
+                    route=route,
+                    test_budget_usd=resolved_test_budget_usd,
+                    role_plan=role_plan,
+                    objective=objective,
+                    max_cost_per_run_usd=max_cost_per_run_usd,
+                    min_feedback=min_feedback,
+                )
+
+        answer._on_feedback = on_feedback
         return answer
 
     def maintain(self, route: str, *, test_budget_usd: float | None = None, maintenance_budget_usd: float | None = None, role_plan: RolePlan, objective: str = "cheapest_passing", max_cost_per_run_usd: float | None = None, rounds: int = 3, min_feedback: int = 5) -> OptimizationResult | None:

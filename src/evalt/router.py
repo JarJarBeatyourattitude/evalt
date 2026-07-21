@@ -18,7 +18,7 @@ from pathlib import Path
 import sqlite3
 import threading
 import uuid
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from last_good_prompt.core import BudgetExceeded, Client, Completion, Example, OptimizationResult, _Budget
 
@@ -228,16 +228,35 @@ class RoutedAnswer:
     decision_reason: str
     maintenance_due: tuple[str, ...]
     _router: "DurableRouter | None" = None
+    _min_feedback: int = 5
+    _retest_after_calls: int = 500
+    _on_feedback: "Callable[[dict[str, Any]], None] | None" = None
 
     def accept(self) -> None:
         if not self._router:
             raise RuntimeError("This routed answer is detached from its Evalt state.")
-        self._router.record_feedback(self.call_id, approved_output=self.content, verdict="accepted")
+        receipt = self._router.record_feedback(
+            self.call_id,
+            approved_output=self.content,
+            verdict="accepted",
+            min_feedback=self._min_feedback,
+            retest_after_calls=self._retest_after_calls,
+        )
+        if self._on_feedback is not None:
+            self._on_feedback(receipt)
 
     def correct(self, approved_output: Any) -> None:
         if not self._router:
             raise RuntimeError("This routed answer is detached from its Evalt state.")
-        self._router.record_feedback(self.call_id, approved_output=_content(approved_output), verdict="corrected")
+        receipt = self._router.record_feedback(
+            self.call_id,
+            approved_output=_content(approved_output),
+            verdict="corrected",
+            min_feedback=self._min_feedback,
+            retest_after_calls=self._retest_after_calls,
+        )
+        if self._on_feedback is not None:
+            self._on_feedback(receipt)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -386,10 +405,14 @@ class DurableRouter:
                 candidates_changed = json.loads(current["candidates_json"]) != list(candidates)
                 if changed:
                     db.execute(
-                        "UPDATE routes SET prompt=?,source_prompt_version=?,prompt_version=?,candidates_json=?,selected_model=?,selected_prompt=?,decision_reason='prompt_changed_unqualified',catalog_revision=?,updated_at=? WHERE route=?",
+                        "UPDATE routes SET prompt=?,source_prompt_version=?,prompt_version=?,candidates_json=?,selected_model=?,selected_prompt=?,decision_reason='prompt_changed_unqualified',feedback_count=0,last_optimized_feedback=0,last_optimized_calls=total_calls,tested_catalog_revision='',catalog_revision=?,updated_at=? WHERE route=?",
                         (prompt.strip(), version, version, json.dumps(candidates), candidates[0], prompt.strip(), catalog_revision, now, route),
                     )
-                    self._event(db, route, "prompt_changed", {"prompt_version": version, "bootstrap_model": candidates[0]})
+                    self._event(db, route, "prompt_changed", {
+                        "prompt_version": version,
+                        "bootstrap_model": candidates[0],
+                        "evidence_policy": "Prior prompt-version feedback remains in the audit log but cannot qualify the changed prompt.",
+                    })
                 elif candidates_changed or current["catalog_revision"] != catalog_revision:
                     db.execute(
                         "UPDATE routes SET candidates_json=?,catalog_revision=?,updated_at=? WHERE route=?",
@@ -515,9 +538,19 @@ class DurableRouter:
             decision_reason=row["decision_reason"],
             maintenance_due=due,
             _router=self,
+            _min_feedback=min_feedback,
+            _retest_after_calls=retest_after_calls,
         )
 
-    def record_feedback(self, call_id: str, *, approved_output: str, verdict: str) -> None:
+    def record_feedback(
+        self,
+        call_id: str,
+        *,
+        approved_output: str,
+        verdict: str,
+        min_feedback: int = 5,
+        retest_after_calls: int = 500,
+    ) -> dict[str, Any]:
         if verdict not in {"accepted", "corrected"}:
             raise ValueError("verdict must be accepted or corrected.")
         with self._db() as db:
@@ -532,6 +565,22 @@ class DurableRouter:
             if existed is None:
                 db.execute("UPDATE routes SET feedback_count=feedback_count+1,updated_at=? WHERE route=?", (_now(), call["route"]))
             self._event(db, call["route"], "feedback_recorded", {"call_id": call_id, "verdict": verdict})
+            row = db.execute("SELECT * FROM routes WHERE route=?", (call["route"],)).fetchone()
+            return {
+                "event": "feedback_recorded",
+                "route": call["route"],
+                "verdict": verdict,
+                "is_new": existed is None,
+                "feedback_count": int(row["feedback_count"]),
+                "min_feedback": int(min_feedback),
+                "maintenance_due": list(
+                    self._due(
+                        row,
+                        retest_after_calls=retest_after_calls,
+                        min_feedback=min_feedback,
+                    )
+                ),
+            }
 
     def maintain(
         self,
@@ -554,8 +603,8 @@ class DurableRouter:
                 if row is None:
                     raise KeyError(f"Unknown Evalt route {route!r}.")
                 feedback = db.execute(
-                    "SELECT calls.input_text,calls.output_text,feedback.approved_output,feedback.verdict FROM feedback JOIN calls USING(call_id) WHERE feedback.route=? ORDER BY feedback.created_at",
-                    (route,),
+                    "SELECT calls.input_text,calls.output_text,feedback.approved_output,feedback.verdict FROM feedback JOIN calls USING(call_id) WHERE feedback.route=? AND calls.prompt_version=? ORDER BY feedback.created_at",
+                    (route, row["source_prompt_version"]),
                 ).fetchall()
             if len(feedback) < min_feedback:
                 return None
@@ -685,6 +734,11 @@ class DurableRouter:
             "selected_model": row["selected_model"],
             "selected_prompt_version": row["prompt_version"],
             "decision_reason": row["decision_reason"],
+            "route_phase": (
+                "qualified"
+                if str(row["decision_reason"]).startswith("qualified_")
+                else "untested_bootstrap"
+            ),
             "price_usd": (
                 row["max_cost_per_run_usd"]
                 if row["price_policy"] == "explicit" else None
@@ -700,6 +754,9 @@ class DurableRouter:
             "optimize_prompt": bool(row["optimize_prompt"]),
             "total_calls": row["total_calls"],
             "feedback_count": row["feedback_count"],
+            "feedback_needed_for_first_test": max(
+                0, int(min_feedback) - int(row["feedback_count"])
+            ),
             "maintenance_due": list(self._due(row, retest_after_calls=retest_after_calls, min_feedback=min_feedback)),
             "catalog_revision": row["catalog_revision"],
             "tested_catalog_revision": row["tested_catalog_revision"],
