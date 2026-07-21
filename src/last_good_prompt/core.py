@@ -135,7 +135,9 @@ class ModelResult:
     baseline_holdout_execution_pass_rate: float = 0.0
     holdout_pass_rates_by_difficulty: dict[str, float] = field(default_factory=dict)
     passed_difficulty_floors: bool = True
+    prompt_origin: str = "starting_prompt"
     few_shot_example_ids: list[str] = field(default_factory=list)
+    few_shot_provenance: list[dict[str, Any]] = field(default_factory=list)
     cases: list[CaseResult] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
@@ -161,7 +163,9 @@ class OptimizationResult:
     incomplete_models: list[dict[str, str]] = field(default_factory=list)
     skipped_budget_models: list[str] = field(default_factory=list)
     pruned_models: list[str] = field(default_factory=list)
+    screening_results: list[dict[str, Any]] = field(default_factory=list)
     winner_scope: str = "Best among every requested target"
+    quality_gate_status: str = "QUALIFIED_ROUTE_SELECTED"
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -242,6 +246,7 @@ class OpenRouterTransport:
         self._reasoning: dict[str, dict[str, Any]] = {}
         self._limits: dict[str, tuple[int | None, int | None]] = {}
         self._providers: dict[str, list[str]] = {}
+        self._provider_route_names: dict[str, dict[str, str]] = {}
         self._catalog_items: list[dict[str, Any]] = []
         self._preferred_max_latency_seconds: float | None = None
         self._provider_sort = "price"
@@ -304,10 +309,20 @@ class OpenRouterTransport:
                     raw = b"".join(chunks)
                 return json.loads(raw.decode("utf-8"))
         except HTTPError as error:
-            detail = _safe_provider_error_detail(
-                error.read().decode("utf-8", errors="replace")
-            )
-            raise ProviderError(f"OpenRouter returned HTTP {error.code}: {detail}") from error
+            raw_detail = error.read().decode("utf-8", errors="replace")
+            detail = _safe_provider_error_detail(raw_detail)
+            provider_error = ProviderError(f"OpenRouter returned HTTP {error.code}: {detail}")
+            provider_error.status_code = int(error.code)
+            try:
+                payload = json.loads(raw_detail)
+                provider_error.provider_name = str(
+                    ((payload.get("error") or {}).get("metadata") or {}).get("provider_name")
+                    or payload.get("provider")
+                    or ""
+                )
+            except (TypeError, ValueError, json.JSONDecodeError):
+                provider_error.provider_name = ""
+            raise provider_error from error
         except (URLError, TimeoutError, json.JSONDecodeError) as error:
             raise ProviderError(f"OpenRouter request failed: {error}") from error
 
@@ -340,6 +355,7 @@ class OpenRouterTransport:
         self._reasoning = {}
         self._limits = {}
         self._providers = {}
+        self._provider_route_names = {}
         for item in payload.get("data", []):
             pricing = item.get("pricing") or {}
             try:
@@ -368,13 +384,34 @@ class OpenRouterTransport:
                 except (TypeError, ValueError):
                     preferred_capacity = 131072
                 capacity_eligible = [value for value in endpoints if endpoint_capacity(value) >= preferred_capacity]
+
+                def endpoint_contract_score(value: dict[str, Any]) -> int:
+                    parameters = {str(item) for item in value.get("supported_parameters") or []}
+                    # Structured output prevents correct answers from failing an
+                    # exact-JSON task merely because a provider wrapped them in
+                    # prose. Adjustable reasoning is the next most useful search
+                    # lever. Prefer the strongest executable contract first, then
+                    # choose the cheapest route that provides it.
+                    return (
+                        2 * int(bool({"structured_outputs", "response_format"} & parameters))
+                        + int(bool({"reasoning", "reasoning_effort"} & parameters))
+                    )
+
                 if capacity_eligible:
-                    provider_pool = sorted(capacity_eligible, key=endpoint_price)
+                    best_contract = max(endpoint_contract_score(value) for value in capacity_eligible)
+                    provider_pool = sorted(
+                        (value for value in capacity_eligible if endpoint_contract_score(value) == best_contract),
+                        key=endpoint_price,
+                    )
                     endpoint = provider_pool[0]
                 elif endpoints:
                     maximum_capacity = max(endpoint_capacity(value) for value in endpoints)
+                    maximum_capacity_pool = [
+                        value for value in endpoints if endpoint_capacity(value) == maximum_capacity
+                    ]
+                    best_contract = max(endpoint_contract_score(value) for value in maximum_capacity_pool)
                     provider_pool = sorted(
-                        (value for value in endpoints if endpoint_capacity(value) == maximum_capacity),
+                        (value for value in maximum_capacity_pool if endpoint_contract_score(value) == best_contract),
                         key=endpoint_price,
                     )
                     endpoint = provider_pool[0]
@@ -407,6 +444,10 @@ class OpenRouterTransport:
                 provider_tags = [str(value["tag"]) for value in provider_pool if value.get("tag")]
                 if provider_tags:
                     self._providers[model_id] = provider_tags[:3]
+                    self._provider_route_names[model_id] = {
+                        str(value["tag"]): str(value.get("provider_name") or "")
+                        for value in provider_pool[:3] if value.get("tag")
+                    }
                 intelligence = ((item.get("benchmarks") or {}).get("artificial_analysis") or {}).get("intelligence_index")
                 try:
                     intelligence = float(intelligence) if intelligence is not None else None
@@ -420,6 +461,7 @@ class OpenRouterTransport:
                     "reasoning": item.get("reasoning") or {},
                     "context_length": context_limit,
                     "max_completion_tokens": completion_limit,
+                    "private_provider_routes": len(provider_tags),
                 })
             except (KeyError, TypeError, ValueError):
                 continue
@@ -561,36 +603,83 @@ class OpenRouterTransport:
                 },
             }
         started = time.monotonic()
-        payload = self._request(OPENROUTER_CHAT_URL, body)
-        try:
-            choice = payload["choices"][0]
-            content = (choice.get("message") or {}).get("content")
-            usage = payload.get("usage") or {}
-            billed_cost = float(usage.get("cost") or 0)
-            if content is None or not str(content).strip() or choice.get("finish_reason") == "length":
+        fallback_spend_usd = 0.0
+        while True:
+            try:
+                payload = self._request(OPENROUTER_CHAT_URL, body)
+            except ProviderError as error:
+                failed_provider = str(getattr(error, "provider_name", "") or "")
+                route_names = self._provider_route_names.get(model, {})
+                current_routes = list(body["provider"].get("only") or [])
+                remaining_routes = [
+                    tag for tag in current_routes
+                    if not failed_provider or route_names.get(tag) != failed_provider
+                ]
+                if (
+                    getattr(error, "status_code", None) != 429
+                    or not failed_provider
+                    or not remaining_routes
+                    or remaining_routes == current_routes
+                ):
+                    raise
+                # OpenRouter can surface one provider's 429 even with fallbacks
+                # enabled. Retry the same model/configuration against the already
+                # preflighted remaining private routes, never against a new model.
+                body["provider"]["only"] = remaining_routes
+                body["provider"]["allow_fallbacks"] = len(remaining_routes) > 1
+                continue
+            try:
+                choice = payload["choices"][0]
+                content = (choice.get("message") or {}).get("content")
+                usage = payload.get("usage") or {}
+                billed_cost = float(usage.get("cost") or 0)
                 if choice.get("finish_reason") == "length":
                     error = ProviderError("OpenRouter reached the response limit before finishing.")
                     error.code = "PROVIDER_TRUNCATED"
                     expanded = self._bounded_output_tokens(model, messages, 131072, reasoning_effort)
                     error.retry_with_more_tokens = expanded > max_tokens
-                else:
+                    error.cost_usd = fallback_spend_usd + billed_cost
+                    error.generation_id = str(payload.get("id") or "")
+                    raise error
+                if content is None or not str(content).strip():
+                    # An empty answer is not evidence that more output allowance is
+                    # needed. If OpenRouter identifies the serving provider, move to
+                    # another already-preflighted compatible route at the same token
+                    # ceiling. Preserve the failed route's reported cost.
+                    failed_provider = str(payload.get("provider") or "")
+                    route_names = self._provider_route_names.get(model, {})
+                    current_routes = list(body["provider"].get("only") or [])
+                    remaining_routes = [
+                        tag for tag in current_routes
+                        if not failed_provider
+                        or (
+                            tag.casefold() != failed_provider.casefold()
+                            and route_names.get(tag, "").casefold() != failed_provider.casefold()
+                        )
+                    ]
+                    if failed_provider and remaining_routes and remaining_routes != current_routes:
+                        fallback_spend_usd += billed_cost
+                        body["provider"]["only"] = remaining_routes
+                        body["provider"]["allow_fallbacks"] = len(remaining_routes) > 1
+                        continue
                     error = ProviderError("OpenRouter returned an empty completion for this model configuration.")
                     error.code = "PROVIDER_EMPTY"
-                error.cost_usd = billed_cost
-                error.generation_id = str(payload.get("id") or "")
-                raise error
-            return Completion(
-                content=str(content),
-                model=configuration,
-                generation_id=str(payload.get("id") or ""),
-                cost_usd=billed_cost,
-                prompt_tokens=int(usage.get("prompt_tokens") or 0),
-                completion_tokens=int(usage.get("completion_tokens") or 0),
-                latency_ms=round((time.monotonic() - started) * 1000),
-            )
-        except (KeyError, IndexError, TypeError, ValueError) as error:
-            detail = _safe_provider_error_detail(json.dumps(payload, ensure_ascii=False))
-            raise ProviderError(f"OpenRouter returned an invalid completion payload: {detail}") from error
+                    error.retry_with_more_tokens = False
+                    error.cost_usd = fallback_spend_usd + billed_cost
+                    error.generation_id = str(payload.get("id") or "")
+                    raise error
+                return Completion(
+                    content=str(content),
+                    model=configuration,
+                    generation_id=str(payload.get("id") or ""),
+                    cost_usd=fallback_spend_usd + billed_cost,
+                    prompt_tokens=int(usage.get("prompt_tokens") or 0),
+                    completion_tokens=int(usage.get("completion_tokens") or 0),
+                    latency_ms=round((time.monotonic() - started) * 1000),
+                )
+            except (KeyError, IndexError, TypeError, ValueError) as error:
+                detail = _safe_provider_error_detail(json.dumps(payload, ensure_ascii=False))
+                raise ProviderError(f"OpenRouter returned an invalid completion payload: {detail}") from error
 
     @staticmethod
     def _split_configuration(configuration: str) -> tuple[str, str]:
@@ -647,30 +736,42 @@ class _Budget:
         self.spent_usd = 0.0
         self.reserved_usd = 0.0
         self._lock = threading.Lock()
+        self._condition = threading.Condition(self._lock)
 
     def authorize(self, estimate_usd: float) -> None:
         estimate = float(estimate_usd)
-        with self._lock:
-            if estimate < 0 or self.spent_usd + self.reserved_usd + estimate > self.limit_usd + 1e-12:
-                raise BudgetExceeded(
-                    f"The next estimated call would exceed the ${self.limit_usd:.4f} cap."
-                )
+        with self._condition:
+            if estimate < 0:
+                raise BudgetExceeded("A provider-cost estimate cannot be negative.")
+            # Parallel calls reserve their worst-case completion allowance. A lane
+            # that would fit after an in-flight reservation settles must wait, not
+            # become a false budget failure. Once no reservation can free enough
+            # room, the hard cap still fails closed before another provider call.
+            while self.spent_usd + self.reserved_usd + estimate > self.limit_usd + 1e-12:
+                if self.reserved_usd <= 1e-12:
+                    raise BudgetExceeded(
+                        f"The next estimated call would exceed the ${self.limit_usd:.4f} cap."
+                    )
+                self._condition.wait()
             self.reserved_usd += estimate
 
     def commit(self, actual_usd: float, reserved_estimate_usd: float = 0.0) -> None:
         actual = max(0.0, float(actual_usd))
         reserved = max(0.0, float(reserved_estimate_usd))
-        with self._lock:
+        with self._condition:
             self.reserved_usd = max(0.0, self.reserved_usd - reserved)
-            if self.spent_usd + self.reserved_usd + actual > self.limit_usd + 1e-12:
+            self.spent_usd += actual
+            exceeded = self.spent_usd + self.reserved_usd > self.limit_usd + 1e-12
+            self._condition.notify_all()
+            if exceeded:
                 raise BudgetExceeded(
                     "The provider-reported cost exceeded the customer-approved hard cap."
                 )
-            self.spent_usd += actual
 
     def release(self, reserved_estimate_usd: float) -> None:
-        with self._lock:
+        with self._condition:
             self.reserved_usd = max(0.0, self.reserved_usd - max(0.0, float(reserved_estimate_usd)))
+            self._condition.notify_all()
 
 
 class _BudgetScope:
@@ -736,9 +837,7 @@ class Client:
                     budget.commit(billed_cost, estimate)
                 else:
                     budget.release(estimate)
-                if output_expansion_attempt == 0 and getattr(error, "code", "") in {
-                    "PROVIDER_EMPTY", "PROVIDER_TRUNCATED",
-                } and getattr(error, "retry_with_more_tokens", True):
+                if output_expansion_attempt == 0 and getattr(error, "code", "") == "PROVIDER_TRUNCATED" and getattr(error, "retry_with_more_tokens", True):
                     continue
                 raise
             except Exception:
@@ -784,6 +883,7 @@ class Client:
         quality_threshold: float = 0.95,
         max_optimization_cost_usd: float = 2.00,
         rounds: int = 3,
+        optimize_prompt: bool = True,
         minimum_meaningful_quality_gain: float = 0.03,
         allow_few_shot: bool = True,
         max_few_shot_examples: int = 3,
@@ -855,6 +955,11 @@ class Client:
         incomplete_models = []
         skipped_budget_models = []
         pruned_models = []
+        screening_results: list[dict[str, Any]] = []
+        screening_cases_by_model: dict[str, list[CaseResult]] = {}
+        seed_prompt_by_model: dict[str, str] = {}
+        seed_few_shot_ids_by_model: dict[str, list[str]] = {}
+        prompt_origin_by_model: dict[str, str] = {}
         omitted_configurations = []
         progress_lock = threading.Lock()
 
@@ -868,8 +973,17 @@ class Client:
                 progress_callback(dict(event))
 
         catalog_loader = getattr(self.transport, "model_catalog", None)
+        catalog_snapshot: list[dict[str, Any]] = []
         if callable(catalog_loader) and model_list:
-            catalog_loader()
+            catalog_snapshot = list(catalog_loader() or [])
+        catalog_intelligence: dict[str, float] = {}
+        for catalog_item in catalog_snapshot:
+            try:
+                intelligence = catalog_item.get("intelligence")
+                if intelligence is not None:
+                    catalog_intelligence[str(catalog_item["id"])] = float(intelligence)
+            except (KeyError, TypeError, ValueError):
+                continue
         support_checker = getattr(self.transport, "configuration_support", None)
         if callable(support_checker):
             eligible_models: list[str] = []
@@ -919,10 +1033,16 @@ class Client:
             model_budget = _BudgetScope(budget)
             return self._evaluate_model(
                 prompt_text, train, dev, holdout, model, optimizer_model,
-                evaluator_model, quality_threshold, model_budget, rounds, allow_few_shot,
+                evaluator_model, quality_threshold, model_budget, rounds,
+                bool(allow_few_shot and optimize_prompt),
                 max_few_shot_examples, representative_input_chars,
                 representative_output_tokens, int(holdout_repeats), evaluator_policy,
                 difficulty_floor_policy, int(max_parallel_scenarios),
+                baseline_dev_cases=screening_cases_by_model.get(model),
+                seed_prompt=seed_prompt_by_model.get(model),
+                seed_few_shot_ids=seed_few_shot_ids_by_model.get(model),
+                prompt_origin=prompt_origin_by_model.get(model, "starting_prompt"),
+                optimize_prompt=bool(optimize_prompt),
             )
 
         def run_batch(configurations: list[str]) -> list[ModelResult]:
@@ -977,6 +1097,56 @@ class Client:
                         emit_progress({"event": "model_unavailable", "model": model, "reason": str(error)})
             return [completed[model] for model in configurations if model in completed]
 
+        def screen_model(model: str) -> dict[str, Any]:
+            emit_progress({
+                "event": "model_screen_started", "model": model,
+                "screening_scenarios": len(dev),
+                "elapsed_seconds": round(time.monotonic() - optimization_started, 3),
+            })
+            model_budget = _BudgetScope(budget)
+            cases = self._run_cases(
+                prompt_text, "screening-baseline", dev, "dev", model,
+                evaluator_model, model_budget, evaluator=evaluator_policy,
+                max_parallel_scenarios=int(max_parallel_scenarios),
+            )
+            screening_cases_by_model[model] = cases
+            costs = sorted(case.target_cost_usd for case in cases if case.target_cost_usd > 0)
+            estimated_cost = (
+                costs[max(0, min(len(costs) - 1, math.ceil(len(costs) * 0.90) - 1))]
+                if costs else float("inf")
+            )
+            latencies = [case.target_latency_ms for case in cases if case.target_latency_ms > 0]
+            result = {
+                "model": model,
+                "validation_pass_rate": round(_scenario_pass_rate(cases), 6),
+                "validation_scenarios": len(dev),
+                "estimated_production_cost_per_call_usd": round(estimated_cost, 10),
+                "screening_spend_usd": round(model_budget.spent_usd, 10),
+                "target_latency_p90_ms": round(_percentile(latencies, 0.90)) if latencies else 0,
+                "status": "SCREENED",
+            }
+            emit_progress({
+                "event": "model_screen_completed", **result,
+                "elapsed_seconds": round(time.monotonic() - optimization_started, 3),
+            })
+            return result
+
+        def run_screening(configurations: list[str]) -> list[dict[str, Any]]:
+            completed: dict[str, dict[str, Any]] = {}
+            with ThreadPoolExecutor(max_workers=min(int(max_parallel_models), len(configurations))) as pool:
+                futures = {pool.submit(screen_model, model): model for model in configurations}
+                for future in as_completed(futures):
+                    model = futures[future]
+                    try:
+                        completed[model] = future.result()
+                    except BudgetExceeded as error:
+                        incomplete_models.append({"model": model, "reason": str(error), "stage": "screening"})
+                        emit_progress({"event": "model_incomplete", "model": model, "reason": str(error)})
+                    except ProviderError as error:
+                        unavailable_models.append({"model": model, "reason": str(error), "stage": "screening"})
+                        emit_progress({"event": "model_unavailable", "model": model, "reason": str(error)})
+            return [completed[model] for model in configurations if model in completed]
+
         if adaptive_search:
             sizing_input = representative_input_chars or max(
                 1, int(_percentile([len(item.input) for item in example_list], 0.90))
@@ -1003,20 +1173,297 @@ class Client:
                 ),
             )
             results = []
-            # Keep the final frontier candidate as a rescue when a cheaper wave already
-            # clears the bar. Realistic eight-model defaults still launch seven lanes at
-            # once, while avoiding an unnecessary expensive call on an easy task.
-            broad_wave_size = max(1, min(len(ordered_broad) - 1 or 1, int(max_parallel_models)))
-            stop_after_first_pass = objective in {
-                "cheapest_passing", "cheapest_at_accuracy", "constrained",
-                "match_baseline_at_lowest_cost",
-            }
-            for wave_start in range(0, len(ordered_broad), broad_wave_size):
-                wave = ordered_broad[wave_start : wave_start + broad_wave_size]
-                results.extend(run_batch(wave))
-                if stop_after_first_pass and any(item.passed_quality_floor for item in results):
-                    pruned_models.extend(ordered_broad[wave_start + broad_wave_size :])
-                    break
+            if len(ordered_broad) > 4 and len(dev) >= 3:
+                screening_results.extend(run_screening(ordered_broad))
+                if not screening_results:
+                    raise ProviderError("No broad model completed the validation screening stage.")
+                # Screening is deliberately broad and cheap. Full prompt search plus
+                # repeated final testing is deeper, but it must not collapse to a
+                # single completed route merely because two initially selected
+                # providers fail. Aim for roughly 1.5*sqrt(N) fully settled routes,
+                # with a floor of four, and backfill failures from the measured
+                # screening frontier until that target is actually complete.
+                full_limit = min(
+                    len(screening_results),
+                    max(4, math.ceil(1.5 * math.sqrt(len(screening_results)))),
+                )
+                ranked_quality = sorted(
+                    screening_results,
+                    key=lambda item: (
+                        -float(item["validation_pass_rate"]),
+                        float(item["estimated_production_cost_per_call_usd"]),
+                        str(item["model"]),
+                    ),
+                )
+                measured_frontier = [
+                    item for item in screening_results
+                    if not any(
+                        other["model"] != item["model"]
+                        and float(other["validation_pass_rate"]) >= float(item["validation_pass_rate"])
+                        and float(other["estimated_production_cost_per_call_usd"])
+                        <= float(item["estimated_production_cost_per_call_usd"])
+                        and (
+                            float(other["validation_pass_rate"]) > float(item["validation_pass_rate"])
+                            or float(other["estimated_production_cost_per_call_usd"])
+                            < float(item["estimated_production_cost_per_call_usd"])
+                        )
+                        for other in screening_results
+                    )
+                ]
+                measured_frontier.sort(
+                    key=lambda item: (
+                        -float(item["validation_pass_rate"]),
+                        float(item["estimated_production_cost_per_call_usd"]),
+                    )
+                )
+                full_priority: list[str] = []
+                intelligence_anchor_model: str | None = None
+
+                def prioritize(model: str) -> None:
+                    if model not in full_priority:
+                        full_priority.append(model)
+
+                if incumbent_model and any(item["model"] == incumbent_model for item in screening_results):
+                    prioritize(incumbent_model)
+                # When every original-prompt screen is below the quality gate,
+                # preserve one intelligence anchor from the requested field. A
+                # weak prompt can flatten cheap-model scores; the anchor gives the
+                # optimizer one capable lane on which to learn a prompt package
+                # that can then be propagated back down the cost frontier.
+                if max(float(item["validation_pass_rate"]) for item in screening_results) < quality_threshold:
+                    anchor_candidates = [
+                        item for item in screening_results
+                        if item["model"].split("#reasoning=", 1)[0] in catalog_intelligence
+                    ]
+                    if anchor_candidates:
+                        anchor = max(
+                            anchor_candidates,
+                            key=lambda item: (
+                                catalog_intelligence[item["model"].split("#reasoning=", 1)[0]],
+                                -float(item["estimated_production_cost_per_call_usd"]),
+                            ),
+                        )
+                        intelligence_anchor_model = str(anchor["model"])
+                        prioritize(intelligence_anchor_model)
+                for item in measured_frontier:
+                    prioritize(str(item["model"]))
+                for item in ranked_quality[:3]:
+                    prioritize(str(item["model"]))
+                prioritize(str(min(
+                    screening_results,
+                    key=lambda item: (
+                        float(item["estimated_production_cost_per_call_usd"]),
+                        -float(item["validation_pass_rate"]),
+                    ),
+                )["model"]))
+                for item in ranked_quality:
+                    prioritize(str(item["model"]))
+
+                attempted_for_full: list[str] = []
+                full_results: list[ModelResult] = []
+                # Screening remains maximally parallel, but if every starting-
+                # prompt score is weak, protect the one deliberately selected
+                # intelligence anchor from shared-budget starvation. Once that
+                # lane settles, the rest of the measured frontier runs in
+                # parallel and can inherit any prompt package it discovers.
+                if intelligence_anchor_model is not None:
+                    attempted_for_full.append(intelligence_anchor_model)
+                    full_results.extend(run_batch([intelligence_anchor_model]))
+                while len(full_results) < full_limit:
+                    remaining = [model for model in full_priority if model not in attempted_for_full]
+                    if not remaining:
+                        break
+                    needed = max(1, full_limit - len(full_results))
+                    wave = remaining[:needed]
+                    attempted_for_full.extend(wave)
+                    full_results.extend(run_batch(wave))
+                results.extend(full_results)
+
+                # A weak starting prompt can make a capable cheap model look bad in
+                # the first screen. Re-test the not-yet-deep models with up to two
+                # successful prompt packages learned strictly from training cases.
+                # Validation may promote that package; final-test answers remain
+                # untouched until the model receives its full evaluation.
+                rewrite_packages: list[tuple[str, list[str], str]] = []
+                seen_packages: set[tuple[str, tuple[str, ...]]] = set()
+                for source in sorted(
+                    full_results,
+                    key=lambda item: (
+                        0 if item.passed_quality_floor else 1,
+                        -item.selected_pass_rate,
+                        item.estimated_production_cost_per_call_usd,
+                    ),
+                ):
+                    package_key = (
+                        source.selected_prompt,
+                        tuple(source.few_shot_example_ids),
+                    )
+                    if (
+                        package_key in seen_packages
+                        or (
+                            source.selected_prompt == prompt_text
+                            and not source.few_shot_example_ids
+                        )
+                    ):
+                        continue
+                    seen_packages.add(package_key)
+                    rewrite_packages.append(
+                        (
+                            source.selected_prompt,
+                            list(source.few_shot_example_ids),
+                            source.model,
+                        )
+                    )
+                    if len(rewrite_packages) >= 2:
+                        break
+
+                propagation_candidates = [
+                    str(item["model"]) for item in screening_results
+                    if item["model"] not in attempted_for_full
+                ]
+                propagation_by_model: dict[str, dict[str, Any]] = {}
+
+                def screen_propagated(model: str) -> dict[str, Any]:
+                    emit_progress({
+                        "event": "prompt_propagation_started",
+                        "model": model,
+                        "candidate_prompt_packages": len(rewrite_packages),
+                        "elapsed_seconds": round(time.monotonic() - optimization_started, 3),
+                    })
+                    model_budget = _BudgetScope(budget)
+                    best: dict[str, Any] | None = None
+                    for propagated_prompt, few_shot_ids, source_model in rewrite_packages:
+                        cases = self._run_cases(
+                            propagated_prompt,
+                            "propagated-screen",
+                            dev,
+                            "dev",
+                            model,
+                            evaluator_model,
+                            model_budget,
+                            train,
+                            few_shot_ids,
+                            evaluator=evaluator_policy,
+                            max_parallel_scenarios=int(max_parallel_scenarios),
+                        )
+                        candidate = {
+                            "model": model,
+                            "validation_pass_rate": round(_scenario_pass_rate(cases), 6),
+                            "cases": cases,
+                            "prompt": propagated_prompt,
+                            "few_shot_example_ids": list(few_shot_ids),
+                            "source_model": source_model,
+                        }
+                        if best is None or (
+                            float(candidate["validation_pass_rate"]),
+                            -len(propagated_prompt),
+                        ) > (
+                            float(best["validation_pass_rate"]),
+                            -len(str(best["prompt"])),
+                        ):
+                            best = candidate
+                        if candidate["validation_pass_rate"] >= quality_threshold:
+                            break
+                    if best is None:
+                        raise ProviderError("No successful prompt package was available to propagate.")
+                    best["propagation_spend_usd"] = round(model_budget.spent_usd, 10)
+                    emit_progress({
+                        "event": "prompt_propagation_completed",
+                        "model": model,
+                        "source_model": best["source_model"],
+                        "validation_pass_rate": best["validation_pass_rate"],
+                        "few_shot_example_ids": best["few_shot_example_ids"],
+                        "elapsed_seconds": round(time.monotonic() - optimization_started, 3),
+                    })
+                    return best
+
+                if optimize_prompt and rewrite_packages and propagation_candidates:
+                    with ThreadPoolExecutor(
+                        max_workers=min(int(max_parallel_models), len(propagation_candidates))
+                    ) as pool:
+                        futures = {
+                            pool.submit(screen_propagated, model): model
+                            for model in propagation_candidates
+                        }
+                        for future in as_completed(futures):
+                            model = futures[future]
+                            try:
+                                propagation_by_model[model] = future.result()
+                            except BudgetExceeded as error:
+                                incomplete_models.append({
+                                    "model": model,
+                                    "reason": str(error),
+                                    "stage": "prompt_propagation",
+                                })
+                            except ProviderError as error:
+                                unavailable_models.append({
+                                    "model": model,
+                                    "reason": str(error),
+                                    "stage": "prompt_propagation",
+                                })
+
+                propagated_for_full = [
+                    model for model in propagation_candidates
+                    if model in propagation_by_model
+                    and float(propagation_by_model[model]["validation_pass_rate"])
+                    >= quality_threshold
+                ]
+                for model in propagated_for_full:
+                    package = propagation_by_model[model]
+                    seed_prompt_by_model[model] = str(package["prompt"])
+                    seed_few_shot_ids_by_model[model] = list(
+                        package["few_shot_example_ids"]
+                    )
+                    screening_cases_by_model[model] = list(package["cases"])
+                    prompt_origin_by_model[model] = (
+                        f"propagated_from:{package['source_model']}"
+                    )
+                if propagated_for_full:
+                    attempted_for_full.extend(propagated_for_full)
+                    results.extend(run_batch(propagated_for_full))
+
+                screened_out = [
+                    str(item["model"]) for item in screening_results
+                    if item["model"] not in attempted_for_full
+                ]
+                pruned_models.extend(screened_out)
+                attempted_set = set(attempted_for_full)
+                for item in screening_results:
+                    propagation = propagation_by_model.get(str(item["model"]))
+                    if propagation:
+                        item["propagated_prompt_validation_pass_rate"] = propagation[
+                            "validation_pass_rate"
+                        ]
+                        item["propagated_from_model"] = propagation["source_model"]
+                        item["propagation_spend_usd"] = propagation[
+                            "propagation_spend_usd"
+                        ]
+                    item["status"] = (
+                        "FULL_PROPAGATED"
+                        if item["model"] in prompt_origin_by_model
+                        else "FULL"
+                        if item["model"] in attempted_set
+                        else "PRUNED"
+                    )
+                for model in screened_out:
+                    emit_progress({
+                        "event": "model_pruned", "model": model,
+                        "reason": "Validation screening did not earn a full prompt-search and final-test run.",
+                    })
+            else:
+                broad_wave_size = max(
+                    1, min(len(ordered_broad) - 1 or 1, int(max_parallel_models))
+                )
+                stop_after_first_pass = objective in {
+                    "cheapest_passing", "cheapest_at_accuracy", "constrained",
+                    "match_baseline_at_lowest_cost",
+                }
+                for wave_start in range(0, len(ordered_broad), broad_wave_size):
+                    wave = ordered_broad[wave_start : wave_start + broad_wave_size]
+                    results.extend(run_batch(wave))
+                    if stop_after_first_pass and any(item.passed_quality_floor for item in results):
+                        pruned_models.extend(ordered_broad[wave_start + broad_wave_size :])
+                        break
             passing_broad = [item for item in results if item.passed_quality_floor]
             if passing_broad:
                 cheapest_pass_cost = min(item.estimated_production_cost_per_call_usd for item in passing_broad)
@@ -1040,6 +1487,37 @@ class Client:
                 if model.split("#reasoning=", 1)[0] in hone_base_models
             ]
             pruned_models.extend(model for model in hone_models if model not in eligible_hone)
+            # Reasoning effort should be the lever under test, not a hidden change
+            # to the prompt package. Seed each hone configuration from the cheapest
+            # passing result for the same base model (or the cheapest global passing
+            # package when needed). It may still rewrite if training/validation says
+            # the shared package is inadequate, and every variant still faces the
+            # untouched final test.
+            passing_packages = sorted(
+                (item for item in results if item.passed_quality_floor),
+                key=lambda item: (
+                    item.estimated_production_cost_per_call_usd,
+                    item.model,
+                ),
+            )
+            for model in eligible_hone:
+                base_model = model.split("#reasoning=", 1)[0]
+                source = next(
+                    (
+                        item for item in passing_packages
+                        if item.model.split("#reasoning=", 1)[0] == base_model
+                    ),
+                    passing_packages[0] if passing_packages else None,
+                )
+                if source is None:
+                    continue
+                seed_prompt_by_model[model] = source.selected_prompt
+                seed_few_shot_ids_by_model[model] = list(
+                    source.few_shot_example_ids
+                )
+                prompt_origin_by_model[model] = (
+                    f"reasoning_hone_from:{source.model}"
+                )
             results.extend(run_batch(eligible_hone))
         else:
             results = run_batch(model_list)
@@ -1152,16 +1630,19 @@ class Client:
             "starting_prompt": prompt_text,
             "winning_prompt": winner.selected_prompt,
             "winning_few_shot_example_ids": winner.few_shot_example_ids,
+            "winning_few_shot_provenance": winner.few_shot_provenance,
             "examples": [asdict(item) for item in example_list],
-            "incumbent_model": winner.model,
+            "selected_model": winner.model,
             "known_models": model_list,
             "optimizer_model": optimizer_model,
             "evaluator_model": evaluator_model,
             "evaluator": evaluator_policy,
             "difficulty_thresholds": difficulty_floor_policy,
             "quality_threshold": quality_threshold,
-            "incumbent_model": baseline.model,
-            "incumbent_baseline_holdout_pass_rate": baseline.baseline_holdout_pass_rate,
+            "incumbent_model": incumbent_model,
+            "incumbent_baseline_holdout_pass_rate": (
+                baseline.baseline_holdout_pass_rate if incumbent_model else None
+            ),
             "allowed_accuracy_regression": allowed_accuracy_regression,
             "max_cost_per_run_usd": max_cost_per_run_usd,
             "max_p90_latency_seconds": max_p90_latency_seconds,
@@ -1171,6 +1652,7 @@ class Client:
             "holdout_repeats": int(holdout_repeats),
             "holdout_unique_scenarios": len(holdout),
             "minimum_meaningful_quality_gain": minimum_meaningful_quality_gain,
+            "optimize_prompt": bool(optimize_prompt),
             "watch": {
                 "enabled": False,
                 "max_recheck_cost_usd": 0,
@@ -1187,6 +1669,21 @@ class Client:
             "executions_per_final_test_scenario": int(holdout_repeats),
             "evaluator": evaluator_policy,
             "difficulty_thresholds": difficulty_floor_policy,
+            "selection_protocol": {
+                "prompt_modification_enabled": bool(optimize_prompt),
+                "prompt_optimizer_inputs": (
+                    "training split only" if optimize_prompt else "disabled"
+                ),
+                "few_shot_sources": (
+                    "customer-approved training examples only"
+                    if optimize_prompt and allow_few_shot else "disabled"
+                ),
+                "prompt_package_selection": (
+                    "validation split" if optimize_prompt else "fixed supplied prompt"
+                ),
+                "promotion_gate": "untouched final-test split",
+                "final_test_used_for_rewrite_or_selection": False,
+            },
             "configurations": [
                 {
                     "configuration": configuration,
@@ -1221,7 +1718,13 @@ class Client:
             incomplete_models=incomplete_models,
             skipped_budget_models=skipped_budget_models,
             pruned_models=pruned_models,
+            screening_results=screening_results,
             winner_scope="Best among the completed adaptive search band" if pruned_models else "Best among fully completed eligible targets only" if incomplete_models or skipped_budget_models or unavailable_models else "Best among every capability-eligible requested target" if omitted_configurations else "Best among every requested target",
+            quality_gate_status=(
+                "QUALIFIED_ROUTE_SELECTED"
+                if winner.passed_quality_floor and winner.passed_latency_ceiling
+                else "NO_CONFIGURATION_PASSED"
+            ),
         )
 
     @staticmethod
@@ -1286,25 +1789,34 @@ class Client:
         evaluator: dict[str, Any],
         difficulty_thresholds: dict[str, float],
         max_parallel_scenarios: int,
+        baseline_dev_cases: list[CaseResult] | None = None,
+        seed_prompt: str | None = None,
+        seed_few_shot_ids: list[str] | None = None,
+        prompt_origin: str = "starting_prompt",
+        optimize_prompt: bool = True,
     ) -> ModelResult:
         started_spend = budget.spent_usd
+        initial_prompt = seed_prompt or prompt
+        initial_few_shot_ids = list(seed_few_shot_ids or [])
         # Validation remains the selection gate, but a small validation slice can
         # reach 100% by chance while the starting prompt still fails much of the
         # approved training evidence. Always measure both disclosed splits before
         # deciding that prompt learning is unnecessary. The frozen final test is
         # still never used to select or rewrite a prompt.
-        baseline_dev = self._run_cases(
-            prompt, "baseline", dev, "dev", model, evaluator_model, budget,
-            evaluator=evaluator, max_parallel_scenarios=max_parallel_scenarios,
+        baseline_dev = list(baseline_dev_cases) if baseline_dev_cases is not None else self._run_cases(
+            initial_prompt, "baseline", dev, "dev", model, evaluator_model, budget,
+            train, initial_few_shot_ids, evaluator=evaluator,
+            max_parallel_scenarios=max_parallel_scenarios,
         )
         baseline_dev_rate = _pass_rate(baseline_dev)
         baseline_train = self._run_cases(
-            prompt, "baseline", train, "train", model, evaluator_model, budget,
-            evaluator=evaluator, max_parallel_scenarios=max_parallel_scenarios,
+            initial_prompt, "baseline", train, "train", model, evaluator_model, budget,
+            train, initial_few_shot_ids, evaluator=evaluator,
+            max_parallel_scenarios=max_parallel_scenarios,
         )
         baseline_train_rate = _pass_rate(baseline_train)
-        selected_prompt = prompt
-        selected_few_shot_ids: list[str] = []
+        selected_prompt = initial_prompt
+        selected_few_shot_ids: list[str] = initial_few_shot_ids
         selected_train = baseline_train or baseline_dev
         selected_train_rate = baseline_train_rate
         selected_dev = baseline_dev
@@ -1312,7 +1824,7 @@ class Client:
         candidate_cases: list[CaseResult] = []
         for round_number in (
             range(1, int(rounds) + 1)
-            if selected_rate < 1 or selected_train_rate < 1
+            if optimize_prompt and (selected_rate < 1 or selected_train_rate < 1)
             else ()
         ):
             revised_prompt, revised_few_shot_ids = self._propose_prompt(
@@ -1361,7 +1873,11 @@ class Client:
                 selected_rate = revised_rate
             if selected_rate >= 1 and selected_train_rate >= 1:
                 break
-        selected_kind = "baseline" if selected_prompt == prompt else "candidate"
+        selected_kind = (
+            "baseline"
+            if selected_prompt == prompt and not selected_few_shot_ids
+            else "candidate"
+        )
         baseline_holdout = self._run_cases(
             prompt, "baseline", holdout, "holdout", model, evaluator_model, budget,
             repeats=holdout_repeats,
@@ -1413,6 +1929,12 @@ class Client:
         all_cases = baseline_train + baseline_dev + candidate_cases + baseline_holdout
         if selected_holdout is not baseline_holdout:
             all_cases += selected_holdout
+        selected_prompt_origin = (
+            prompt_origin
+            if selected_prompt == initial_prompt
+            and selected_few_shot_ids == initial_few_shot_ids
+            else f"optimized_for:{model}"
+        )
         return ModelResult(
             model=model,
             selected_prompt=selected_prompt,
@@ -1432,7 +1954,18 @@ class Client:
             baseline_holdout_execution_pass_rate=round(_pass_rate(baseline_holdout), 6),
             holdout_pass_rates_by_difficulty=holdout_by_difficulty,
             passed_difficulty_floors=passed_difficulty_floors,
+            prompt_origin=selected_prompt_origin,
             few_shot_example_ids=selected_few_shot_ids,
+            few_shot_provenance=[
+                {
+                    "example_id": example_id,
+                    "source_split": "train",
+                    "customer_approved": True,
+                    "eligible_for_validation_prompt": True,
+                    "eligible_for_final_test_prompt": True,
+                }
+                for example_id in selected_few_shot_ids
+            ],
             cases=all_cases,
         )
 
@@ -1468,6 +2001,11 @@ class Client:
                     target_model,
                     [{"role": "system", "content": prompt}] + demonstrations + transcript + [{"role": "user", "content": turn.input}],
                     max_tokens=target_max_tokens,
+                    response_schema=(
+                        _exact_json_response_schema(turn.approved_output, evaluator_policy)
+                        if evaluator_policy["type"] == "exact_json"
+                        else None
+                    ),
                 )
                 transcript += [{"role": "user", "content": turn.input}, {"role": "assistant", "content": target.content}]
                 judgment, judge_completion = self._judge(example, turn, turn_index, transcript, target.content, evaluator_model, budget, evaluator_policy)
@@ -1624,6 +2162,12 @@ class Client:
                         "every approved training scenario and every observed failure. Preserve every "
                         "label-changing boundary, exception, precedence rule, output constraint, and "
                         "multi-turn dependency; do not collapse cases with different approved behavior. "
+                        "The production model will receive only the proposed system prompt, any selected "
+                        "few-shot demonstrations, the current conversation transcript, and the new user "
+                        "message. Make the package self-contained: never refer to a supplied policy, "
+                        "training set, approved answer, test, or instruction that will not actually be "
+                        "present at production time. Generalize rules from training evidence instead of "
+                        "copying validation-specific wording. "
                         "Mentally replay the proposed package against all supplied scenarios. Use only "
                         "allowed IDs; demonstrations add production token cost. Return the package and "
                         "hypothesis as JSON."
@@ -1651,6 +2195,41 @@ def _parse_json_object(value: str) -> dict[str, Any]:
     if text.startswith("```"):
         text = text.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
     return json.loads(text)
+
+
+def _exact_json_response_schema(
+    approved_output: str, evaluator: dict[str, Any]
+) -> dict[str, Any]:
+    """Build a shape-only schema without leaking the approved answer."""
+    expected = _parse_json_object(approved_output)
+    required = list(evaluator.get("required_keys") or expected.keys())
+
+    def shape(value: Any) -> dict[str, Any]:
+        if value is None:
+            return {"type": "null"}
+        if isinstance(value, bool):
+            return {"type": "boolean"}
+        if isinstance(value, int):
+            return {"type": "integer"}
+        if isinstance(value, float):
+            return {"type": "number"}
+        if isinstance(value, list):
+            return {"type": "array", "items": shape(value[0]) if value else {}}
+        if isinstance(value, dict):
+            return {
+                "type": "object",
+                "properties": {str(key): shape(item) for key, item in value.items()},
+                "required": [str(key) for key in value],
+                "additionalProperties": False,
+            }
+        return {"type": "string"}
+
+    return {
+        "type": "object",
+        "properties": {key: shape(expected[key]) for key in required if key in expected},
+        "required": required,
+        "additionalProperties": bool(evaluator.get("allow_additional_properties", True)),
+    }
 
 
 def _validate_evaluator_policy(value: dict[str, Any] | None) -> dict[str, Any]:

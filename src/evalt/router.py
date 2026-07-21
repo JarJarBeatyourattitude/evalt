@@ -102,10 +102,17 @@ def select_role_plan(
                 efforts = ("low", "medium", "high")
             if not reasoning.get("mandatory"):
                 efforts = ("none", *efforts)
+            try:
+                private_provider_routes = max(
+                    0, int(item.get("private_provider_routes") or 0)
+                )
+            except (TypeError, ValueError):
+                private_provider_routes = 0
             normalized.append({
                 "id": model,
                 "intelligence": intelligence,
                 "price": price,
+                "private_provider_routes": private_provider_routes,
                 "reasoning_efforts": tuple(dict.fromkeys(efforts)),
             })
 
@@ -154,6 +161,23 @@ def select_role_plan(
         if item not in selected and len(selected) < breadth:
             selected.append(item)
 
+    bootstrap_pool = [
+        item for item in normalized
+        if item["intelligence"] >= maximum - judge_delta
+    ]
+    bootstrap = min(
+        bootstrap_pool,
+        key=lambda item: (
+            0 if item["private_provider_routes"] >= 2 else 1,
+            item["price"],
+            -item["intelligence"],
+        ),
+    )
+    # The first production call occurs before route-specific feedback can qualify
+    # a winner. Start it on a sufficiently intelligent route with provider
+    # redundancy when available; the fragile absolute-cheapest model remains in
+    # the measured tournament and can still win after evidence.
+    add(bootstrap)
     add(frontier[0])
     add(knee)
     add(strongest)
@@ -187,7 +211,7 @@ def select_role_plan(
         catalog_revision=revision,
         policy=(
             "The smartest role is protected for test design; judging uses the cheapest model above a lower intelligence floor; "
-            "production search starts with one configuration across the price/intelligence frontier, then spends remaining budget "
+            "the unqualified first call starts on a sufficiently intelligent provider-redundant route when available; production search then starts with one configuration across the price/intelligence frontier and spends remaining budget "
             "only on reasoning-effort variants in the task-specific capability band. Route holdouts, never benchmarks, promote the winner."
         ),
     )
@@ -319,6 +343,7 @@ class DurableRouter:
                 ("test_budget_policy", "TEXT NOT NULL DEFAULT 'legacy'"),
                 ("max_p90_latency_seconds", "REAL DEFAULT NULL"),
                 ("latency_value_usd_per_second", "REAL NOT NULL DEFAULT 0"),
+                ("optimize_prompt", "INTEGER NOT NULL DEFAULT 1"),
             ):
                 if name not in columns:
                     db.execute(f"ALTER TABLE routes ADD COLUMN {name} {declaration}")
@@ -393,6 +418,7 @@ class DurableRouter:
         max_tokens: int = 600,
         target_accuracy: float = 0.95,
         objective: str = "best_within_price",
+        optimize_prompt: bool = True,
         test_budget_usd: float = 0.0,
         test_budget_policy: str = "explicit",
         max_p90_latency_seconds: float | None = None,
@@ -421,16 +447,17 @@ class DurableRouter:
             controls = (
                 float(max_cost_per_run_usd), float(test_budget_usd), objective,
                 test_budget_policy, max_p90_latency_seconds,
-                float(latency_value_usd_per_second),
+                float(latency_value_usd_per_second), int(bool(optimize_prompt)),
             )
             previous = (
                 current["max_cost_per_run_usd"], current["test_budget_usd"],
                 current["objective"], current["test_budget_policy"],
                 current["max_p90_latency_seconds"],
                 current["latency_value_usd_per_second"],
+                current["optimize_prompt"],
             )
             db.execute(
-                "UPDATE routes SET quality_threshold=?,max_cost_per_run_usd=?,test_budget_usd=?,objective=?,test_budget_policy=?,max_p90_latency_seconds=?,latency_value_usd_per_second=?,updated_at=? WHERE route=?",
+                "UPDATE routes SET quality_threshold=?,max_cost_per_run_usd=?,test_budget_usd=?,objective=?,test_budget_policy=?,max_p90_latency_seconds=?,latency_value_usd_per_second=?,optimize_prompt=?,updated_at=? WHERE route=?",
                 (float(target_accuracy), *controls, _now(), route),
             )
             if previous != controls:
@@ -442,6 +469,7 @@ class DurableRouter:
                     "objective": objective,
                     "max_p90_latency_seconds": max_p90_latency_seconds,
                     "latency_value_usd_per_second": latency_value_usd_per_second,
+                    "optimize_prompt": bool(optimize_prompt),
                 })
             row = db.execute("SELECT * FROM routes WHERE route=?", (route,)).fetchone()
         set_performance_policy = getattr(self.client.transport, "set_performance_policy", None)
@@ -576,6 +604,7 @@ class DurableRouter:
                 quality_threshold=float(row["quality_threshold"]),
                 max_optimization_cost_usd=remaining_budget,
                 rounds=rounds,
+                optimize_prompt=bool(row["optimize_prompt"]),
                 max_cost_per_run_usd=max_cost_per_run_usd,
                 representative_input_chars=representative_input_chars,
                 representative_output_tokens=representative_output_tokens,
@@ -655,6 +684,7 @@ class DurableRouter:
             "objective": row["objective"],
             "max_p90_latency_seconds": row["max_p90_latency_seconds"],
             "latency_value_usd_per_second": row["latency_value_usd_per_second"],
+            "optimize_prompt": bool(row["optimize_prompt"]),
             "total_calls": row["total_calls"],
             "feedback_count": row["feedback_count"],
             "maintenance_due": list(self._due(row, retest_after_calls=retest_after_calls, min_feedback=min_feedback)),

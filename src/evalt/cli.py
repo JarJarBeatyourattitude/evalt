@@ -31,6 +31,7 @@ STARTER_SUITE = {
     "quality_threshold": 0.95,
     "max_optimization_cost_usd": 2.00,
     "rounds": 3,
+    "optimize_prompt": True,
     "minimum_meaningful_quality_gain": 0.03,
     "allow_few_shot": True,
     "max_few_shot_examples": 3,
@@ -75,6 +76,27 @@ class _CliProgress:
             if kind == "model_started":
                 self.active.add(model)
                 message = f"START  {model}"
+            elif kind == "model_screen_started":
+                self.active.add(model)
+                message = f"SCREEN {model}"
+            elif kind == "model_screen_completed":
+                self.active.discard(model)
+                rate = round(float(event.get("validation_pass_rate", 0)) * 100)
+                p90 = int(event.get("target_latency_p90_ms") or 0)
+                message = f"SCREEN {model}  {rate}% validation  p90 {p90 / 1000:.2f}s"
+            elif kind == "prompt_propagation_started":
+                self.active.add(model)
+                count = int(event.get("candidate_prompt_packages") or 0)
+                message = f"RETEST {model}  {count} learned prompt package(s)"
+            elif kind == "prompt_propagation_completed":
+                self.active.discard(model)
+                rate = round(float(event.get("validation_pass_rate", 0)) * 100)
+                source = str(event.get("source_model") or "another route")
+                message = f"RETEST {model}  {rate}% validation  prompt from {source}"
+            elif kind == "model_pruned":
+                self.active.discard(model)
+                self.finished.add(model)
+                message = f"PRUNE  {model}  {event.get('reason', kind)}"
             elif kind == "model_completed":
                 self.active.discard(model)
                 self.finished.add(model)
@@ -112,7 +134,7 @@ def parser() -> argparse.ArgumentParser:
         prog="evalt",
         description="Run prompts through a durable, tested, budget-bounded model route.",
     )
-    root.add_argument("--version", action="version", version="evalt 0.8.17")
+    root.add_argument("--version", action="version", version="evalt 0.8.18")
     commands = root.add_subparsers(dest="command", required=True)
 
     init = commands.add_parser("init", help="Write a reviewable starter suite; no provider call.")
@@ -154,6 +176,7 @@ def parser() -> argparse.ArgumentParser:
     run.add_argument("--objective", choices=("match_baseline_at_lowest_cost", "best_within_price", "lowest_cost_at_accuracy"), default="lowest_cost_at_accuracy")
     run.add_argument("--state", default=".evalt/evalt.db")
     run.add_argument("--model", action="append", dest="models")
+    run.add_argument("--fixed-prompt", action="store_true", help="Compare routes without rewriting the supplied prompt or adding few-shot examples.")
     run.add_argument("--approved-output", help="Immediately record an accepted/corrected answer for future tests.")
 
     status = commands.add_parser("status", help="Show the durable decision trail for one route; no provider call.")
@@ -167,6 +190,7 @@ def parser() -> argparse.ArgumentParser:
     optimize.add_argument("--max-parallel-models", type=int, help="Override parallel model lanes for this run.")
     optimize.add_argument("--max-parallel-scenarios", type=int, help="Override parallel scenario lanes per model for this run.")
     optimize.add_argument("--request-timeout", type=float, help="Override the suite's per-response wall-clock deadline (default 600 seconds; maximum 7200).")
+    optimize.add_argument("--fixed-prompt", action="store_true", help="Override the suite and compare routes without modifying its prompt.")
 
     check = commands.add_parser("check", help="Gate an exported result for CI; no provider call.")
     check.add_argument("result")
@@ -196,10 +220,12 @@ def _summary(result, path: str) -> dict[str, object]:
         "elapsed_seconds": result.elapsed_seconds,
         "exploratory": result.exploratory,
         "winner_scope": result.winner_scope,
+        "quality_gate_status": result.quality_gate_status,
         "quality_frontier": result.quality_frontier,
         "diminishing_returns": result.diminishing_returns,
         "omitted_configurations": result.omitted_configurations,
         "unavailable_models": result.unavailable_models,
+        "screening_results": result.screening_results,
         "result": path,
     }
 
@@ -303,6 +329,7 @@ def main(argv: list[str] | None = None) -> int:
                 target_accuracy=args.target_accuracy,
                 objective=args.objective,
                 models=args.models,
+                optimize_prompt=not args.fixed_prompt,
             )
             if args.approved_output is not None:
                 if args.approved_output == answer.content:
@@ -329,6 +356,8 @@ def main(argv: list[str] | None = None) -> int:
                 optimize_kwargs["max_parallel_models"] = args.max_parallel_models
             if args.max_parallel_scenarios is not None:
                 optimize_kwargs["max_parallel_scenarios"] = args.max_parallel_scenarios
+            if args.fixed_prompt:
+                optimize_kwargs["optimize_prompt"] = False
             progress = _CliProgress(len(optimize_kwargs.get("models") or []))
             try:
                 result = client.client.optimize(

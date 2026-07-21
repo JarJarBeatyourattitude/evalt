@@ -32,7 +32,7 @@ repository checkout:
 
 ```bash
 python -m venv .venv
-python -m pip install dist/evalt-0.8.17-py3-none-any.whl
+python -m pip install dist/evalt-0.8.18-py3-none-any.whl
 evalt --version
 ```
 
@@ -180,7 +180,8 @@ well; a statistical slice is not a substitute for a deterministic veto.
 
 Speed is durable route state, not a one-time benchmark option. There is no latency
 ceiling by default. Set
-`max_latency_seconds=3.0` when a route needs a ceiling. Evalt reports measured p50 and
+`max_latency_seconds=3.0` when each production response needs a ceiling. This does not
+limit the total tournament wall time. Evalt reports measured p50 and
 p90 for every completed route, persists the limit in SQLite, and refuses to promote a
 later maintenance winner whose measured p90 misses it. OpenRouter's provider
 price/latency/throughput preferences help search, but cannot replace those frozen-run measurements. The default deadline
@@ -202,6 +203,19 @@ Higher maintenance budgets tighten the intelligence floors and broaden the targe
 Catalog benchmarks shortlist contenders only; they never promote a route without the
 task-specific holdout.
 
+Prompt search can rewrite instructions, select customer-approved training examples as
+few-shot demonstrations, or combine both. It never selects demonstrations from the
+validation or final-test partitions, excludes a training case from its own prompt, and
+records each selected example with <code>source_split: "train"</code>. A successful prompt
+package is re-screened on cheap model lanes that looked weak under the original prompt;
+those lanes still must pass the untouched final test before they can win.
+Set `"optimize_prompt": false` in a suite—or `optimize_prompt=False` on a durable
+`Evalt.run(...)` route—to hold the supplied prompt exactly fixed. That disables rewrites,
+few-shot selection, and cross-model prompt propagation while leaving model, reasoning,
+provider, validation, and final-test comparisons intact.
+The CLI equivalent is `evalt optimize evalt.json --fixed-prompt` (or
+`evalt run ... --fixed-prompt` for a durable production route).
+
 ## Explicit optimization and CI
 
 ```bash
@@ -220,6 +234,9 @@ live elapsed/active/settled heartbeat and prints score, p90 latency, and spend a
 route finishes. When piped it emits the same progress as JSONL on stderr, while the final
 JSON stays on stdout and at the requested output path. Model/scenario concurrency and the
 wall-clock timeout for one provider response can be overridden per run.
+Every result also carries `quality_gate_status`. `NO_CONFIGURATION_PASSED` means the
+reported best-observed configuration is diagnostic only and must not be promoted as a
+production route.
 
 Use stricter CI gates when needed:
 

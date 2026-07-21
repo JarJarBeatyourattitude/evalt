@@ -1,4 +1,5 @@
 import hashlib
+from io import BytesIO
 import json
 import os
 from contextlib import redirect_stderr, redirect_stdout
@@ -9,13 +10,15 @@ import threading
 import time
 import unittest
 from unittest import mock
+from urllib.error import HTTPError
 
 from evalt import BudgetExceeded, Client, Evalt, ProviderError, Suite, check_result, select_role_plan
-from evalt.cli import STARTER_SUITE, main as cli_main
+from evalt.cli import STARTER_SUITE, main as cli_main, parser as cli_parser
 from evalt.core import Completion, OpenRouterTransport, _safe_provider_error_detail
 from evalt.migration import migrate_openai_results
 from modelsieve import Client as ModelSieveClient
 from last_good_prompt import Client as LegacyClient
+from last_good_prompt.core import _Budget
 
 
 class CompatibilityTests(unittest.TestCase):
@@ -138,6 +141,37 @@ EXAMPLES = [
 
 
 class SdkTests(unittest.TestCase):
+    def test_parallel_budget_reservations_wait_instead_of_creating_a_false_failure(self):
+        budget = _Budget(0.10)
+        first_reserved = threading.Event()
+        release_first = threading.Event()
+        second_authorized = threading.Event()
+
+        def first_call():
+            budget.authorize(0.06)
+            first_reserved.set()
+            release_first.wait(timeout=1)
+            budget.commit(0.01, 0.06)
+
+        def second_call():
+            first_reserved.wait(timeout=1)
+            budget.authorize(0.06)
+            second_authorized.set()
+            budget.commit(0.01, 0.06)
+
+        first = threading.Thread(target=first_call)
+        second = threading.Thread(target=second_call)
+        first.start()
+        second.start()
+        self.assertTrue(first_reserved.wait(timeout=1))
+        self.assertFalse(second_authorized.wait(timeout=0.05))
+        release_first.set()
+        first.join(timeout=1)
+        second.join(timeout=1)
+        self.assertTrue(second_authorized.is_set())
+        self.assertAlmostEqual(budget.spent_usd, 0.02)
+        self.assertAlmostEqual(budget.reserved_usd, 0.0)
+
     def test_checked_in_quickstart_is_syntactically_runnable(self):
         example = Path(__file__).resolve().parents[1] / "examples" / "quickstart.py"
         compile(example.read_text(encoding="utf-8"), str(example), "exec")
@@ -355,7 +389,7 @@ class SdkTests(unittest.TestCase):
     def test_exact_json_evaluator_is_zero_cost_and_normalizes_rational_values(self):
         class ExactJsonTransport(FakeTransport):
             def complete(self, model, messages, *, max_tokens, response_schema=None):
-                if response_schema:
+                if model == "optimizer":
                     return super().complete(model, messages, max_tokens=max_tokens, response_schema=response_schema)
                 self.calls.append((model, messages, max_tokens, response_schema))
                 return Completion('{"x":"2/4","y":"-4/3"}', model, f"gen-{len(self.calls)}", 0.0001)
@@ -381,7 +415,7 @@ class SdkTests(unittest.TestCase):
     def test_exact_json_evaluator_rejects_wrong_values_and_extra_keys(self):
         class InvalidJsonTransport(FakeTransport):
             def complete(self, model, messages, *, max_tokens, response_schema=None):
-                if response_schema:
+                if model == "optimizer":
                     return super().complete(model, messages, max_tokens=max_tokens, response_schema=response_schema)
                 self.calls.append((model, messages, max_tokens, response_schema))
                 return Completion('{"x":"1/2","y":"9","note":"guess"}', model, f"gen-{len(self.calls)}", 0.0001)
@@ -474,6 +508,32 @@ class SdkTests(unittest.TestCase):
         self.assertEqual(result.winner.baseline_holdout_pass_rate, 0)
         self.assertEqual(result.winner.holdout_pass_rate, 1)
         self.assertEqual(result.winner.selected_prompt, "Rewritten policy: always return approved.")
+        self.assertEqual(result.winner.prompt_origin, "optimized_for:target")
+        self.assertEqual(result.quality_gate_status, "QUALIFIED_ROUTE_SELECTED")
+
+    def test_prompt_optimization_can_be_disabled_without_disabling_model_evaluation(self):
+        transport = FakeTransport()
+        supplied_prompt = "Keep this exact production prompt unchanged."
+        result = Client(transport=transport).optimize(
+            prompt=supplied_prompt,
+            examples=EXAMPLES,
+            models=["cheap", "expensive"],
+            optimizer_model="optimizer",
+            evaluator_model="evaluator",
+            optimize_prompt=False,
+            allow_few_shot=True,
+            max_optimization_cost_usd=1,
+        )
+        self.assertTrue(result.models)
+        self.assertTrue(all(item.selected_prompt == supplied_prompt for item in result.models))
+        self.assertTrue(all(item.few_shot_example_ids == [] for item in result.models))
+        self.assertFalse(result.regression_suite["optimize_prompt"])
+        self.assertFalse(
+            result.comparison_integrity["selection_protocol"]["prompt_modification_enabled"]
+        )
+        self.assertEqual(result.quality_gate_status, "NO_CONFIGURATION_PASSED")
+        called_models = [model for model, *_rest in transport.calls]
+        self.assertNotIn("optimizer", called_models)
 
     def test_stratified_groups_reach_every_split_and_hard_floor_blocks_promotion(self):
         class DifficultyTransport(FakeTransport):
@@ -705,6 +765,23 @@ class SdkTests(unittest.TestCase):
             events = [item["event_type"] for item in evalt.route_status("support")["decisions"]]
             self.assertIn("prompt_changed", events)
 
+    def test_durable_route_persists_fixed_prompt_policy(self):
+        with TemporaryDirectory() as directory:
+            evalt = Evalt(
+                transport=FakeTransport(),
+                state_path=Path(directory) / "evalt.db",
+            )
+            evalt.run(
+                "Return one route label only.",
+                "charged twice",
+                route="fixed-prompt",
+                models=["cheap"],
+                incumbent_model="cheap",
+                optimize_prompt=False,
+                budget_usd=0.01,
+            )
+            self.assertFalse(evalt.route_status("fixed-prompt")["optimize_prompt"])
+
     def test_role_policy_protects_design_quality_and_expands_breadth_with_budget(self):
         catalog = [
             {"id": "tiny", "intelligence": 55, "blended_price": 0.1},
@@ -719,6 +796,16 @@ class SdkTests(unittest.TestCase):
         self.assertEqual(deep.test_designer_model, "frontier")
         self.assertGreaterEqual(len(deep.target_models), len(lean.target_models))
         self.assertNotEqual(lean.judge_model, "tiny")
+
+    def test_role_policy_bootstraps_on_a_capable_redundant_route_not_a_fragile_cheapest_model(self):
+        catalog = [
+            {"id": "fragile-cheap", "intelligence": 80, "blended_price": 0.1, "private_provider_routes": 1},
+            {"id": "reliable", "intelligence": 82, "blended_price": 0.3, "private_provider_routes": 3},
+            {"id": "strong", "intelligence": 96, "blended_price": 4.0, "private_provider_routes": 2},
+        ]
+        plan = select_role_plan(catalog, maintenance_budget_usd=0.25)
+        self.assertTrue(plan.target_models[0].startswith("reliable#reasoning="))
+        self.assertTrue(any(model.startswith("fragile-cheap#reasoning=") for model in plan.target_models))
 
     def test_catalog_revision_changes_when_openrouter_price_changes(self):
         before = select_role_plan([
@@ -885,6 +972,17 @@ class SdkTests(unittest.TestCase):
                 self.assertEqual(cli_main(["check", str(result_path), "--min-pass-rate", "0.95"]), 0)
             self.assertIn("provider_call_started", output.getvalue())
 
+    def test_cli_exposes_fixed_prompt_mode_for_routes_and_explicit_suites(self):
+        run_args = cli_parser().parse_args([
+            "run", "--route", "support", "--prompt", "Return one route label.",
+            "--input", "The website is broken.", "--price", "0.01", "--fixed-prompt",
+        ])
+        optimize_args = cli_parser().parse_args([
+            "optimize", "evalt.json", "--fixed-prompt",
+        ])
+        self.assertTrue(run_args.fixed_prompt)
+        self.assertTrue(optimize_args.fixed_prompt)
+
     def test_cli_persists_failure_receipt_when_no_provider_lane_completes(self):
         class FailedClient:
             def optimize(self, **_kwargs):
@@ -969,6 +1067,180 @@ class SdkTests(unittest.TestCase):
         self.assertEqual(sent["provider"]["sort"], "price")
         self.assertEqual(sent["usage"], {"include": True})
         self.assertEqual(sent["response_format"]["type"], "json_schema")
+
+    def test_exact_json_targets_receive_a_shape_only_response_schema(self):
+        transport = FakeTransport()
+        Client(transport=transport).optimize(
+            prompt="Return exact JSON only.",
+            examples=[
+                {"id": "one", "input": "first", "approved_output": '{"x":"17/3","y":"-2"}'},
+                {"id": "two", "input": "second", "approved_output": '{"x":"5","y":"11/7"}'},
+                {"id": "three", "input": "third", "approved_output": '{"x":"-9/4","y":"6"}'},
+            ],
+            models=["target"],
+            optimizer_model="optimizer",
+            evaluator_model="evaluator",
+            evaluator={
+                "type": "exact_json",
+                "required_keys": ["x", "y"],
+                "allow_additional_properties": False,
+                "normalize_rational_strings": True,
+            },
+            max_optimization_cost_usd=1,
+            rounds=1,
+        )
+        target_schemas = [
+            response_schema
+            for model, messages, _max_tokens, response_schema in transport.calls
+            if model == "target" and messages[0]["content"] != "Improve the current prompt using only the supplied customer-approved training evidence. Return a deployable prompt and a short hypothesis."
+        ]
+        self.assertTrue(target_schemas)
+        for schema in target_schemas:
+            self.assertEqual(schema["required"], ["x", "y"])
+            self.assertEqual(schema["properties"], {"x": {"type": "string"}, "y": {"type": "string"}})
+            self.assertFalse(schema["additionalProperties"])
+            self.assertNotIn("17/3", json.dumps(schema))
+
+    def test_endpoint_selection_prefers_a_schema_capable_route_at_the_same_capacity(self):
+        requests = []
+
+        def opener(request, timeout):
+            if request.data is not None:
+                requests.append(json.loads(request.data))
+                return FakeResponse({
+                    "id": "gen-schema", "choices": [{"finish_reason": "stop", "message": {"content": "{}"}}],
+                    "usage": {"cost": 0.0001, "prompt_tokens": 4, "completion_tokens": 1},
+                })
+            if "endpoints/zdr" in request.full_url:
+                return FakeResponse({"data": [
+                    {
+                        "model_id": "schema-choice", "tag": "cheap/unstructured", "context_length": 131072,
+                        "max_completion_tokens": 131072, "pricing": {"prompt": "0.00000001", "completion": "0.00000001"},
+                        "supported_parameters": ["max_completion_tokens"],
+                    },
+                    {
+                        "model_id": "schema-choice", "tag": "reliable/structured", "context_length": 131072,
+                        "max_completion_tokens": 131072, "pricing": {"prompt": "0.00000002", "completion": "0.00000002"},
+                        "supported_parameters": ["max_completion_tokens", "response_format", "structured_outputs"],
+                    },
+                ]})
+            return FakeResponse({"data": [{
+                "id": "schema-choice", "context_length": 131072,
+                "top_provider": {"context_length": 131072, "max_completion_tokens": 131072},
+                "pricing": {"prompt": "0.00000001", "completion": "0.00000001"},
+                "supported_parameters": ["max_completion_tokens", "response_format", "structured_outputs"],
+            }]})
+
+        transport = OpenRouterTransport("sk-or-v1-test-key", opener=opener)
+        transport.complete(
+            "schema-choice", [{"role": "user", "content": "hello"}], max_tokens=25,
+            response_schema={"type": "object"},
+        )
+        sent = requests[-1]
+        self.assertEqual(sent["provider"]["only"], ["reliable/structured"])
+        self.assertEqual(sent["response_format"]["type"], "json_schema")
+
+    def test_provider_429_retries_the_same_model_on_a_preflighted_fallback_route(self):
+        requests = []
+
+        def opener(request, timeout):
+            if request.data is not None:
+                body = json.loads(request.data)
+                requests.append(body)
+                if len(requests) == 1:
+                    detail = json.dumps({
+                        "error": {
+                            "message": "rate limited",
+                            "code": 429,
+                            "metadata": {"provider_name": "First"},
+                        }
+                    }).encode()
+                    raise HTTPError(request.full_url, 429, "rate limited", {}, BytesIO(detail))
+                return FakeResponse({
+                    "id": "gen-fallback", "choices": [{"finish_reason": "stop", "message": {"content": "{}"}}],
+                    "usage": {"cost": 0.0001, "prompt_tokens": 4, "completion_tokens": 1},
+                })
+            if "endpoints/zdr" in request.full_url:
+                return FakeResponse({"data": [
+                    {
+                        "model_id": "fallback-model", "tag": "first/route", "provider_name": "First",
+                        "context_length": 131072, "max_completion_tokens": 131072,
+                        "pricing": {"prompt": "0.00000001", "completion": "0.00000001"},
+                        "supported_parameters": ["max_completion_tokens", "structured_outputs"],
+                    },
+                    {
+                        "model_id": "fallback-model", "tag": "second/route", "provider_name": "Second",
+                        "context_length": 131072, "max_completion_tokens": 131072,
+                        "pricing": {"prompt": "0.00000002", "completion": "0.00000002"},
+                        "supported_parameters": ["max_completion_tokens", "structured_outputs"],
+                    },
+                ]})
+            return FakeResponse({"data": [{
+                "id": "fallback-model", "context_length": 131072,
+                "top_provider": {"context_length": 131072, "max_completion_tokens": 131072},
+                "pricing": {"prompt": "0.00000001", "completion": "0.00000001"},
+                "supported_parameters": ["max_completion_tokens", "structured_outputs"],
+            }]})
+
+        transport = OpenRouterTransport("sk-or-v1-test-key", opener=opener)
+        completion = transport.complete(
+            "fallback-model", [{"role": "user", "content": "hello"}], max_tokens=25,
+            response_schema={"type": "object"},
+        )
+        self.assertEqual(completion.generation_id, "gen-fallback")
+        self.assertEqual(requests[0]["provider"]["only"], ["first/route", "second/route"])
+        self.assertEqual(requests[1]["provider"]["only"], ["second/route"])
+
+    def test_empty_completion_falls_back_to_another_preflighted_provider_without_expanding_tokens(self):
+        requests = []
+
+        def opener(request, timeout):
+            if request.data is not None:
+                body = json.loads(request.data)
+                requests.append(body)
+                if len(requests) == 1:
+                    return FakeResponse({
+                        "id": "gen-empty", "provider": "First",
+                        "choices": [{"finish_reason": "stop", "message": {"content": ""}}],
+                        "usage": {"cost": 0.00003, "prompt_tokens": 4, "completion_tokens": 0},
+                    })
+                return FakeResponse({
+                    "id": "gen-good", "provider": "Second",
+                    "choices": [{"finish_reason": "stop", "message": {"content": "{}"}}],
+                    "usage": {"cost": 0.0001, "prompt_tokens": 4, "completion_tokens": 1},
+                })
+            if "endpoints/zdr" in request.full_url:
+                return FakeResponse({"data": [
+                    {
+                        "model_id": "fallback-model", "tag": "first/route", "provider_name": "First",
+                        "context_length": 131072, "max_completion_tokens": 131072,
+                        "pricing": {"prompt": "0.00000001", "completion": "0.00000001"},
+                        "supported_parameters": ["max_completion_tokens", "structured_outputs"],
+                    },
+                    {
+                        "model_id": "fallback-model", "tag": "second/route", "provider_name": "Second",
+                        "context_length": 131072, "max_completion_tokens": 131072,
+                        "pricing": {"prompt": "0.00000002", "completion": "0.00000002"},
+                        "supported_parameters": ["max_completion_tokens", "structured_outputs"],
+                    },
+                ]})
+            return FakeResponse({"data": [{
+                "id": "fallback-model", "context_length": 131072,
+                "top_provider": {"context_length": 131072, "max_completion_tokens": 131072},
+                "pricing": {"prompt": "0.00000001", "completion": "0.00000001"},
+                "supported_parameters": ["max_completion_tokens", "structured_outputs"],
+            }]})
+
+        completion = OpenRouterTransport(
+            "sk-or-v1-test-key", opener=opener,
+        ).complete(
+            "fallback-model", [{"role": "user", "content": "hello"}], max_tokens=25,
+            response_schema={"type": "object"},
+        )
+        self.assertEqual(completion.generation_id, "gen-good")
+        self.assertAlmostEqual(completion.cost_usd, 0.00013)
+        self.assertEqual(requests[0]["max_completion_tokens"], requests[1]["max_completion_tokens"])
+        self.assertEqual(requests[1]["provider"]["only"], ["second/route"])
 
     def test_reasoning_effort_is_a_costed_auditable_model_configuration(self):
         requests = []
@@ -1154,7 +1426,7 @@ class SdkTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, "PROVIDER_TRUNCATED")
         self.assertFalse(raised.exception.retry_with_more_tokens)
 
-    def test_empty_answer_retries_once_with_a_larger_budgeted_response_target(self):
+    def test_empty_answer_does_not_misdiagnose_the_failure_as_a_token_limit(self):
         class EmptyOnceTransport(FakeTransport):
             def __init__(self):
                 super().__init__()
@@ -1167,14 +1439,14 @@ class SdkTests(unittest.TestCase):
                     error.code = "PROVIDER_EMPTY"
                     error.cost_usd = 0.001
                     raise error
-                return Completion("complete answer", model, "gen-retry", 0.002)
+                return Completion("unexpected retry", model, "gen-retry", 0.002)
 
         transport = EmptyOnceTransport()
-        answer = Client(transport=transport).draft_answer(
-            task="Answer completely.", input="Test", max_cost_usd=0.10,
-        )
-        self.assertEqual(answer.answer, "complete answer")
-        self.assertEqual(transport.max_tokens_seen, [8192, 131072])
+        with self.assertRaises(ProviderError):
+            Client(transport=transport).draft_answer(
+                task="Answer completely.", input="Test", max_cost_usd=0.10,
+            )
+        self.assertEqual(transport.max_tokens_seen, [8192])
 
     def test_truncated_answer_gets_one_genuinely_larger_budgeted_retry(self):
         class TruncatedTransport(FakeTransport):
@@ -1282,6 +1554,8 @@ class SdkTests(unittest.TestCase):
         self.assertNotIn("cheap#reasoning=high", result.pruned_models)
         self.assertEqual(result.winner.model, "near#reasoning=low")
         self.assertIn("adaptive search band", result.winner_scope)
+        near_high = next(item for item in result.models if item.model == "near#reasoning=high")
+        self.assertEqual(near_high.prompt_origin, "reasoning_hone_from:near#reasoning=low")
 
     def test_adaptive_cheapest_passing_stops_before_an_expensive_rescue_wave(self):
         transport = FakeTransport()
@@ -1298,6 +1572,206 @@ class SdkTests(unittest.TestCase):
         self.assertIn("expensive", result.pruned_models)
         target_models = [model for model, _messages, _tokens, schema in transport.calls if schema is None]
         self.assertNotIn("expensive", target_models)
+
+    def test_adaptive_search_screens_broad_models_before_full_final_test(self):
+        class ScreeningTransport(FakeTransport):
+            def estimate_cost(self, model, messages, *, max_tokens):
+                return {
+                    "strong-cheap": 0.0002,
+                    "strong-expensive": 0.002,
+                    "weak-cheapest": 0.00001,
+                }.get(model, 0.0001)
+
+            def complete(self, model, messages, *, max_tokens, response_schema=None):
+                if model == "optimizer":
+                    return super().complete(
+                        model, messages, max_tokens=max_tokens, response_schema=response_schema,
+                    )
+                self.calls.append((model, messages, max_tokens, response_schema))
+                content = "billing" if model.startswith("strong-") else "wrong"
+                return Completion(
+                    content, model, f"gen-{len(self.calls)}",
+                    self.estimate_cost(model, messages, max_tokens=max_tokens),
+                    latency_ms=10,
+                )
+
+        examples = [
+            {"id": f"billing-{index}", "input": f"charged twice {index}", "approved_output": "billing"}
+            for index in range(15)
+        ]
+        events = []
+        result = Client(transport=ScreeningTransport()).optimize(
+            prompt="Return the approved route label only.",
+            examples=examples,
+            models=[
+                "weak-cheapest", "weak-two", "strong-expensive",
+                "weak-three", "strong-cheap", "weak-four",
+            ],
+            optimizer_model="optimizer",
+            evaluator_model="unused",
+            evaluator={"type": "exact_text"},
+            rounds=1,
+            adaptive_search=True,
+            max_optimization_cost_usd=5,
+            progress_callback=events.append,
+        )
+        self.assertEqual(len(result.screening_results), 6)
+        self.assertEqual(len(result.models), 4)
+        self.assertEqual(result.winner.model, "strong-cheap")
+        self.assertEqual(len(result.pruned_models), 2)
+        self.assertTrue(all(model.startswith("weak-") for model in result.pruned_models))
+        self.assertTrue(any(event["event"] == "model_screen_completed" for event in events))
+        self.assertTrue(any(event["event"] == "model_pruned" for event in events))
+
+    def test_weak_adaptive_screen_preserves_one_catalog_intelligence_anchor(self):
+        class AnchorTransport(FakeTransport):
+            def model_catalog(self):
+                return [
+                    {"id": f"model-{index}", "intelligence": index}
+                    for index in range(1, 7)
+                ]
+
+            def estimate_cost(self, model, messages, *, max_tokens):
+                if model.startswith("model-"):
+                    return int(model.rsplit("-", 1)[1]) / 10_000
+                return super().estimate_cost(model, messages, max_tokens=max_tokens)
+
+            def complete(self, model, messages, *, max_tokens, response_schema=None):
+                if response_schema:
+                    return super().complete(
+                        model, messages, max_tokens=max_tokens,
+                        response_schema=response_schema,
+                    )
+                self.calls.append((model, messages, max_tokens, response_schema))
+                return Completion(
+                    "wrong", model, f"gen-{len(self.calls)}",
+                    self.estimate_cost(model, messages, max_tokens=max_tokens),
+                )
+
+        examples = [
+            {"id": f"billing-{index}", "input": f"charged twice {index}", "approved_output": "billing"}
+            for index in range(15)
+        ]
+        events = []
+        result = Client(transport=AnchorTransport()).optimize(
+            prompt="Classify this support request.", examples=examples,
+            models=[f"model-{index}" for index in range(1, 7)],
+            optimizer_model="optimizer", evaluator_model="unused",
+            evaluator={"type": "exact_text"}, rounds=1,
+            adaptive_search=True, max_optimization_cost_usd=5,
+            progress_callback=events.append,
+        )
+        self.assertIn("model-6", {item.model for item in result.models})
+        self.assertNotIn("model-6", result.pruned_models)
+        self.assertEqual(result.quality_gate_status, "NO_CONFIGURATION_PASSED")
+        deep_starts = [
+            event["model"] for event in events if event["event"] == "model_started"
+        ]
+        self.assertEqual(deep_starts[0], "model-6")
+
+    def test_adaptive_search_backfills_failed_deep_finalists(self):
+        class BackfillClient(Client):
+            def _evaluate_model(self, *args, **kwargs):
+                model = args[4]
+                if model in {"candidate-1", "candidate-2"}:
+                    raise ProviderError("simulated provider failure after screening")
+                return super()._evaluate_model(*args, **kwargs)
+
+        class UniformTransport(FakeTransport):
+            def estimate_cost(self, model, messages, *, max_tokens):
+                if model.startswith("candidate-"):
+                    return int(model.rsplit("-", 1)[1]) / 10_000
+                return super().estimate_cost(model, messages, max_tokens=max_tokens)
+
+            def complete(self, model, messages, *, max_tokens, response_schema=None):
+                if model.startswith("candidate-"):
+                    self.calls.append((model, messages, max_tokens, response_schema))
+                    return Completion(
+                        "billing", model, f"gen-{len(self.calls)}",
+                        self.estimate_cost(model, messages, max_tokens=max_tokens),
+                    )
+                return super().complete(
+                    model, messages, max_tokens=max_tokens, response_schema=response_schema,
+                )
+
+        examples = [
+            {"id": f"billing-{index}", "input": f"charged twice {index}", "approved_output": "billing"}
+            for index in range(15)
+        ]
+        result = BackfillClient(transport=UniformTransport()).optimize(
+            prompt="Return the approved route label only.",
+            examples=examples,
+            models=[f"candidate-{index}" for index in range(1, 7)],
+            optimizer_model="optimizer",
+            evaluator_model="unused",
+            evaluator={"type": "exact_text"},
+            rounds=1,
+            adaptive_search=True,
+            max_optimization_cost_usd=5,
+        )
+        self.assertEqual(len(result.screening_results), 6)
+        self.assertEqual(len(result.models), 4)
+        self.assertEqual(result.pruned_models, [])
+        self.assertEqual(
+            {item["status"] for item in result.screening_results}, {"FULL"},
+        )
+
+    def test_successful_training_rewrite_propagates_before_cheap_models_are_pruned(self):
+        class PropagationTransport(FakeTransport):
+            def estimate_cost(self, model, messages, *, max_tokens):
+                if model.startswith("candidate-"):
+                    return int(model.rsplit("-", 1)[1]) / 100_000
+                return super().estimate_cost(model, messages, max_tokens=max_tokens)
+
+            def complete(self, model, messages, *, max_tokens, response_schema=None):
+                self.calls.append((model, messages, max_tokens, response_schema))
+                if model == "optimizer":
+                    return Completion(
+                        json.dumps({
+                            "prompt": "Return billing for every supplied support request.",
+                            "hypothesis": "The approved training set establishes the route.",
+                            "few_shot_example_ids": [],
+                        }),
+                        model,
+                        f"gen-{len(self.calls)}",
+                        0.0001,
+                    )
+                system = messages[0]["content"]
+                content = "billing" if "Return billing" in system else "wrong"
+                return Completion(
+                    content,
+                    model,
+                    f"gen-{len(self.calls)}",
+                    self.estimate_cost(model, messages, max_tokens=max_tokens),
+                )
+
+        examples = [
+            {"id": f"billing-{index}", "input": f"charged twice {index}", "approved_output": "billing"}
+            for index in range(15)
+        ]
+        result = Client(transport=PropagationTransport()).optimize(
+            prompt="Classify this request.",
+            examples=examples,
+            models=[f"candidate-{index}" for index in range(1, 7)],
+            optimizer_model="optimizer",
+            evaluator_model="unused",
+            evaluator={"type": "exact_text"},
+            rounds=1,
+            adaptive_search=True,
+            max_optimization_cost_usd=5,
+        )
+        propagated = [
+            item for item in result.models
+            if item.prompt_origin.startswith("propagated_from:")
+        ]
+        self.assertEqual(len(result.models), 6)
+        self.assertEqual(len(propagated), 2)
+        self.assertEqual(result.pruned_models, [])
+        self.assertEqual(
+            sum(item["status"] == "FULL_PROPAGATED" for item in result.screening_results),
+            2,
+        )
+        self.assertTrue(all(item.holdout_pass_rate == 1 for item in propagated))
 
     def test_draft_becomes_approved_or_corrected_example(self):
         client = Client(transport=FakeTransport())
@@ -1319,6 +1793,8 @@ class SdkTests(unittest.TestCase):
         self.assertEqual(result.winner.model, "cheap")
         self.assertEqual(result.winner.selected_prompt, "Return the approved route label only.")
         self.assertEqual(result.winner.holdout_pass_rate, 1)
+        self.assertIsNone(result.regression_suite["incumbent_model"])
+        self.assertEqual(result.regression_suite["selected_model"], "cheap")
         self.assertTrue(result.exploratory)
         self.assertEqual(result.winner.holdout_unique_scenarios, 1)
         self.assertEqual(result.winner.holdout_executions, 2)
@@ -1445,6 +1921,27 @@ class SdkTests(unittest.TestCase):
         suite_ids = {item["id"] for item in result.regression_suite["examples"]}
         self.assertTrue(set(result.winner.few_shot_example_ids) <= suite_ids)
         self.assertEqual(result.regression_suite["winning_few_shot_example_ids"], result.winner.few_shot_example_ids)
+        self.assertEqual(
+            result.regression_suite["winning_few_shot_provenance"],
+            result.winner.few_shot_provenance,
+        )
+        self.assertTrue(result.winner.few_shot_provenance)
+        self.assertEqual(
+            {item["source_split"] for item in result.winner.few_shot_provenance},
+            {"train"},
+        )
+        self.assertTrue(
+            all(item["customer_approved"] for item in result.winner.few_shot_provenance)
+        )
+        self.assertEqual(result.winner.prompt_origin, "optimized_for:cheap")
+        optimizer_system_prompts = [
+            messages[0]["content"]
+            for model, messages, _tokens, _schema in transport.calls
+            if model == "optimizer"
+        ]
+        self.assertTrue(optimizer_system_prompts)
+        self.assertTrue(all("Make the package self-contained" in text for text in optimizer_system_prompts))
+        self.assertTrue(all("present at production time" in text for text in optimizer_system_prompts))
 
     def test_multi_turn_scenarios_replay_prior_assistant_context(self):
         scenarios = [

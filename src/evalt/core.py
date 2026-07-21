@@ -47,6 +47,7 @@ class Suite:
     quality_threshold: float = 0.95
     max_optimization_cost_usd: float = 2.00
     rounds: int = 3
+    optimize_prompt: bool = True
     holdout_repeats: int = 2
     max_parallel_models: int = 16
     max_parallel_scenarios: int = 32
@@ -84,6 +85,7 @@ class Suite:
                 quality_threshold=float(value.get("quality_threshold", 0.95)),
                 max_optimization_cost_usd=float(value.get("max_optimization_cost_usd", 2.00)),
                 rounds=int(value.get("rounds", 3)),
+                optimize_prompt=bool(value.get("optimize_prompt", True)),
                 holdout_repeats=int(value.get("holdout_repeats", 2)),
                 max_parallel_models=int(value.get("max_parallel_models", 16)),
                 max_parallel_scenarios=int(value.get("max_parallel_scenarios", 32)),
@@ -163,6 +165,7 @@ class Suite:
             "quality_threshold": self.quality_threshold,
             "max_optimization_cost_usd": self.max_optimization_cost_usd,
             "rounds": self.rounds,
+            "optimize_prompt": self.optimize_prompt,
             "holdout_repeats": self.holdout_repeats,
             "max_parallel_models": self.max_parallel_models,
             "max_parallel_scenarios": self.max_parallel_scenarios,
@@ -195,6 +198,7 @@ class Suite:
             "quality_threshold": self.quality_threshold,
             "max_optimization_cost_usd": self.max_optimization_cost_usd,
             "rounds": self.rounds,
+            "optimize_prompt": self.optimize_prompt,
             "holdout_repeats": self.holdout_repeats,
             "max_parallel_models": self.max_parallel_models,
             "max_parallel_scenarios": self.max_parallel_scenarios,
@@ -252,6 +256,7 @@ class Evalt:
         max_test_budget_usd: float = 1.00,
         target_accuracy: float = 0.95,
         objective: str = "lowest_cost_at_accuracy",
+        optimize_prompt: bool = True,
         max_latency_seconds: float | None = None,
         max_p90_latency_seconds: float | None = None,
         latency_value_usd_per_second: float = 0.0,
@@ -349,6 +354,7 @@ class Evalt:
             max_tokens=max_tokens,
             target_accuracy=target_accuracy,
             objective=objective,
+            optimize_prompt=bool(optimize_prompt),
             test_budget_usd=resolved_test_budget_usd,
             test_budget_policy=test_budget_policy,
             max_p90_latency_seconds=max_p90_latency_seconds,
