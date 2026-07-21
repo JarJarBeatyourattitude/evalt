@@ -1909,6 +1909,16 @@ class SdkTests(unittest.TestCase):
         self.assertTrue(result.incomplete_models)
         self.assertEqual(result.skipped_budget_models, ["later"])
         self.assertEqual(result.winner_scope, "Best among fully completed eligible targets only")
+        self.assertTrue(result.continuation_recommendation["recommended"])
+        self.assertEqual(
+            result.continuation_recommendation["unfinished_configurations"],
+            ["expensive", "later"],
+        )
+        self.assertEqual(
+            result.continuation_recommendation["suggested_next_test_budget_usd"],
+            0.25,
+        )
+        self.assertFalse(result.continuation_recommendation["automatic_spend"])
 
     def test_few_shot_selection_is_training_only_and_is_included_in_costed_package(self):
         transport = FewShotTransport()

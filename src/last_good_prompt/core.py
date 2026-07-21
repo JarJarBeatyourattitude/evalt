@@ -166,6 +166,7 @@ class OptimizationResult:
     screening_results: list[dict[str, Any]] = field(default_factory=list)
     winner_scope: str = "Best among every requested target"
     quality_gate_status: str = "QUALIFIED_ROUTE_SELECTED"
+    continuation_recommendation: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -1700,6 +1701,50 @@ class Client:
                 "not a general model-intelligence ranking."
             ),
         }
+        budget_limited_configurations = list(dict.fromkeys([
+            *[
+                str(item["model"])
+                for item in incomplete_models
+                if "budget" in str(item.get("reason", "")).lower()
+                or "cap" in str(item.get("reason", "")).lower()
+            ],
+            *[str(model) for model in skipped_budget_models],
+        ]))
+        continuation_recommendation = None
+        if budget_limited_configurations and max_optimization_cost_usd < 100:
+            suggested_budget = min(
+                100.0,
+                max(
+                    float(max_optimization_cost_usd) + 0.25,
+                    float(max_optimization_cost_usd) * 1.5,
+                ),
+            )
+            suggested_budget = round(suggested_budget + 1e-12, 2)
+            qualified = winner.passed_quality_floor and winner.passed_latency_ceiling
+            continuation_recommendation = {
+                "recommended": True,
+                "reason": (
+                    "COMPLETE_COST_FRONTIER"
+                    if qualified
+                    else "FIND_QUALIFIED_ROUTE"
+                ),
+                "unfinished_configurations": budget_limited_configurations,
+                "current_test_budget_usd": round(float(max_optimization_cost_usd), 2),
+                "suggested_next_test_budget_usd": suggested_budget,
+                "suggested_additional_budget_usd": round(
+                    suggested_budget - float(max_optimization_cost_usd), 2
+                ),
+                "basis": (
+                    "Bounded 1.5x-cap heuristic (at least $0.25 more); review the "
+                    "unfinished configurations before explicitly approving a rerun."
+                ),
+                "automatic_spend": False,
+            }
+            emit_progress({
+                "event": "continuation_recommended",
+                **continuation_recommendation,
+                "elapsed_seconds": round(time.monotonic() - optimization_started, 3),
+            })
         return OptimizationResult(
             objective=objective,
             quality_threshold=quality_threshold,
@@ -1725,6 +1770,7 @@ class Client:
                 if winner.passed_quality_floor and winner.passed_latency_ceiling
                 else "NO_CONFIGURATION_PASSED"
             ),
+            continuation_recommendation=continuation_recommendation,
         )
 
     @staticmethod

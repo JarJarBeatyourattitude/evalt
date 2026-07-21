@@ -32,7 +32,7 @@ repository checkout:
 
 ```bash
 python -m venv .venv
-python -m pip install dist/evalt-0.8.18-py3-none-any.whl
+python -m pip install dist/evalt-0.8.19-py3-none-any.whl
 evalt --version
 ```
 
@@ -237,6 +237,10 @@ wall-clock timeout for one provider response can be overridden per run.
 Every result also carries `quality_gate_status`. `NO_CONFIGURATION_PASSED` means the
 reported best-observed configuration is diagnostic only and must not be promoted as a
 production route.
+If the cap leaves configurations unfinished, the result also records a structured
+`continuation_recommendation` with those configuration IDs and a bounded next cap. It
+uses a transparent 1.5× heuristic with at least $0.25 additional headroom;
+`automatic_spend` is always `false`, so Evalt never silently extends a tournament.
 
 Use stricter CI gates when needed:
 

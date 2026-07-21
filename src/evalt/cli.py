@@ -134,7 +134,7 @@ def parser() -> argparse.ArgumentParser:
         prog="evalt",
         description="Run prompts through a durable, tested, budget-bounded model route.",
     )
-    root.add_argument("--version", action="version", version="evalt 0.8.18")
+    root.add_argument("--version", action="version", version="evalt 0.8.19")
     commands = root.add_subparsers(dest="command", required=True)
 
     init = commands.add_parser("init", help="Write a reviewable starter suite; no provider call.")
@@ -221,6 +221,7 @@ def _summary(result, path: str) -> dict[str, object]:
         "exploratory": result.exploratory,
         "winner_scope": result.winner_scope,
         "quality_gate_status": result.quality_gate_status,
+        "continuation_recommendation": result.continuation_recommendation,
         "quality_frontier": result.quality_frontier,
         "diminishing_returns": result.diminishing_returns,
         "omitted_configurations": result.omitted_configurations,
