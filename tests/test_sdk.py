@@ -3,7 +3,7 @@ from io import BytesIO
 import json
 import os
 import sqlite3
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import nullcontext, redirect_stderr, redirect_stdout
 from io import StringIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -18,10 +18,10 @@ from evalt.cli import STARTER_SUITE, main as cli_main, parser as cli_parser
 from evalt.acceptance import AcceptanceFailure, redact_trace, validate_auto_first_route_receipt
 from evalt.core import Completion, OpenRouterTransport, _automatic_target_max_tokens, _safe_provider_error_detail
 from evalt.migration import migrate_openai_results
-from evalt.dashboard import WorkspaceSync, generate_workspace_token, load_dashboard_config, remove_dashboard_config, sanitize_progress_event, sanitize_route_snapshot, save_dashboard_config
+from evalt.dashboard import WorkspaceSync, generate_workspace_token, load_dashboard_config, remove_dashboard_config, sanitize_progress_event, sanitize_route_snapshot, save_dashboard_config, workspace_fingerprint
 from modelsieve import Client as ModelSieveClient
 from last_good_prompt import Client as LegacyClient
-from last_good_prompt.core import _Budget, ModelResult
+from last_good_prompt.core import _Budget, CaseResult, ModelResult
 
 
 class CompatibilityTests(unittest.TestCase):
@@ -48,6 +48,15 @@ class CompatibilityTests(unittest.TestCase):
 
 
 class DashboardBridgeTests(unittest.TestCase):
+    def test_workspace_fingerprint_is_stable_safe_and_distinguishes_workspaces(self):
+        first = generate_workspace_token()
+        second = generate_workspace_token()
+        fingerprint = workspace_fingerprint(first)
+        self.assertEqual(fingerprint, workspace_fingerprint(first))
+        self.assertNotEqual(fingerprint, workspace_fingerprint(second))
+        self.assertTrue(fingerprint.startswith("ws_"))
+        self.assertNotIn(first, fingerprint)
+
     def test_connection_config_is_private_and_removable(self):
         with TemporaryDirectory() as directory:
             state = Path(directory) / ".evalt" / "evalt.db"
@@ -110,7 +119,7 @@ class DashboardBridgeTests(unittest.TestCase):
         sync = WorkspaceSync(generate_workspace_token(), api_url="https://api.example", sender=unavailable)
         sync.publish_event({"event": "production_call_started", "route": "support"})
         sync.publish_route({"route": "support", "selected_model": "cheap"})
-        self.assertTrue(sync.flush())
+        self.assertFalse(sync.flush())
         self.assertIn("dashboard unavailable", sync.last_error)
 
     def test_progress_and_final_route_share_one_hosted_write(self):
@@ -210,7 +219,64 @@ class DashboardBridgeTests(unittest.TestCase):
                 ]), 0)
             self.assertNotIn(token, output.getvalue())
             self.assertTrue(json.loads(output.getvalue())["connected"])
+            self.assertEqual(
+                json.loads(output.getvalue())["workspace_id"],
+                workspace_fingerprint(token),
+            )
             self.assertEqual(load_dashboard_config(state)["workspace_token"], token)
+
+    def test_dashboard_status_exposes_comparable_id_without_opening_or_leaking_token(self):
+        with TemporaryDirectory() as directory:
+            state = Path(directory) / ".evalt" / "evalt.db"
+            token = generate_workspace_token()
+            save_dashboard_config(token, state_path=state, app_url="https://app.example")
+            output = StringIO()
+            with mock.patch("evalt.cli.webbrowser.open") as opened, redirect_stdout(output):
+                self.assertEqual(cli_main(["dashboard", "--state", str(state), "--status"]), 0)
+            payload = json.loads(output.getvalue())
+            self.assertEqual(payload["workspace_id"], workspace_fingerprint(token))
+            self.assertFalse(payload["opened"])
+            self.assertNotIn(token, output.getvalue())
+            opened.assert_not_called()
+
+    def test_visible_progress_names_workspace_and_reports_sync_failure(self):
+        class FailedSync:
+            workspace_id = "ws_0123456789ab"
+            last_error = "dashboard unavailable"
+
+            def publish_event(self, _value): pass
+            def publish_route(self, _value): pass
+            def flush(self, _timeout_seconds): return False
+
+        with mock.patch("evalt.core.WorkspaceSync", return_value=FailedSync()):
+            evalt = Evalt(
+                transport=FakeTransport(), show_progress=True,
+                dashboard_token=generate_workspace_token(),
+            )
+        output = StringIO()
+        with redirect_stderr(output):
+            evalt._emit_dashboard_status("support", "connected")
+            evalt._emit_dashboard_status("support", "failed")
+        rendered = output.getvalue()
+        self.assertIn("HOSTED WORKSPACE ws_0123456789ab", rendered)
+        self.assertIn("DASHBOARD SYNC FAILED", rendered)
+        self.assertIn("local route is safe", rendered)
+
+    def test_local_only_run_never_claims_a_dashboard_sync(self):
+        with TemporaryDirectory() as directory:
+            output = StringIO()
+            evalt = Evalt(
+                transport=FakeTransport(), show_progress=True,
+                state_path=Path(directory) / ".evalt" / "evalt.db",
+            )
+            with redirect_stderr(output):
+                evalt.run(
+                    "Return one label.", "charged twice", route="local-route",
+                    first_run="bootstrap", models=["cheap"], auto_maintain=False,
+                )
+        rendered = output.getvalue()
+        self.assertIn("LOCAL WORKSPACE ONLY", rendered)
+        self.assertNotIn("DASHBOARD SYNCED", rendered)
 
     def test_damaged_optional_dashboard_config_cannot_block_local_startup(self):
         with TemporaryDirectory() as directory:
@@ -2249,6 +2315,12 @@ class SdkTests(unittest.TestCase):
         self.assertEqual(plan.tier, "standard")
         self.assertEqual(len(broad), 10)
         self.assertEqual(len({item.split("#", 1)[0] for item in broad}), 10)
+        medium_models = {
+            item.split("#", 1)[0]
+            for item in plan.target_models[10:]
+            if item.endswith("#reasoning=medium")
+        }
+        self.assertGreaterEqual(len(medium_models), 8)
 
     def test_automatic_role_policy_preserves_extreme_efforts_for_staged_search(self):
         catalog = [
@@ -2737,6 +2809,63 @@ class SdkTests(unittest.TestCase):
         self.assertEqual(transport.timeout_seconds, 1800)
         with self.assertRaisesRegex(ValueError, "greater than zero"):
             transport.set_timeout_seconds(0)
+
+    def test_transport_timeout_override_is_thread_local(self):
+        observed = []
+        observed_lock = threading.Lock()
+
+        def opener(_request, timeout):
+            with observed_lock:
+                observed.append(timeout)
+            return FakeResponse({"ok": True})
+
+        transport = OpenRouterTransport(
+            "sk-or-v1-test-key", timeout_seconds=600, opener=opener,
+        )
+
+        def call_with_deadline(deadline):
+            with transport.request_timeout_override(deadline):
+                transport._request("https://openrouter.ai/test")
+
+        first = threading.Thread(target=call_with_deadline, args=(11,))
+        second = threading.Thread(target=call_with_deadline, args=(22,))
+        first.start()
+        second.start()
+        first.join()
+        second.join()
+        transport._request("https://openrouter.ai/test")
+        self.assertEqual(sorted(observed), [11, 22, 600])
+
+    def test_broad_screen_caps_only_its_provider_request_deadline(self):
+        class DeadlineTransport(FakeTransport):
+            timeout_seconds = 120
+
+            def __init__(self):
+                super().__init__()
+                self.deadlines = []
+
+            def request_timeout_override(self, value):
+                self.deadlines.append(value)
+                return nullcontext()
+
+        transport = DeadlineTransport()
+        Client(transport=transport).optimize(
+            prompt="Return one lowercase label.",
+            examples=[
+                {"id": f"case-{index}", "input": f"request {index}", "approved_output": "billing"}
+                for index in range(25)
+            ],
+            models=[f"model-{index}" for index in range(6)],
+            optimizer_model="optimizer",
+            evaluator_model="unused",
+            evaluator={"type": "exact_text"},
+            adaptive_search=True,
+            optimize_prompt=False,
+            max_optimization_cost_usd=5,
+            max_parallel_models=6,
+        )
+        self.assertEqual(transport.deadlines[:6], [30.0] * 6)
+        self.assertEqual(transport.deadlines[6:], [45.0] * 3)
 
     def test_default_transport_uses_a_bundled_verified_ca_context(self):
         with mock.patch("last_good_prompt.core.urlopen", return_value=FakeResponse({"ok": True})) as opener:
@@ -3502,7 +3631,7 @@ class SdkTests(unittest.TestCase):
             Client(transport=transport).optimize(
                 prompt="Return one label.", examples=EXAMPLES, models=["target"],
                 optimizer_model="optimizer", evaluator_model="evaluator",
-                max_optimization_cost_usd=1,
+                max_optimization_cost_usd=1, max_parallel_scenarios=1,
             )
         self.assertEqual(transport.max_tokens_seen, [8192, 131072])
 
@@ -3563,7 +3692,10 @@ class SdkTests(unittest.TestCase):
         )
         self.assertIn("far#reasoning=high", result.pruned_models)
         self.assertNotIn("cheap#reasoning=high", result.pruned_models)
-        self.assertIn("near#reasoning=high", result.pruned_models)
+        self.assertNotIn("near#reasoning=high", result.pruned_models)
+        self.assertTrue(any(
+            item.model == "near#reasoning=high" for item in result.models
+        ))
         self.assertEqual(result.winner.model, "near#reasoning=low")
         self.assertTrue(all(
             item.prompt_rewrites_tested == 0
@@ -3571,6 +3703,97 @@ class SdkTests(unittest.TestCase):
             if item.model == "cheap#reasoning=high"
         ))
         self.assertIn("adaptive search band", result.winner_scope)
+
+    def test_compact_route_hones_cheap_reasoning_before_costlier_prompt_propagation(self):
+        class CompactRouteTransport(FakeTransport):
+            timeout_seconds = 120
+
+            @staticmethod
+            def base(model):
+                return model.split("#reasoning=", 1)[0]
+
+            def estimate_cost(self, model, messages, *, max_tokens):
+                base_cost = {
+                    "oss20": 0.00001,
+                    "oss120": 0.00004,
+                    "other-1": 0.0002,
+                    "other-2": 0.0003,
+                    "other-3": 0.0004,
+                    "other-4": 0.0005,
+                }.get(self.base(model), 0.0001)
+                effort = model.rsplit("#reasoning=", 1)[-1]
+                multiplier = {"medium": 1.5, "high": 2.0}.get(effort, 1.0)
+                return base_cost * multiplier
+
+            def complete(self, model, messages, *, max_tokens, response_schema=None):
+                if response_schema:
+                    return super().complete(
+                        model, messages, max_tokens=max_tokens,
+                        response_schema=response_schema,
+                    )
+                return Completion(
+                    "billing", model, f"gen-{time.monotonic_ns()}",
+                    self.estimate_cost(model, messages, max_tokens=max_tokens),
+                )
+
+            def request_timeout_override(self, _value):
+                return nullcontext()
+
+        class CompactRouteClient(Client):
+            def _evaluate_model(self, *args, **kwargs):
+                model = args[4]
+                effort = model.rsplit("#reasoning=", 1)[-1]
+                passed = model.startswith("oss20#") and effort in {"medium", "high"}
+                cost = self.transport.estimate_cost(model, [], max_tokens=64)
+                return ModelResult(
+                    model=model,
+                    selected_prompt=args[0],
+                    baseline_pass_rate=1.0,
+                    selected_pass_rate=1.0,
+                    holdout_pass_rate=1.0 if passed else 0.9,
+                    baseline_holdout_pass_rate=0.9,
+                    estimated_production_cost_per_call_usd=cost,
+                    estimated_cost_per_successful_call_usd=(
+                        cost if passed else float("inf")
+                    ),
+                    optimization_spend_usd=0.0,
+                    passed_quality_floor=passed,
+                    holdout_unique_scenarios=10,
+                    holdout_executions=20,
+                )
+
+        events = []
+        result = CompactRouteClient(transport=CompactRouteTransport()).optimize(
+            prompt="Return one score.",
+            examples=[
+                {
+                    "id": f"case-{index}",
+                    "input": f"request {index}",
+                    "approved_output": "billing",
+                }
+                for index in range(25)
+            ],
+            models=[
+                "oss20#reasoning=low", "oss120#reasoning=low",
+                "other-1#reasoning=none", "other-2#reasoning=none",
+                "other-3#reasoning=none", "other-4#reasoning=none",
+                "oss20#reasoning=medium", "oss20#reasoning=high",
+            ],
+            optimizer_model="optimizer",
+            evaluator_model="unused",
+            evaluator={"type": "exact_text"},
+            adaptive_search=True,
+            optimize_prompt=True,
+            max_optimization_cost_usd=1,
+            progress_callback=events.append,
+        )
+        tested = {item.model for item in result.models}
+        self.assertIn("oss20#reasoning=medium", tested)
+        self.assertIn("oss20#reasoning=high", tested)
+        self.assertEqual(result.winner.model, "oss20#reasoning=medium")
+        self.assertFalse(any(
+            event["event"] == "prompt_propagation_started" for event in events
+        ))
 
     def test_extreme_reasoning_requires_close_validation_not_a_lucky_final_test(self):
         class LadderClient(Client):
@@ -3796,9 +4019,9 @@ class SdkTests(unittest.TestCase):
             progress_callback=events.append,
         )
         self.assertEqual(len(result.screening_results), 6)
-        self.assertEqual(len(result.models), 4)
+        self.assertEqual(len(result.models), 3)
         self.assertEqual(result.winner.model, "strong-cheap")
-        self.assertEqual(len(result.pruned_models), 2)
+        self.assertEqual(len(result.pruned_models), 3)
         self.assertTrue(all(model.startswith("weak-") for model in result.pruned_models))
         self.assertTrue(any(event["event"] == "model_screen_completed" for event in events))
         self.assertTrue(any(event["event"] == "model_pruned" for event in events))
@@ -3849,6 +4072,133 @@ class SdkTests(unittest.TestCase):
         ]
         self.assertEqual(deep_starts[0], "model-6")
 
+    def test_intelligence_anchor_shares_the_first_deep_wave(self):
+        class WeakCatalogTransport(FakeTransport):
+            def model_catalog(self):
+                return [
+                    {"id": f"model-{index}", "intelligence": index}
+                    for index in range(1, 7)
+                ]
+
+            def estimate_cost(self, model, messages, *, max_tokens):
+                if model.startswith("model-"):
+                    return int(model.rsplit("-", 1)[1]) / 10_000
+                return super().estimate_cost(model, messages, max_tokens=max_tokens)
+
+            def complete(self, model, messages, *, max_tokens, response_schema=None):
+                if model.startswith("model-"):
+                    return Completion(
+                        "wrong", model, f"screen-{time.monotonic_ns()}",
+                        self.estimate_cost(model, messages, max_tokens=max_tokens),
+                    )
+                return super().complete(
+                    model, messages, max_tokens=max_tokens,
+                    response_schema=response_schema,
+                )
+
+        class TrackingClient(Client):
+            def __init__(self):
+                super().__init__(transport=WeakCatalogTransport())
+                self.active = 0
+                self.maximum_active = 0
+                self.lock = threading.Lock()
+
+            def _evaluate_model(self, *args, **kwargs):
+                model = args[4]
+                with self.lock:
+                    self.active += 1
+                    self.maximum_active = max(self.maximum_active, self.active)
+                time.sleep(0.05)
+                with self.lock:
+                    self.active -= 1
+                return ModelResult(
+                    model=model,
+                    selected_prompt=args[0],
+                    baseline_pass_rate=0.0,
+                    selected_pass_rate=0.0,
+                    holdout_pass_rate=0.0,
+                    baseline_holdout_pass_rate=0.0,
+                    estimated_production_cost_per_call_usd=0.001,
+                    estimated_cost_per_successful_call_usd=0.1,
+                    optimization_spend_usd=0.0,
+                    passed_quality_floor=False,
+                )
+
+        client = TrackingClient()
+        examples = [
+            {
+                "id": f"case-{index}",
+                "input": f"request {index}",
+                "approved_output": "billing",
+            }
+            for index in range(25)
+        ]
+        client.optimize(
+            prompt="Classify this support request.",
+            examples=examples,
+            models=[f"model-{index}" for index in range(1, 7)],
+            optimizer_model="optimizer",
+            evaluator_model="unused",
+            evaluator={"type": "exact_text"},
+            rounds=1,
+            adaptive_search=True,
+            max_optimization_cost_usd=5,
+            max_parallel_models=6,
+        )
+        self.assertEqual(client.maximum_active, 3)
+
+    def test_prompt_rewrite_training_and_validation_splits_overlap(self):
+        class SplitTrackingClient(Client):
+            def __init__(self):
+                super().__init__(transport=FakeTransport())
+                self.candidate_barrier = threading.Barrier(2)
+                self.candidate_splits = []
+
+            def _propose_prompt(self, *args, **kwargs):
+                return "Revised prompt package.", []
+
+            def _run_cases(
+                self, prompt, prompt_kind, examples, split, target_model,
+                evaluator_model, budget, *args, **kwargs,
+            ):
+                if prompt_kind.startswith("candidate-"):
+                    self.candidate_splits.append(split)
+                    self.candidate_barrier.wait(timeout=1)
+                return [
+                    CaseResult(
+                        example_id=item.id,
+                        split=split,
+                        prompt_kind=prompt_kind,
+                        output=item.approved_output,
+                        approved_output=item.approved_output,
+                        passed=True,
+                        score=1.0,
+                        reason="matched",
+                        target_cost_usd=0.0,
+                        evaluator_cost_usd=0.0,
+                        target_generation_id=f"target-{split}",
+                        evaluator_generation_id=f"judge-{split}",
+                    )
+                    for item in examples
+                ]
+
+        client = SplitTrackingClient()
+        train = [Example("training input", "billing", "train-1")]
+        dev = [Example("validation input", "billing", "dev-1")]
+        holdout = [Example("final input", "billing", "final-1")]
+        baseline_dev = client._run_cases(
+            "Original prompt.", "baseline", dev, "dev", "target",
+            "unused", _Budget(5),
+        )
+        result = client._evaluate_model(
+            "Original prompt.", train, dev, holdout, "target", "optimizer",
+            "unused", 1.0, _Budget(5), 1, True, 3, None, None, 1,
+            {"type": "exact_text"}, {}, 2,
+            baseline_dev_cases=baseline_dev,
+        )
+        self.assertEqual(sorted(client.candidate_splits), ["dev", "train"])
+        self.assertEqual(result.prompt_candidates_tested, 2)
+
     def test_adaptive_search_backfills_failed_deep_finalists(self):
         class BackfillClient(Client):
             def _evaluate_model(self, *args, **kwargs):
@@ -3890,13 +4240,13 @@ class SdkTests(unittest.TestCase):
             max_optimization_cost_usd=5,
         )
         self.assertEqual(len(result.screening_results), 6)
-        self.assertEqual(len(result.models), 4)
-        self.assertEqual(result.pruned_models, [])
+        self.assertEqual(len(result.models), 3)
+        self.assertEqual(result.pruned_models, ["candidate-6"])
         self.assertEqual(
-            {item["status"] for item in result.screening_results}, {"FULL"},
+            {item["status"] for item in result.screening_results}, {"FULL", "PRUNED"},
         )
 
-    def test_successful_training_rewrite_propagates_before_cheap_models_are_pruned(self):
+    def test_successful_rewrite_does_not_propagate_to_cost_dominated_models(self):
         class PropagationTransport(FakeTransport):
             def estimate_cost(self, model, messages, *, max_tokens):
                 if model.startswith("candidate-"):
@@ -3944,14 +4294,16 @@ class SdkTests(unittest.TestCase):
             item for item in result.models
             if item.prompt_origin.startswith("propagated_from:")
         ]
-        self.assertEqual(len(result.models), 6)
-        self.assertEqual(len(propagated), 2)
-        self.assertEqual(result.pruned_models, [])
+        self.assertEqual(len(result.models), 3)
+        self.assertEqual(propagated, [])
         self.assertEqual(
-            sum(item["status"] == "FULL_PROPAGATED" for item in result.screening_results),
-            2,
+            result.pruned_models,
+            ["candidate-4", "candidate-5", "candidate-6"],
         )
-        self.assertTrue(all(item.holdout_pass_rate == 1 for item in propagated))
+        self.assertEqual(
+            sum(item["status"] == "PRUNED" for item in result.screening_results),
+            3,
+        )
 
     def test_draft_becomes_approved_or_corrected_example(self):
         client = Client(transport=FakeTransport())

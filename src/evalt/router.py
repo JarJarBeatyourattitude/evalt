@@ -292,8 +292,18 @@ def select_role_plan(
     # Hone phase: alternate efforts stay behind breadth and are pruned unless the
     # broad result lands near the observed task-specific capability threshold.
     hone_ids: list[str] = []
-    for item in sorted(selected, key=lambda value: (value["price"], -value["intelligence"])):
-        for effort in item.get("reasoning_efforts") or ("none",):
+    ordered_for_hone = sorted(
+        selected, key=lambda value: (value["price"], -value["intelligence"])
+    )
+    # Interleave the next useful rung across models. Grouping every effort for
+    # the cheapest model first meant the 25-configuration cap could omit medium
+    # effort for GPT OSS entirely while testing several less useful variants of
+    # one model. Medium is the first repair for the broad low-effort screen;
+    # lower/no-reasoning and more extreme rungs remain available afterward.
+    for effort in ("medium", "none", "high", "minimal", "xhigh", "max"):
+        for item in ordered_for_hone:
+            if effort not in (item.get("reasoning_efforts") or ("none",)):
+                continue
             configured = f"{item['id']}#reasoning={effort}"
             if configured not in broad_ids and configured not in hone_ids:
                 hone_ids.append(configured)

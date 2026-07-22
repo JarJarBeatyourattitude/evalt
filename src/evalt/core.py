@@ -143,6 +143,7 @@ def _dashboard_run_scope(method):
             "route": route,
         }
         self._dashboard_run_local.context = context
+        self._emit_dashboard_status(route, "connected" if self._dashboard_sync else "local")
         self._emit_progress({"event": "run_started", "route": route})
         try:
             result = method(self, suite_or_prompt, *args, **kwargs)
@@ -151,7 +152,9 @@ def _dashboard_run_scope(method):
                 "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
             )
             self._emit_progress({"event": "run_completed", "route": route})
-            self.flush_dashboard(timeout_seconds=8.0)
+            if self._dashboard_sync is not None:
+                synced = self.flush_dashboard(timeout_seconds=8.0)
+                self._emit_dashboard_status(route, "synced" if synced else "failed")
             return result
         except Exception:
             context["run_state"] = "failed"
@@ -159,7 +162,9 @@ def _dashboard_run_scope(method):
                 "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
             )
             self._emit_progress({"event": "run_failed", "route": route})
-            self.flush_dashboard(timeout_seconds=4.0)
+            if self._dashboard_sync is not None:
+                synced = self.flush_dashboard(timeout_seconds=4.0)
+                self._emit_dashboard_status(route, "synced" if synced else "failed")
             raise
         finally:
             try:
@@ -613,6 +618,38 @@ class Evalt:
         self._maintenance_guard = threading.Lock()
         self._maintenance_routes: set[str] = set()
         self._maintenance_threads: list[threading.Thread] = []
+
+    def _emit_dashboard_status(self, route: str, status: str) -> None:
+        """Report hosted visibility locally without recursively syncing the report."""
+
+        if not self._show_progress:
+            return
+        workspace_id = str(
+            getattr(self._dashboard_sync, "workspace_id", "unknown workspace")
+        )
+        if status == "connected":
+            message = (
+                f"Evalt · {route} · HOSTED WORKSPACE {workspace_id} · "
+                "syncing private route metadata"
+            )
+        elif status == "synced":
+            message = (
+                f"Evalt · {route} · DASHBOARD SYNCED · {workspace_id} · "
+                "open with: evalt dashboard"
+            )
+        elif status == "failed":
+            detail = str(getattr(self._dashboard_sync, "last_error", "") or "")
+            detail = f" · {detail}" if detail else ""
+            message = (
+                f"Evalt · {route} · DASHBOARD SYNC FAILED · {workspace_id} · "
+                f"the local route is safe{detail}"
+            )
+        else:
+            message = (
+                f"Evalt · {route} · LOCAL WORKSPACE ONLY · "
+                "run `evalt connect` to show this route at evalt.dev"
+            )
+        print(message, file=sys.stderr, flush=True)
 
     def _emit_progress(self, event: dict[str, Any]) -> None:
         event = dict(event)

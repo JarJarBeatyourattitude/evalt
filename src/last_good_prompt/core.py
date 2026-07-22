@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager, nullcontext
 from dataclasses import asdict, dataclass, field
 from fractions import Fraction
 import hashlib
@@ -341,6 +342,7 @@ class OpenRouterTransport:
         self._catalog_items: list[dict[str, Any]] = []
         self._preferred_max_latency_seconds: float | None = None
         self._provider_sort = "price"
+        self._request_timeout_local = threading.local()
 
     @property
     def timeout_seconds(self) -> float:
@@ -351,6 +353,25 @@ class OpenRouterTransport:
         if not 0 < resolved <= 7200:
             raise ValueError("timeout_seconds must be greater than zero and no more than 7200 seconds.")
         self._timeout = resolved
+
+    @contextmanager
+    def request_timeout_override(self, value: float):
+        """Apply a per-thread request deadline without racing other model lanes."""
+        resolved = float(value)
+        if not 0 < resolved <= 7200:
+            raise ValueError("timeout override must be greater than zero and no more than 7200 seconds.")
+        previous = getattr(self._request_timeout_local, "value", None)
+        self._request_timeout_local.value = resolved
+        try:
+            yield
+        finally:
+            if previous is None:
+                try:
+                    del self._request_timeout_local.value
+                except AttributeError:
+                    pass
+            else:
+                self._request_timeout_local.value = previous
 
     def set_performance_policy(
         self,
@@ -382,11 +403,14 @@ class OpenRouterTransport:
             data = json.dumps(body).encode("utf-8")
         request = Request(url, data=data, headers=headers, method="POST" if data else "GET")
         started = time.monotonic()
+        request_timeout = float(
+            getattr(self._request_timeout_local, "value", self._timeout)
+        )
         try:
             response_context = (
-                self._opener(request, timeout=self._timeout)
+                self._opener(request, timeout=request_timeout)
                 if self._opener is not None
-                else urlopen(request, timeout=self._timeout, context=self._ssl_context)
+                else urlopen(request, timeout=request_timeout, context=self._ssl_context)
             )
             with response_context as response:
                 if not hasattr(response, "read1"):
@@ -394,9 +418,9 @@ class OpenRouterTransport:
                 else:
                     chunks: list[bytes] = []
                     while True:
-                        if time.monotonic() - started > self._timeout:
+                        if time.monotonic() - started > request_timeout:
                             raise TimeoutError(
-                                f"provider response exceeded the {self._timeout:g}s total deadline"
+                                f"provider response exceeded the {request_timeout:g}s total deadline"
                             )
                         chunk = response.read1(65536)
                         if not chunk:
@@ -1382,6 +1406,31 @@ class Client:
         omitted_configurations = []
         progress_lock = threading.Lock()
 
+        def request_timeout_context(cap_seconds: float):
+            override = getattr(self.transport, "request_timeout_override", None)
+            if not callable(override):
+                return nullcontext()
+            configured = float(
+                getattr(self.transport, "timeout_seconds", cap_seconds)
+            )
+            return override(min(float(cap_seconds), configured))
+
+        resolved_target_envelope = int(target_max_tokens) if target_max_tokens is not None else {
+            "exact_text": 64,
+            "exact_json": 1024,
+            "numeric_tolerance": 64,
+            "semantic": 8192,
+        }[evaluator_policy["type"]]
+        # A recurring label/score route is not viable when one provider call can
+        # stall the whole tournament for two minutes. Larger-output and semantic
+        # jobs retain materially larger deadlines; explicit suites can also raise
+        # their output envelope when long reasoning is genuinely part of the job.
+        deep_call_deadline = (
+            45.0 if resolved_target_envelope <= 128
+            else 90.0 if resolved_target_envelope <= 1024
+            else float(getattr(self.transport, "timeout_seconds", 600.0))
+        )
+
         def emit_progress(event: dict[str, Any]) -> None:
             if progress_callback is None:
                 return
@@ -1453,24 +1502,25 @@ class Client:
                 "elapsed_seconds": round(time.monotonic() - optimization_started, 3),
             })
             model_budget = _BudgetScope(budget)
-            return self._evaluate_model(
-                prompt_text, train, dev, holdout, model, optimizer_model,
-                evaluator_model, quality_threshold, model_budget, rounds,
-                bool(allow_few_shot and optimize_prompt),
-                max_few_shot_examples, representative_input_chars,
-                representative_output_tokens, int(holdout_repeats), evaluator_policy,
-                difficulty_floor_policy, int(max_parallel_scenarios),
-                baseline_dev_cases=screening_cases_by_model.get(model),
-                seed_prompt=seed_prompt_by_model.get(model),
-                seed_few_shot_ids=seed_few_shot_ids_by_model.get(model),
-                prompt_origin=prompt_origin_by_model.get(model, "starting_prompt"),
-                optimize_prompt=bool(
-                    optimize_prompt and model not in fixed_prompt_models
-                ),
-                progress_callback=emit_progress,
-                target_max_tokens=(int(target_max_tokens) if target_max_tokens is not None else None),
-                request_options=target_request_options,
-            )
+            with request_timeout_context(deep_call_deadline):
+                return self._evaluate_model(
+                    prompt_text, train, dev, holdout, model, optimizer_model,
+                    evaluator_model, quality_threshold, model_budget, rounds,
+                    bool(allow_few_shot and optimize_prompt),
+                    max_few_shot_examples, representative_input_chars,
+                    representative_output_tokens, int(holdout_repeats), evaluator_policy,
+                    difficulty_floor_policy, int(max_parallel_scenarios),
+                    baseline_dev_cases=screening_cases_by_model.get(model),
+                    seed_prompt=seed_prompt_by_model.get(model),
+                    seed_few_shot_ids=seed_few_shot_ids_by_model.get(model),
+                    prompt_origin=prompt_origin_by_model.get(model, "starting_prompt"),
+                    optimize_prompt=bool(
+                        optimize_prompt and model not in fixed_prompt_models
+                    ),
+                    progress_callback=emit_progress,
+                    target_max_tokens=(int(target_max_tokens) if target_max_tokens is not None else None),
+                    request_options=target_request_options,
+                )
 
         def run_batch(configurations: list[str]) -> list[ModelResult]:
             if not configurations:
@@ -1541,13 +1591,20 @@ class Client:
                 "elapsed_seconds": round(time.monotonic() - optimization_started, 3),
             })
             model_budget = _BudgetScope(budget)
-            cases = self._run_cases(
-                prompt_text, "screening-baseline", dev, "dev", model,
-                evaluator_model, model_budget, evaluator=evaluator_policy,
-                max_parallel_scenarios=int(max_parallel_scenarios),
-                target_max_tokens=(int(target_max_tokens) if target_max_tokens is not None else None),
-                request_options=target_request_options,
-            )
+            # The broad screen exists to reject obviously weak, costly, or slow
+            # configurations before deep prompt search. A single provider route
+            # must not hold the entire first-run tournament hostage for the full
+            # (potentially much larger) final-test deadline. The override is
+            # thread-local, so ten parallel model lanes cannot change one another's
+            # request contract. Deep testing still receives the suite's full limit.
+            with request_timeout_context(30.0):
+                cases = self._run_cases(
+                    prompt_text, "screening-baseline", dev, "dev", model,
+                    evaluator_model, model_budget, evaluator=evaluator_policy,
+                    max_parallel_scenarios=int(max_parallel_scenarios),
+                    target_max_tokens=(int(target_max_tokens) if target_max_tokens is not None else None),
+                    request_options=target_request_options,
+                )
             screening_cases_by_model[model] = cases
             costs = sorted(case.target_cost_usd for case in cases if case.target_cost_usd > 0)
             estimated_cost = (
@@ -1712,19 +1769,23 @@ class Client:
 
                 attempted_for_full: list[str] = []
                 full_results: list[ModelResult] = []
-                # Screening remains maximally parallel, but if every starting-
-                # prompt score is weak, protect the one deliberately selected
-                # intelligence anchor from shared-budget starvation. Once that
-                # lane settles, the rest of the measured frontier runs in
-                # parallel and can inherit any prompt package it discovers.
-                if intelligence_anchor_model is not None:
-                    attempted_for_full.append(intelligence_anchor_model)
-                    full_results.extend(run_batch([intelligence_anchor_model]))
-                while len(full_results) < full_limit:
+                # The shared budget already makes in-flight reservations wait
+                # instead of failing. Keep the intelligence anchor first in the
+                # priority list, but launch it in the same bounded wave as the
+                # other finalists. Running the anchor alone added a complete
+                # prompt-search/final-test round to every weak-starting-prompt
+                # workflow without buying stronger evidence.
+                # Three completed deep lanes plus the broad screen are enough to
+                # move on to task-specific reasoning hone. Provider failures are
+                # evidence too; repeatedly backfilling a fourth weak lane delayed
+                # useful effort tests even after the cost/quality frontier was
+                # already clear.
+                completed_floor = min(3, full_limit)
+                while len(full_results) < completed_floor:
                     remaining = [model for model in full_priority if model not in attempted_for_full]
                     if not remaining:
                         break
-                    needed = max(1, full_limit - len(full_results))
+                    needed = max(1, completed_floor - len(full_results))
                     wave = remaining[:needed]
                     attempted_for_full.extend(wave)
                     full_results.extend(run_batch(wave))
@@ -1772,6 +1833,26 @@ class Client:
                     str(item["model"]) for item in screening_results
                     if item["model"] not in attempted_for_full
                 ]
+                validation_passing_packages = [
+                    item for item in full_results
+                    if item.selected_pass_rate >= quality_threshold
+                ]
+                if validation_passing_packages:
+                    validation_passing_cost = min(
+                        item.estimated_production_cost_per_call_usd
+                        for item in validation_passing_packages
+                    )
+                    screen_cost_by_model = {
+                        str(item["model"]): float(
+                            item["estimated_production_cost_per_call_usd"]
+                        )
+                        for item in screening_results
+                    }
+                    propagation_candidates = [
+                        model for model in propagation_candidates
+                        if screen_cost_by_model.get(model, float("inf"))
+                        < validation_passing_cost
+                    ]
                 propagation_by_model: dict[str, dict[str, Any]] = {}
 
                 def screen_propagated(model: str) -> dict[str, Any]:
@@ -1784,21 +1865,22 @@ class Client:
                     model_budget = _BudgetScope(budget)
                     best: dict[str, Any] | None = None
                     for propagated_prompt, few_shot_ids, source_model in rewrite_packages:
-                        cases = self._run_cases(
-                            propagated_prompt,
-                            "propagated-screen",
-                            dev,
-                            "dev",
-                            model,
-                            evaluator_model,
-                            model_budget,
-                            train,
-                            few_shot_ids,
-                            evaluator=evaluator_policy,
-                            max_parallel_scenarios=int(max_parallel_scenarios),
-                            target_max_tokens=(int(target_max_tokens) if target_max_tokens is not None else None),
-                            request_options=target_request_options,
-                        )
+                        with request_timeout_context(30.0):
+                            cases = self._run_cases(
+                                propagated_prompt,
+                                "propagated-screen",
+                                dev,
+                                "dev",
+                                model,
+                                evaluator_model,
+                                model_budget,
+                                train,
+                                few_shot_ids,
+                                evaluator=evaluator_policy,
+                                max_parallel_scenarios=int(max_parallel_scenarios),
+                                target_max_tokens=(int(target_max_tokens) if target_max_tokens is not None else None),
+                                request_options=target_request_options,
+                            )
                         candidate = {
                             "model": model,
                             "validation_pass_rate": round(_scenario_pass_rate(cases), 6),
@@ -1976,9 +2058,23 @@ class Client:
                 broad_rank = effort_rank[broad_effort]
                 if broad_result.selected_pass_rate >= quality_threshold:
                     # Once a base model clears the quality gate, more reasoning is
-                    # strictly dominated for a lowest-cost search.  A cheaper lower
-                    # effort can still be worth measuring.
-                    return candidate_rank < broad_rank
+                    # usually dominated for a lowest-cost search, and a cheaper
+                    # lower effort remains worth measuring. With only a five-case
+                    # validation split, however, one perfect result is too brittle
+                    # to justify skipping every stronger rung of the cheapest base.
+                    # Measure medium/high siblings in parallel before the frozen
+                    # final result is known; this adds robustness without tuning on
+                    # final-test answers.
+                    return bool(
+                        candidate_rank < broad_rank
+                        or (
+                            len(dev) < 20
+                            and candidate_rank > broad_rank
+                            and candidate_rank <= effort_rank["high"]
+                            and broad_result.estimated_production_cost_per_call_usd
+                            <= cheapest_pass_cost * 1.25 + 1e-12
+                        )
+                    )
                 # If the broad effort missed, only extra reasoning can plausibly
                 # repair accuracy.  Do not spend on a still-weaker configuration.
                 return candidate_rank > broad_rank
@@ -2491,19 +2587,49 @@ class Client:
         # approved training evidence. Always measure both disclosed splits before
         # deciding that prompt learning is unnecessary. The frozen final test is
         # still never used to select or rewrite a prompt.
-        baseline_dev = list(baseline_dev_cases) if baseline_dev_cases is not None else self._run_cases(
-            initial_prompt, "baseline", dev, "dev", model, evaluator_model, budget,
-            train, initial_few_shot_ids, evaluator=evaluator,
-            max_parallel_scenarios=max_parallel_scenarios,
-            target_max_tokens=target_max_tokens, request_options=request_options,
-        )
+        def run_split(
+            split_examples: list[Example], split: str, candidate_prompt: str,
+            prompt_kind: str, few_shot_ids: list[str],
+        ) -> list[CaseResult]:
+            return self._run_cases(
+                candidate_prompt, prompt_kind, split_examples, split, model,
+                evaluator_model, budget, train, few_shot_ids,
+                evaluator=evaluator,
+                max_parallel_scenarios=max_parallel_scenarios,
+                target_max_tokens=target_max_tokens,
+                request_options=request_options,
+            )
+
+        if (
+            baseline_dev_cases is None
+            and train and dev
+            and int(max_parallel_scenarios) > 1
+        ):
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                train_future = pool.submit(
+                    run_split, train, "train", initial_prompt, "baseline",
+                    initial_few_shot_ids,
+                )
+                dev_future = pool.submit(
+                    run_split, dev, "dev", initial_prompt, "baseline",
+                    initial_few_shot_ids,
+                )
+                baseline_train = train_future.result()
+                baseline_dev = dev_future.result()
+        else:
+            baseline_dev = (
+                list(baseline_dev_cases)
+                if baseline_dev_cases is not None
+                else run_split(
+                    dev, "dev", initial_prompt, "baseline",
+                    initial_few_shot_ids,
+                )
+            )
+            baseline_train = run_split(
+                train, "train", initial_prompt, "baseline",
+                initial_few_shot_ids,
+            )
         baseline_dev_rate = _pass_rate(baseline_dev)
-        baseline_train = self._run_cases(
-            initial_prompt, "baseline", train, "train", model, evaluator_model, budget,
-            train, initial_few_shot_ids, evaluator=evaluator,
-            max_parallel_scenarios=max_parallel_scenarios,
-            target_max_tokens=target_max_tokens, request_options=request_options,
-        )
         baseline_train_rate = _pass_rate(baseline_train)
         selected_prompt = initial_prompt
         selected_few_shot_ids: list[str] = initial_few_shot_ids
@@ -2543,22 +2669,28 @@ class Client:
                 # Training evidence breaks a validation tie; the candidate must never
                 # regress on validation. This avoids silently skipping a useful rewrite
                 # after a lucky perfect score on a small validation slice.
-                revised_train = self._run_cases(
-                    revised_prompt,
-                    f"candidate-{round_number}",
-                    train,
-                    "train",
-                    model,
-                    evaluator_model,
-                    budget,
-                    train,
-                    revised_few_shot_ids,
-                    evaluator=evaluator,
-                    max_parallel_scenarios=max_parallel_scenarios,
-                    target_max_tokens=target_max_tokens, request_options=request_options,
-                )
+                if train and dev and int(max_parallel_scenarios) > 1:
+                    with ThreadPoolExecutor(max_workers=2) as pool:
+                        train_future = pool.submit(
+                            run_split, train, "train", revised_prompt,
+                            f"candidate-{round_number}", revised_few_shot_ids,
+                        )
+                        dev_future = pool.submit(
+                            run_split, dev, "dev", revised_prompt,
+                            f"candidate-{round_number}", revised_few_shot_ids,
+                        )
+                        revised_train = train_future.result()
+                        revised_dev = dev_future.result()
+                else:
+                    revised_train = run_split(
+                        train, "train", revised_prompt,
+                        f"candidate-{round_number}", revised_few_shot_ids,
+                    )
+                    revised_dev = run_split(
+                        dev, "dev", revised_prompt,
+                        f"candidate-{round_number}", revised_few_shot_ids,
+                    )
                 candidate_cases += revised_train
-                revised_dev = self._run_cases(revised_prompt, f"candidate-{round_number}", dev, "dev", model, evaluator_model, budget, train, revised_few_shot_ids, evaluator=evaluator, max_parallel_scenarios=max_parallel_scenarios, target_max_tokens=target_max_tokens, request_options=request_options)
                 candidate_cases += revised_dev
             except BudgetExceeded as error:
                 # Prompt search is optional. Preserve the fully measured starting

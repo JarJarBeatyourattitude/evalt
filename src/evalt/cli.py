@@ -16,10 +16,12 @@ from .reporting import compare_results, render_comparison_html, write_reports
 from .dashboard import (
     DEFAULT_DASHBOARD_API_URL,
     DEFAULT_DASHBOARD_APP_URL,
+    dashboard_config_path,
     generate_workspace_token,
     load_dashboard_config,
     remove_dashboard_config,
     save_dashboard_config,
+    workspace_fingerprint,
 )
 
 
@@ -144,7 +146,7 @@ def parser() -> argparse.ArgumentParser:
         prog="evalt",
         description="Run prompts through a durable, tested, budget-bounded model route.",
     )
-    root.add_argument("--version", action="version", version="evalt 0.10.6")
+    root.add_argument("--version", action="version", version="evalt 0.10.7")
     commands = root.add_subparsers(dest="command", required=True)
 
     init = commands.add_parser("init", help="Write a reviewable starter suite; no provider call.")
@@ -238,6 +240,7 @@ def parser() -> argparse.ArgumentParser:
 
     dashboard = commands.add_parser("dashboard", help="Open the connected hosted workspace without exposing the token in output.")
     dashboard.add_argument("--state", default=".evalt/evalt.db")
+    dashboard.add_argument("--status", action="store_true", help="Show the connected workspace ID without opening a browser.")
 
     disconnect = commands.add_parser("disconnect", help="Remove the local hosted-workspace connection.")
     disconnect.add_argument("--state", default=".evalt/evalt.db")
@@ -291,6 +294,7 @@ def main(argv: list[str] | None = None) -> int:
             opened = False if args.no_open else bool(webbrowser.open(dashboard_url))
             payload = {
                 "connected": True,
+                "workspace_id": workspace_fingerprint(token),
                 "config": str(path),
                 "dashboard": str(args.app_url).rstrip("/"),
                 "browser_opened": opened,
@@ -305,8 +309,15 @@ def main(argv: list[str] | None = None) -> int:
             config = load_dashboard_config(args.state)
             if not config:
                 raise ValueError("No hosted workspace is connected. Run: evalt connect")
-            opened = bool(webbrowser.open(f"{config['app_url']}#workspace={config['workspace_token']}"))
-            print(json.dumps({"opened": opened, "dashboard": config["app_url"], "workspace_token_printed": False}, indent=2))
+            opened = False if args.status else bool(webbrowser.open(f"{config['app_url']}#workspace={config['workspace_token']}"))
+            print(json.dumps({
+                "connected": True,
+                "workspace_id": workspace_fingerprint(config["workspace_token"]),
+                "opened": opened,
+                "dashboard": config["app_url"],
+                "config": str(dashboard_config_path(args.state)),
+                "workspace_token_printed": False,
+            }, indent=2))
             return 0
         if args.command == "disconnect":
             removed = remove_dashboard_config(args.state)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 from pathlib import Path
 import queue
@@ -37,6 +38,14 @@ def validate_workspace_token(token: str) -> str:
     if any(character not in allowed for character in token[len(_TOKEN_PREFIX):]):
         raise ValueError("Workspace token contains unsupported characters.")
     return token
+
+
+def workspace_fingerprint(token: str) -> str:
+    """Return a safe, stable identifier users can compare across devices."""
+
+    validated = validate_workspace_token(token)
+    digest = hashlib.sha256(validated.encode("utf-8")).hexdigest()[:12]
+    return f"ws_{digest}"
 
 
 def dashboard_config_path(state_path: str | Path = ".evalt/evalt.db") -> Path:
@@ -189,6 +198,7 @@ class WorkspaceSync:
         sender: Callable[[str, str, dict[str, Any]], None] | None = None,
     ) -> None:
         self.token = validate_workspace_token(token)
+        self.workspace_id = workspace_fingerprint(self.token)
         self.api_url = str(api_url).rstrip("/")
         self.timeout_seconds = float(timeout_seconds)
         self.last_error: str | None = None
@@ -261,12 +271,12 @@ class WorkspaceSync:
         deadline = time.monotonic() + max(0, timeout_seconds)
         while self._queue.unfinished_tasks and time.monotonic() < deadline:
             time.sleep(0.01)
-        return self._queue.unfinished_tasks == 0
+        return self._queue.unfinished_tasks == 0 and self.last_error is None
 
 
 __all__ = [
     "DEFAULT_DASHBOARD_API_URL", "DEFAULT_DASHBOARD_APP_URL", "WorkspaceSync",
     "dashboard_config_path", "generate_workspace_token", "load_dashboard_config",
     "remove_dashboard_config", "sanitize_progress_event", "sanitize_route_snapshot",
-    "save_dashboard_config", "validate_workspace_token",
+    "save_dashboard_config", "validate_workspace_token", "workspace_fingerprint",
 ]

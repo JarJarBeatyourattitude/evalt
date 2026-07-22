@@ -23,11 +23,14 @@ evalt connect
 ```
 
 The command opens the private dashboard and stores its capability token beside the local
-route database. Evalt synchronizes only operational route metadata and bounded progress;
+route database. The CLI and browser show a safe `ws_...` workspace ID; those IDs must
+match. Evalt synchronizes only operational route metadata and bounded progress;
 prompts, inputs, outputs, cases, provider keys, request bodies, and raw responses stay
 local. Each invocation gets an opaque run ID, so repeated tournaments on one durable
-route have separate running, completed, or failed progress streams. Use `evalt dashboard`
-to reopen it and `evalt disconnect` to remove the local connection. Dashboard
+route have separate running, completed, or failed progress streams. Every visible run
+prints either `DASHBOARD SYNCED` or `DASHBOARD SYNC FAILED`. Use `evalt dashboard`
+to reopen it, `evalt dashboard --status` to compare the ID without opening a browser,
+and `evalt disconnect` to remove the local connection. Dashboard
 availability never affects a production call.
 
 Migrating from OpenAI Evals result JSONL? Evalt can recover only the reviewable
@@ -45,7 +48,7 @@ repository checkout:
 
 ```bash
 python -m venv .venv
-python -m pip install dist/evalt-0.10.6-py3-none-any.whl
+python -m pip install dist/evalt-0.10.7-py3-none-any.whl
 evalt --version
 ```
 
