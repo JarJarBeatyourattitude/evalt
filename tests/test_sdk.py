@@ -2950,6 +2950,24 @@ class SdkTests(unittest.TestCase):
         transport._request("https://openrouter.ai/test")
         self.assertEqual(sorted(observed), [11, 22, 600])
 
+    def test_transport_shared_lane_deadline_clamps_later_provider_requests(self):
+        observed = []
+
+        def opener(_request, timeout):
+            observed.append(timeout)
+            return FakeResponse({"ok": True})
+
+        transport = OpenRouterTransport(
+            "sk-or-v1-test-key", timeout_seconds=600, opener=opener,
+        )
+        with mock.patch(
+            "last_good_prompt.core.time.monotonic",
+            side_effect=[100.0, 105.0],
+        ):
+            with transport.request_deadline_override(20):
+                transport._request("https://openrouter.ai/test")
+        self.assertEqual(observed, [15.0])
+
     def test_broad_screen_caps_only_its_provider_request_deadline(self):
         class DeadlineTransport(FakeTransport):
             timeout_seconds = 120
@@ -2957,9 +2975,14 @@ class SdkTests(unittest.TestCase):
             def __init__(self):
                 super().__init__()
                 self.deadlines = []
+                self.lane_deadlines = []
 
             def request_timeout_override(self, value):
                 self.deadlines.append(value)
+                return nullcontext()
+
+            def request_deadline_override(self, value):
+                self.lane_deadlines.append(value)
                 return nullcontext()
 
         transport = DeadlineTransport()
@@ -2980,6 +3003,7 @@ class SdkTests(unittest.TestCase):
         )
         self.assertEqual(transport.deadlines[:6], [30.0] * 6)
         self.assertEqual(transport.deadlines[6:], [45.0] * 6)
+        self.assertEqual(transport.lane_deadlines, [90.0] * 6)
 
     def test_default_transport_uses_a_bundled_verified_ca_context(self):
         with mock.patch("last_good_prompt.core.urlopen", return_value=FakeResponse({"ok": True})) as opener:

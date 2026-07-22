@@ -378,6 +378,29 @@ class OpenRouterTransport:
             else:
                 self._request_timeout_local.value = previous
 
+    @contextmanager
+    def request_deadline_override(self, value: float):
+        """Bound every request in one model lane by a shared wall-clock deadline."""
+        resolved = float(value)
+        if not 0 < resolved <= 7200:
+            raise ValueError("request deadline must be greater than zero and no more than 7200 seconds.")
+        previous_deadline = getattr(self._request_timeout_local, "absolute_deadline", None)
+        previous_limit = getattr(self._request_timeout_local, "deadline_limit", None)
+        self._request_timeout_local.absolute_deadline = time.monotonic() + resolved
+        self._request_timeout_local.deadline_limit = resolved
+        try:
+            yield
+        finally:
+            if previous_deadline is None:
+                for name in ("absolute_deadline", "deadline_limit"):
+                    try:
+                        delattr(self._request_timeout_local, name)
+                    except AttributeError:
+                        pass
+            else:
+                self._request_timeout_local.absolute_deadline = previous_deadline
+                self._request_timeout_local.deadline_limit = previous_limit
+
     def set_performance_policy(
         self,
         *,
@@ -411,6 +434,19 @@ class OpenRouterTransport:
         request_timeout = float(
             getattr(self._request_timeout_local, "value", self._timeout)
         )
+        absolute_deadline = getattr(
+            self._request_timeout_local, "absolute_deadline", None
+        )
+        if absolute_deadline is not None:
+            remaining = float(absolute_deadline) - started
+            if remaining <= 0:
+                limit = float(getattr(
+                    self._request_timeout_local, "deadline_limit", 0.0
+                ))
+                raise ProviderError(
+                    f"model evaluation exceeded its {limit:g}s total deadline"
+                )
+            request_timeout = min(request_timeout, remaining)
         try:
             response_context = (
                 self._opener(request, timeout=request_timeout)
@@ -1420,6 +1456,15 @@ class Client:
             )
             return override(min(float(cap_seconds), configured))
 
+        def request_deadline_context(cap_seconds: float):
+            override = getattr(self.transport, "request_deadline_override", None)
+            if not callable(override):
+                return nullcontext()
+            configured = float(
+                getattr(self.transport, "timeout_seconds", cap_seconds)
+            )
+            return override(min(float(cap_seconds), configured))
+
         resolved_target_envelope = int(target_max_tokens) if target_max_tokens is not None else {
             "exact_text": 64,
             "exact_json": 1024,
@@ -1434,6 +1479,14 @@ class Client:
             45.0 if resolved_target_envelope <= 128
             else 90.0 if resolved_target_envelope <= 1024
             else float(getattr(self.transport, "timeout_seconds", 600.0))
+        )
+        # The request cap above applies to one provider response. Prompt search,
+        # validation, and final confirmation share a second lane-wide deadline so
+        # a sequence of individually legal calls cannot turn a simple recurring
+        # task into a five-minute finalist.
+        deep_model_deadline = min(
+            float(getattr(self.transport, "timeout_seconds", deep_call_deadline * 2)),
+            deep_call_deadline * 2,
         )
 
         def emit_progress(event: dict[str, Any]) -> None:
@@ -1520,25 +1573,26 @@ class Client:
                 "elapsed_seconds": round(time.monotonic() - optimization_started, 3),
             })
             model_budget = _BudgetScope(budget)
-            with request_timeout_context(deep_call_deadline):
-                return self._evaluate_model(
-                    prompt_text, train, dev, holdout, model, optimizer_model,
-                    evaluator_model, quality_threshold, model_budget, rounds,
-                    bool(allow_few_shot and optimize_prompt),
-                    max_few_shot_examples, representative_input_chars,
-                    representative_output_tokens, int(holdout_repeats), evaluator_policy,
-                    difficulty_floor_policy, int(max_parallel_scenarios),
-                    baseline_dev_cases=screening_cases_by_model.get(model),
-                    seed_prompt=seed_prompt_by_model.get(model),
-                    seed_few_shot_ids=seed_few_shot_ids_by_model.get(model),
-                    prompt_origin=prompt_origin_by_model.get(model, "starting_prompt"),
-                    optimize_prompt=bool(
-                        optimize_prompt and model not in fixed_prompt_models
-                    ),
-                    progress_callback=emit_progress,
-                    target_max_tokens=(int(target_max_tokens) if target_max_tokens is not None else None),
-                    request_options=target_request_options,
-                )
+            with request_deadline_context(deep_model_deadline):
+                with request_timeout_context(deep_call_deadline):
+                    return self._evaluate_model(
+                        prompt_text, train, dev, holdout, model, optimizer_model,
+                        evaluator_model, quality_threshold, model_budget, rounds,
+                        bool(allow_few_shot and optimize_prompt),
+                        max_few_shot_examples, representative_input_chars,
+                        representative_output_tokens, int(holdout_repeats), evaluator_policy,
+                        difficulty_floor_policy, int(max_parallel_scenarios),
+                        baseline_dev_cases=screening_cases_by_model.get(model),
+                        seed_prompt=seed_prompt_by_model.get(model),
+                        seed_few_shot_ids=seed_few_shot_ids_by_model.get(model),
+                        prompt_origin=prompt_origin_by_model.get(model, "starting_prompt"),
+                        optimize_prompt=bool(
+                            optimize_prompt and model not in fixed_prompt_models
+                        ),
+                        progress_callback=emit_progress,
+                        target_max_tokens=(int(target_max_tokens) if target_max_tokens is not None else None),
+                        request_options=target_request_options,
+                    )
 
         def run_batch(configurations: list[str]) -> list[ModelResult]:
             if not configurations:
