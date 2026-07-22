@@ -16,14 +16,16 @@ then answer the real input through that package. Later calls reuse it immediatel
 pip install evalt
 ```
 
-Optionally connect this project's local routes to the hosted workspace:
+Optionally connect local routes to the hosted workspace:
 
 ```bash
 evalt connect
 ```
 
-The command opens the private dashboard and stores its capability token beside the local
-route database. The CLI and browser show a safe `ws_...` workspace ID; those IDs must
+The command opens the private dashboard and stores its capability token once for the
+current user, so routes remain connected when scripts run from another project folder.
+Pass `--state path/to/evalt.db` only when a project needs a separate workspace. The CLI
+and browser show a safe `ws_...` workspace ID; those IDs must
 match. Evalt synchronizes only operational route metadata and bounded progress;
 prompts, inputs, outputs, cases, provider keys, request bodies, and raw responses stay
 local. Each invocation gets an opaque run ID, so repeated tournaments on one durable
@@ -50,7 +52,7 @@ repository checkout:
 
 ```bash
 python -m venv .venv
-python -m pip install dist/evalt-0.10.8-py3-none-any.whl
+python -m pip install dist/evalt-0.10.9-py3-none-any.whl
 evalt --version
 ```
 

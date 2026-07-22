@@ -146,7 +146,7 @@ def parser() -> argparse.ArgumentParser:
         prog="evalt",
         description="Run prompts through a durable, tested, budget-bounded model route.",
     )
-    root.add_argument("--version", action="version", version="evalt 0.10.8")
+    root.add_argument("--version", action="version", version="evalt 0.10.9")
     commands = root.add_subparsers(dest="command", required=True)
 
     init = commands.add_parser("init", help="Write a reviewable starter suite; no provider call.")
@@ -233,17 +233,17 @@ def parser() -> argparse.ArgumentParser:
 
     connect = commands.add_parser("connect", help="Connect local route metadata to a private hosted workspace.")
     connect.add_argument("token", nargs="?", help="Existing evw_ workspace token; omitted creates one.")
-    connect.add_argument("--state", default=".evalt/evalt.db")
+    connect.add_argument("--state", help="Scope the connection to one route database; omitted saves it for all local projects.")
     connect.add_argument("--api-url", default=DEFAULT_DASHBOARD_API_URL)
     connect.add_argument("--app-url", default=DEFAULT_DASHBOARD_APP_URL)
     connect.add_argument("--no-open", action="store_true", help="Do not open the connected dashboard in a browser.")
 
     dashboard = commands.add_parser("dashboard", help="Open the connected hosted workspace without exposing the token in output.")
-    dashboard.add_argument("--state", default=".evalt/evalt.db")
+    dashboard.add_argument("--state", help="Prefer a project-scoped connection for this route database.")
     dashboard.add_argument("--status", action="store_true", help="Show the connected workspace ID without opening a browser.")
 
     disconnect = commands.add_parser("disconnect", help="Remove the local hosted-workspace connection.")
-    disconnect.add_argument("--state", default=".evalt/evalt.db")
+    disconnect.add_argument("--state", help="Remove a project-scoped connection instead of the user-wide default.")
     return root
 
 
@@ -315,13 +315,18 @@ def main(argv: list[str] | None = None) -> int:
                 "workspace_id": workspace_fingerprint(config["workspace_token"]),
                 "opened": opened,
                 "dashboard": config["app_url"],
-                "config": str(dashboard_config_path(args.state)),
+                "config": config.get("config_path", str(dashboard_config_path(args.state))),
                 "workspace_token_printed": False,
             }, indent=2))
             return 0
         if args.command == "disconnect":
             removed = remove_dashboard_config(args.state)
-            print(json.dumps({"connected": False, "local_config_removed": removed, "remote_metadata_deleted": False}, indent=2))
+            print(json.dumps({
+                "connected": False,
+                "local_config_removed": removed,
+                "connection_scope": "project" if args.state else "all local projects",
+                "remote_metadata_deleted": False,
+            }, indent=2))
             return 0
         if args.command == "init":
             path = Path(args.path)

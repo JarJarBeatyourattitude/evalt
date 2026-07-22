@@ -48,14 +48,32 @@ def workspace_fingerprint(token: str) -> str:
     return f"ws_{digest}"
 
 
-def dashboard_config_path(state_path: str | Path = ".evalt/evalt.db") -> Path:
+def global_dashboard_config_path() -> Path:
+    """Return the user-wide workspace connection used across project folders."""
+
+    configured_home = os.environ.get("EVALT_CONFIG_HOME", "").strip()
+    if configured_home:
+        root = Path(configured_home).expanduser()
+    else:
+        try:
+            root = Path.home() / ".evalt"
+        except RuntimeError:
+            # Minimal containers may omit every conventional home-directory
+            # variable. Keep the optional dashboard bridge non-fatal there.
+            root = Path.cwd() / ".evalt"
+    return root.resolve() / "dashboard.json"
+
+
+def dashboard_config_path(state_path: str | Path | None = None) -> Path:
+    if state_path is None:
+        return global_dashboard_config_path()
     return Path(state_path).expanduser().resolve().parent / "dashboard.json"
 
 
 def save_dashboard_config(
     token: str,
     *,
-    state_path: str | Path = ".evalt/evalt.db",
+    state_path: str | Path | None = None,
     api_url: str = DEFAULT_DASHBOARD_API_URL,
     app_url: str = DEFAULT_DASHBOARD_APP_URL,
 ) -> Path:
@@ -81,24 +99,37 @@ def save_dashboard_config(
     return path
 
 
-def load_dashboard_config(state_path: str | Path = ".evalt/evalt.db") -> dict[str, str] | None:
+def load_dashboard_config(state_path: str | Path | None = None) -> dict[str, str] | None:
     token = os.environ.get("EVALT_WORKSPACE_TOKEN", "").strip()
     api_url = os.environ.get("EVALT_DASHBOARD_API_URL", DEFAULT_DASHBOARD_API_URL).strip()
     app_url = os.environ.get("EVALT_DASHBOARD_APP_URL", DEFAULT_DASHBOARD_APP_URL).strip()
     if token:
-        return {"workspace_token": validate_workspace_token(token), "api_url": api_url.rstrip("/"), "app_url": app_url.rstrip("/")}
-    path = dashboard_config_path(state_path)
-    if not path.exists():
-        return None
-    value = json.loads(path.read_text(encoding="utf-8"))
-    return {
-        "workspace_token": validate_workspace_token(value.get("workspace_token", "")),
-        "api_url": str(value.get("api_url") or api_url).rstrip("/"),
-        "app_url": str(value.get("app_url") or app_url).rstrip("/"),
-    }
+        return {
+            "workspace_token": validate_workspace_token(token),
+            "api_url": api_url.rstrip("/"),
+            "app_url": app_url.rstrip("/"),
+            "config_path": "environment:EVALT_WORKSPACE_TOKEN",
+        }
+    candidates = []
+    if state_path is not None:
+        candidates.append(dashboard_config_path(state_path))
+    candidates.append(global_dashboard_config_path())
+    checked: set[Path] = set()
+    for path in candidates:
+        if path in checked or not path.exists():
+            continue
+        checked.add(path)
+        value = json.loads(path.read_text(encoding="utf-8"))
+        return {
+            "workspace_token": validate_workspace_token(value.get("workspace_token", "")),
+            "api_url": str(value.get("api_url") or api_url).rstrip("/"),
+            "app_url": str(value.get("app_url") or app_url).rstrip("/"),
+            "config_path": str(path),
+        }
+    return None
 
 
-def remove_dashboard_config(state_path: str | Path = ".evalt/evalt.db") -> bool:
+def remove_dashboard_config(state_path: str | Path | None = None) -> bool:
     path = dashboard_config_path(state_path)
     if not path.exists():
         return False
@@ -278,7 +309,7 @@ class WorkspaceSync:
 
 __all__ = [
     "DEFAULT_DASHBOARD_API_URL", "DEFAULT_DASHBOARD_APP_URL", "WorkspaceSync",
-    "dashboard_config_path", "generate_workspace_token", "load_dashboard_config",
+    "dashboard_config_path", "generate_workspace_token", "global_dashboard_config_path", "load_dashboard_config",
     "remove_dashboard_config", "sanitize_progress_event", "sanitize_route_snapshot",
     "save_dashboard_config", "validate_workspace_token", "workspace_fingerprint",
 ]

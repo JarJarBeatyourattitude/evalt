@@ -18,7 +18,7 @@ from evalt.cli import STARTER_SUITE, main as cli_main, parser as cli_parser
 from evalt.acceptance import AcceptanceFailure, redact_trace, validate_auto_first_route_receipt
 from evalt.core import Completion, OpenRouterTransport, _automatic_target_max_tokens, _safe_provider_error_detail
 from evalt.migration import migrate_openai_results
-from evalt.dashboard import WorkspaceSync, generate_workspace_token, load_dashboard_config, remove_dashboard_config, sanitize_progress_event, sanitize_route_snapshot, save_dashboard_config, workspace_fingerprint
+from evalt.dashboard import WorkspaceSync, dashboard_config_path, generate_workspace_token, load_dashboard_config, remove_dashboard_config, sanitize_progress_event, sanitize_route_snapshot, save_dashboard_config, workspace_fingerprint
 from modelsieve import Client as ModelSieveClient
 from last_good_prompt import Client as LegacyClient
 from last_good_prompt.core import _Budget, CaseResult, ModelResult
@@ -61,12 +61,25 @@ class DashboardBridgeTests(unittest.TestCase):
         with TemporaryDirectory() as directory:
             state = Path(directory) / ".evalt" / "evalt.db"
             token = generate_workspace_token()
-            path = save_dashboard_config(token, state_path=state, api_url="https://api.example")
-            self.assertEqual(load_dashboard_config(state)["workspace_token"], token)
-            self.assertEqual(load_dashboard_config(state)["api_url"], "https://api.example")
-            self.assertTrue(path.exists())
-            self.assertTrue(remove_dashboard_config(state))
-            self.assertIsNone(load_dashboard_config(state))
+            with mock.patch.dict(os.environ, {"EVALT_CONFIG_HOME": str(Path(directory) / "global")}, clear=False):
+                path = save_dashboard_config(token, state_path=state, api_url="https://api.example")
+                self.assertEqual(load_dashboard_config(state)["workspace_token"], token)
+                self.assertEqual(load_dashboard_config(state)["api_url"], "https://api.example")
+                self.assertTrue(path.exists())
+                self.assertTrue(remove_dashboard_config(state))
+                self.assertIsNone(load_dashboard_config(state))
+
+    def test_user_wide_connection_follows_scripts_across_project_folders(self):
+        with TemporaryDirectory() as directory:
+            token = generate_workspace_token()
+            global_home = Path(directory) / "global"
+            unrelated_state = Path(directory) / "another-project" / ".evalt" / "evalt.db"
+            with mock.patch.dict(os.environ, {"EVALT_CONFIG_HOME": str(global_home)}, clear=False):
+                path = save_dashboard_config(token)
+                loaded = load_dashboard_config(unrelated_state)
+                self.assertEqual(path, dashboard_config_path())
+                self.assertEqual(loaded["workspace_token"], token)
+                self.assertEqual(loaded["config_path"], str(path))
 
     def test_sync_allowlist_excludes_customer_content_and_provider_secrets(self):
         event = sanitize_progress_event({
