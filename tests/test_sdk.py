@@ -18,6 +18,7 @@ from evalt.cli import STARTER_SUITE, main as cli_main, parser as cli_parser
 from evalt.acceptance import AcceptanceFailure, redact_trace, validate_auto_first_route_receipt
 from evalt.core import Completion, OpenRouterTransport, _safe_provider_error_detail
 from evalt.migration import migrate_openai_results
+from evalt.dashboard import WorkspaceSync, generate_workspace_token, load_dashboard_config, remove_dashboard_config, sanitize_progress_event, sanitize_route_snapshot, save_dashboard_config
 from modelsieve import Client as ModelSieveClient
 from last_good_prompt import Client as LegacyClient
 from last_good_prompt.core import _Budget, ModelResult
@@ -27,6 +28,237 @@ class CompatibilityTests(unittest.TestCase):
     def test_earlier_imports_resolve_to_evalt_client(self):
         self.assertIs(LegacyClient, Client)
         self.assertIs(ModelSieveClient, Client)
+
+
+class DashboardBridgeTests(unittest.TestCase):
+    def test_connection_config_is_private_and_removable(self):
+        with TemporaryDirectory() as directory:
+            state = Path(directory) / ".evalt" / "evalt.db"
+            token = generate_workspace_token()
+            path = save_dashboard_config(token, state_path=state, api_url="https://api.example")
+            self.assertEqual(load_dashboard_config(state)["workspace_token"], token)
+            self.assertEqual(load_dashboard_config(state)["api_url"], "https://api.example")
+            self.assertTrue(path.exists())
+            self.assertTrue(remove_dashboard_config(state))
+            self.assertIsNone(load_dashboard_config(state))
+
+    def test_sync_allowlist_excludes_customer_content_and_provider_secrets(self):
+        event = sanitize_progress_event({
+            "event": "model_completed", "route": "support", "model": "cheap",
+            "prompt": "private prompt", "input": "private input", "output": "private output",
+            "api_key": "secret", "validation_pass_rate": 1.0,
+            "error": "provider echoed private prompt",
+        })
+        self.assertEqual(event["validation_pass_rate"], 1.0)
+        self.assertFalse({"prompt", "input", "output", "api_key"} & set(event))
+        self.assertNotIn("private prompt", event["error"])
+        snapshot = sanitize_route_snapshot({
+            "route": "support", "selected_model": "cheap", "target_accuracy": 0.95,
+            "selected_prompt": "private", "tested_request_options": {"temperature": 0},
+            "last_test_summary": {"holdout_pass_rate": 1.0, "winner_prompt": "private"},
+        })
+        self.assertEqual(snapshot["last_test_summary"], {"holdout_pass_rate": 1.0})
+        self.assertNotIn("selected_prompt", snapshot)
+        self.assertNotIn("tested_request_options", snapshot)
+
+    def test_sync_preserves_safe_progress_metrics_needed_to_explain_a_live_tournament(self):
+        event = sanitize_progress_event({
+            "event": "model_screen_completed", "route": "support",
+            "run_id": "evr_abcdefghijklmnop", "run_state": "running",
+            "run_started_at": "2026-07-21T10:00:00Z",
+            "model": "cheap#reasoning=low", "configurations": 12,
+            "parallel_models": 10, "validation_pass_rate": 0.8,
+            "target_latency_p90_ms": 432, "screening_spend_usd": 0.0012,
+            "candidate": 1, "kind": "optimizer_rewrite",
+            "training_pass_rate": 0.6, "selected": False,
+            "quality_threshold": 0.95, "reason": "validation did not clear the gate",
+            "prompt": "private prompt",
+        })
+        self.assertEqual(event["configurations"], 12)
+        self.assertEqual(event["parallel_models"], 10)
+        self.assertEqual(event["target_latency_p90_ms"], 432)
+        self.assertEqual(event["screening_spend_usd"], 0.0012)
+        self.assertEqual(event["candidate"], 1)
+        self.assertEqual(event["kind"], "optimizer_rewrite")
+        self.assertEqual(event["training_pass_rate"], 0.6)
+        self.assertEqual(event["reason"], "validation did not clear the gate")
+        self.assertEqual(event["run_id"], "evr_abcdefghijklmnop")
+        self.assertEqual(event["run_state"], "running")
+        self.assertNotIn("prompt", event)
+
+    def test_dashboard_failure_never_raises_into_the_provider_workflow(self):
+        def unavailable(_method, _path, _payload):
+            raise OSError("dashboard unavailable")
+
+        sync = WorkspaceSync(generate_workspace_token(), api_url="https://api.example", sender=unavailable)
+        sync.publish_event({"event": "production_call_started", "route": "support"})
+        sync.publish_route({"route": "support", "selected_model": "cheap"})
+        self.assertTrue(sync.flush())
+        self.assertIn("dashboard unavailable", sync.last_error)
+
+    def test_progress_and_final_route_share_one_hosted_write(self):
+        sent = []
+
+        def capture(method, path, payload):
+            sent.append((method, path, payload))
+
+        sync = WorkspaceSync(generate_workspace_token(), api_url="https://api.example", sender=capture)
+        sync.publish_event({"event": "production_call_completed", "route": "support", "completed": 1, "total": 1})
+        sync.publish_route({"route": "support", "selected_model": "cheap"})
+        self.assertTrue(sync.flush())
+        self.assertEqual(len(sent), 1)
+        method, path, payload = sent[0]
+        self.assertEqual(method, "POST")
+        self.assertEqual(path, "/api/workspace/routes/support/sync")
+        self.assertEqual(payload["snapshot"]["selected_model"], "cheap")
+        self.assertEqual(payload["events"][0]["event"], "production_call_completed")
+
+    def test_one_burst_keeps_two_local_routes_isolated(self):
+        sent = []
+        sync = WorkspaceSync(
+            generate_workspace_token(), api_url="https://api.example",
+            sender=lambda method, path, payload: sent.append((method, path, payload)),
+        )
+        for route in ("support", "invoice"):
+            sync.publish_event({
+                "event": "model_screen_completed", "route": route,
+                "completed": 1, "total": 2,
+            })
+            sync.publish_route({"route": route, "selected_model": f"{route}-model"})
+        self.assertTrue(sync.flush())
+        self.assertEqual(len(sent), 2)
+        by_path = {path: payload for _method, path, payload in sent}
+        self.assertEqual(
+            by_path["/api/workspace/routes/support/sync"]["snapshot"]["selected_model"],
+            "support-model",
+        )
+        self.assertEqual(
+            by_path["/api/workspace/routes/invoice/sync"]["snapshot"]["selected_model"],
+            "invoice-model",
+        )
+
+    def test_dashboard_only_connection_receives_detailed_optimizer_progress(self):
+        class CapturingSync:
+            def __init__(self): self.events = []
+            def publish_event(self, value): self.events.append(dict(value))
+            def publish_route(self, _value): pass
+            def flush(self, _timeout_seconds): return True
+
+        sync = CapturingSync()
+        result = mock.Mock(regression_suite={}, warnings=[])
+        suite = Suite(
+            name="dashboard-deep-progress",
+            prompt="Return the approved route label only.",
+            examples=tuple(
+                Example.from_value(item, index)
+                for index, item in enumerate(EXAMPLES)
+            ),
+            models=("cheap",), optimizer_model="optimizer",
+            evaluator_model="evaluator", evaluator={"type": "exact_text"},
+            optimize_prompt=False,
+        )
+        with mock.patch("evalt.core.WorkspaceSync", return_value=sync):
+            evalt = Evalt(
+                transport=FakeTransport(), show_progress=False,
+                dashboard_token=generate_workspace_token(),
+                dashboard_api_url="https://api.example",
+            )
+
+        def optimize(**kwargs):
+            kwargs["progress_callback"]({
+                "event": "model_screen_completed", "model": "cheap",
+                "validation_pass_rate": 1.0,
+            })
+            return result
+
+        with mock.patch.object(evalt.client, "optimize", side_effect=optimize):
+            self.assertIs(evalt.run(suite), result)
+        measured = next(item for item in sync.events if item["event"] == "model_screen_completed")
+        self.assertEqual(measured["route"], "dashboard-deep-progress")
+        self.assertEqual(sync.events[0]["event"], "run_started")
+        self.assertEqual(sync.events[-1]["event"], "run_completed")
+        self.assertEqual(sync.events[-1]["run_state"], "completed")
+        self.assertTrue(sync.events[-1]["run_finished_at"])
+        self.assertEqual(len({item["run_id"] for item in sync.events}), 1)
+
+    def test_connect_cli_saves_the_capability_without_printing_it(self):
+        with TemporaryDirectory() as directory:
+            state = Path(directory) / ".evalt" / "evalt.db"
+            token = generate_workspace_token()
+            output = StringIO()
+            with redirect_stdout(output):
+                self.assertEqual(cli_main([
+                    "connect", token, "--state", str(state), "--no-open",
+                    "--api-url", "https://api.example", "--app-url", "https://app.example",
+                ]), 0)
+            self.assertNotIn(token, output.getvalue())
+            self.assertTrue(json.loads(output.getvalue())["connected"])
+            self.assertEqual(load_dashboard_config(state)["workspace_token"], token)
+
+    def test_damaged_optional_dashboard_config_cannot_block_local_startup(self):
+        with TemporaryDirectory() as directory:
+            state = Path(directory) / ".evalt" / "evalt.db"
+            state.parent.mkdir(parents=True)
+            (state.parent / "dashboard.json").write_text("{broken", encoding="utf-8")
+            evalt = Evalt(transport=FakeTransport(), state_path=state)
+            self.assertIsNotNone(evalt.client)
+
+    def test_evalt_run_publishes_progress_and_final_route_then_flushes(self):
+        class CapturingSync:
+            def __init__(self):
+                self.events = []
+                self.routes = []
+                self.flushes = []
+
+            def publish_event(self, value): self.events.append(dict(value))
+            def publish_route(self, value): self.routes.append(dict(value))
+            def flush(self, timeout_seconds): self.flushes.append(timeout_seconds); return True
+
+        sync = CapturingSync()
+        with TemporaryDirectory() as directory, mock.patch("evalt.core.WorkspaceSync", return_value=sync):
+            evalt = Evalt(
+                transport=FakeTransport(), state_path=Path(directory) / "evalt.db",
+                dashboard_token=generate_workspace_token(), dashboard_api_url="https://api.example",
+            )
+            answer = evalt.run(
+                "Return the approved route label only.", "charged twice",
+                route="dashboard-route", price_usd=0.01, models=["cheap"],
+                auto_maintain=False, first_run="bootstrap",
+            )
+        self.assertEqual(answer.content, "billing")
+        self.assertIn("production_call_completed", [item["event"] for item in sync.events])
+        self.assertEqual(sync.routes[-1]["route"], "dashboard-route")
+        self.assertTrue(sync.flushes)
+
+    def test_failed_sdk_run_closes_the_same_dashboard_lifecycle(self):
+        class CapturingSync:
+            def __init__(self): self.events = []
+            def publish_event(self, value): self.events.append(dict(value))
+            def publish_route(self, _value): pass
+            def flush(self, _timeout_seconds): return True
+
+        sync = CapturingSync()
+        with TemporaryDirectory() as directory, mock.patch(
+            "evalt.core.WorkspaceSync", return_value=sync,
+        ):
+            evalt = Evalt(
+                transport=FakeTransport(), state_path=Path(directory) / "evalt.db",
+                dashboard_token=generate_workspace_token(),
+                dashboard_api_url="https://api.example",
+            )
+            with mock.patch.object(
+                evalt.router, "run", side_effect=ProviderError("private provider detail"),
+            ), self.assertRaises(ProviderError):
+                evalt.run(
+                    "Return one label.", "private input", route="failed-route",
+                    first_run="bootstrap", models=["cheap"], auto_maintain=False,
+                )
+        self.assertEqual(sync.events[0]["event"], "run_started")
+        self.assertEqual(sync.events[-1]["event"], "run_failed")
+        self.assertEqual(sync.events[-1]["run_state"], "failed")
+        self.assertEqual(
+            sync.events[0]["run_id"], sync.events[-1]["run_id"],
+        )
 
 
 class AutomaticFirstRouteAcceptanceTests(unittest.TestCase):
@@ -280,8 +512,13 @@ class CaseDesignerTransport(FakeTransport):
     def complete(self, model, messages, *, max_tokens, response_schema=None):
         if response_schema and "Design a balanced evaluation suite" in messages[0]["content"]:
             self.calls.append((model, messages, max_tokens, response_schema))
+            scenario_count = int(
+                response_schema.get("properties", {})
+                .get("scenarios", {})
+                .get("maxItems", 25)
+            )
             scenarios = []
-            for index in range(25):
+            for index in range(scenario_count):
                 category = index % 3
                 if category == 0:
                     input_text, approved = f"I was charged twice, case {index}", "billing"
@@ -327,23 +564,7 @@ class CaseDesignerTransport(FakeTransport):
                 ],
                 "design_notes": ["Balanced three routing labels before splitting."],
             }
-            if "strata" in response_schema.get("properties", {}):
-                design_payload["strata"] = [
-                    {
-                        "group": f"family-{group_index + 1}",
-                        "scenarios": [
-                            {
-                                key: value for key, value in scenario.items()
-                                if key != "group"
-                            }
-                            for scenario in scenarios
-                            if scenario["group"] == f"family-{group_index + 1}"
-                        ],
-                    }
-                    for group_index in range(5)
-                ]
-            else:
-                design_payload["scenarios"] = scenarios
+            design_payload["scenarios"] = scenarios
             content = json.dumps(design_payload)
             return Completion(
                 content, model, f"gen-{len(self.calls)}",
@@ -388,6 +609,13 @@ class DesignerFallbackTransport(CaseDesignerTransport):
                 "id": "secondary-designer",
                 "intelligence": 90,
                 "blended_price": 0.2,
+                "supported_parameters": ["max_tokens"],
+            },
+            {
+                "id": "tertiary-designer",
+                "intelligence": 95,
+                "blended_price": 0.3,
+                "private_provider_routes": 3,
                 "supported_parameters": ["max_tokens"],
             },
             {
@@ -469,11 +697,7 @@ class NumericScoreDesignerTransport(CaseDesignerTransport):
                 "maximum": 100,
                 "absolute_tolerance": 10,
             })
-            scenarios = [
-                scenario
-                for stratum in payload["strata"]
-                for scenario in stratum["scenarios"]
-            ]
+            scenarios = payload["scenarios"]
             for index, scenario in enumerate(scenarios):
                 scenario["turns"][0]["approved_output"] = str((index * 4) % 101)
             return Completion(
@@ -485,6 +709,27 @@ class NumericScoreDesignerTransport(CaseDesignerTransport):
         return super().complete(
             model, messages, max_tokens=max_tokens, response_schema=response_schema
         )
+
+
+class NullScaleNumericDesignerTransport(NumericScoreDesignerTransport):
+    def complete(self, model, messages, *, max_tokens, response_schema=None):
+        completion = super().complete(
+            model, messages, max_tokens=max_tokens, response_schema=response_schema
+        )
+        if response_schema and "Design a balanced evaluation suite" in messages[0]["content"]:
+            payload = json.loads(completion.content)
+            payload["evaluator"].update({
+                "minimum": None,
+                "maximum": None,
+                "absolute_tolerance": None,
+            })
+            for index, scenario in enumerate(payload["scenarios"]):
+                scenario["turns"][0]["approved_output"] = str(index % 11)
+            return Completion(
+                json.dumps(payload), completion.model, completion.generation_id,
+                completion.cost_usd,
+            )
+        return completion
 
 
 class FailingCaseDesignerTransport(CaseDesignerTransport):
@@ -1406,8 +1651,13 @@ class SdkTests(unittest.TestCase):
             self.assertIn("no tournament ran", rendered)
             self.assertEqual(
                 [event["event"] for event in events],
-                ["production_call_started", "production_call_completed"],
+                [
+                    "run_started", "production_call_started",
+                    "production_call_completed", "run_completed",
+                ],
             )
+            self.assertEqual(len({event["run_id"] for event in events}), 1)
+            self.assertEqual(events[-1]["run_state"], "completed")
 
     def test_interactive_progress_surfaces_the_parallel_broad_screen(self):
         stream = StringIO()
@@ -1419,7 +1669,7 @@ class SdkTests(unittest.TestCase):
                 "case_count": 25,
                 "workflow_budget_usd": 1,
                 "designer_model": "smart-designer",
-                "designer_timeout_seconds": 300,
+                "designer_timeout_seconds": 120,
             })
             evalt._emit_progress({
                 "event": "suite_design_attempt_started",
@@ -1486,7 +1736,7 @@ class SdkTests(unittest.TestCase):
                 "elapsed_seconds": 24.6,
             })
         rendered = stream.getvalue()
-        self.assertIn("25 cases · smart-designer · deadline 300s", rendered)
+        self.assertIn("25 cases · smart-designer · deadline 120s", rendered)
         self.assertIn("smart-designer · attempt 1/2 · request started", rendered)
         self.assertIn("TEST DRAFT REJECTED · smart-designer · attempt 1/2", rendered)
         self.assertIn("retrying this model within the workflow cap", rendered)
@@ -1892,6 +2142,23 @@ class SdkTests(unittest.TestCase):
         self.assertGreaterEqual(len(deep.target_models), len(lean.target_models))
         self.assertNotEqual(lean.judge_model, "tiny")
 
+    def test_role_policy_uses_live_catalog_rank_when_absolute_scores_are_missing(self):
+        catalog = [
+            {
+                "id": f"ranked-{index}",
+                "intelligence": None,
+                "intelligence_rank": index,
+                "blended_price": 0.1 * index,
+                "private_provider_routes": 3,
+            }
+            for index in range(1, 9)
+        ]
+        plan = select_role_plan(catalog, maintenance_budget_usd=1.0)
+        self.assertNotEqual(plan.catalog_revision, "fallback")
+        self.assertEqual(plan.test_designer_model, "ranked-1")
+        self.assertTrue(plan.designer_candidates)
+        self.assertNotIn(plan.judge_model, plan.designer_candidates)
+
     def test_standard_role_policy_screens_ten_distinct_models_before_reasoning_hone(self):
         catalog = [
             {
@@ -2096,7 +2363,7 @@ class SdkTests(unittest.TestCase):
             case_count=25,
             workflow_budget_usd=1,
         )
-        self.assertEqual(draft.designer_model, "secondary-designer")
+        self.assertEqual(draft.designer_model, "tertiary-designer")
         self.assertTrue(any("Designer fallback" in note for note in draft.design_notes))
         self.assertEqual(
             [event["event"] for event in events if event["event"] == "suite_designer_unavailable"],
@@ -2107,8 +2374,21 @@ class SdkTests(unittest.TestCase):
                 event["designer_model"] for event in events
                 if event["event"] == "suite_design_attempt_started"
             ],
-            ["primary-designer", "secondary-designer"],
+            ["primary-designer", "tertiary-designer"],
         )
+
+    def test_explicit_target_models_do_not_discard_live_designer_roles(self):
+        evalt = Evalt(transport=DesignerFallbackTransport())
+        draft = evalt.design_suite(
+            task="Classify recurring support tickets into one routing label.",
+            prompt="Return exactly one lowercase label: billing, account, or technical.",
+            route="designer-role-with-explicit-targets",
+            case_count=25,
+            workflow_budget_usd=1,
+            models=["cheap-target"],
+        )
+        self.assertEqual(draft.designer_model, "tertiary-designer")
+        self.assertEqual(draft.models, ("cheap-target",))
 
     def test_ai_suite_design_rejects_a_judge_that_cannot_detect_known_failure(self):
         with TemporaryDirectory() as directory:
@@ -2147,7 +2427,7 @@ class SdkTests(unittest.TestCase):
             evaluator_model="evaluator",
         )
         self.assertEqual(len(draft.examples), 25)
-        self.assertEqual(transport.design_attempts, 2)
+        self.assertEqual(transport.design_attempts, 10)
         attempts = [
             event for event in events
             if event["event"] == "suite_design_attempt_started"
@@ -2224,9 +2504,36 @@ class SdkTests(unittest.TestCase):
         far, _far_completion = evalt.client._judge(
             example, turn, 0, [], "25", "unused", _Budget(0), dict(draft.evaluator)
         )
+        labeled, _labeled_completion = evalt.client._judge(
+            example, turn, 0, [], "score: 8", "unused", _Budget(0), dict(draft.evaluator)
+        )
+        ambiguous, _ambiguous_completion = evalt.client._judge(
+            example, turn, 0, [], "8 out of 10", "unused", _Budget(0), dict(draft.evaluator)
+        )
         self.assertTrue(close.passed)
+        self.assertTrue(labeled.passed)
         self.assertFalse(far.passed)
+        self.assertFalse(ambiguous.passed)
         self.assertEqual(close_completion.model, "deterministic/numeric_tolerance")
+
+    def test_null_designer_scale_is_recovered_from_explicit_customer_contract(self):
+        draft = Evalt(transport=NullScaleNumericDesignerTransport()).design_suite(
+            task="Judge sentiment of recurring messages.",
+            prompt="Judge sentiment from 0 for most negative to 10 for most positive.",
+            route="numeric-scale-recovery",
+            case_count=25,
+            workflow_budget_usd=1,
+            models=["cheap"],
+            designer_model="designer",
+            evaluator_model="evaluator",
+        )
+        self.assertEqual(draft.evaluator["minimum"], 0.0)
+        self.assertEqual(draft.evaluator["maximum"], 10.0)
+        self.assertEqual(draft.evaluator["absolute_tolerance"], 2.0)
+        self.assertTrue(any(
+            "task-sensitive equivalence tolerance" in note
+            for note in draft.design_notes
+        ))
 
     def test_ai_generated_semantic_suite_never_uses_its_designer_as_the_judge(self):
         evalt = Evalt(transport=SemanticMiscalibratedDesignerTransport())
@@ -2333,6 +2640,21 @@ class SdkTests(unittest.TestCase):
                     designer_request_timeout_seconds=211,
                 )
             self.assertEqual(observed["timeout_seconds"], 211)
+
+    def test_automatic_first_route_bounds_prompt_rewrite_rounds(self):
+        with TemporaryDirectory() as directory:
+            evalt = Evalt(
+                transport=FakeTransport(),
+                state_path=Path(directory) / "evalt.db",
+            )
+            with self.assertRaisesRegex(ValueError, "optimization_rounds"):
+                evalt.run(
+                    "Return one lowercase route label.",
+                    "the website will not load",
+                    task="Route recurring customer support tickets.",
+                    route="invalid-round-count",
+                    optimization_rounds=0,
+                )
 
     def test_transport_defaults_to_ten_minutes_and_allows_long_complex_jobs(self):
         transport = OpenRouterTransport("sk-or-v1-test-key")
@@ -2608,6 +2930,55 @@ class SdkTests(unittest.TestCase):
         )
         self.assertEqual(completion.generation_id, "gen-fallback")
         self.assertEqual(requests[0]["provider"]["only"], ["first/route", "second/route"])
+        self.assertEqual(requests[1]["provider"]["only"], ["second/route"])
+
+    def test_provider_specific_400_retries_another_preflighted_route(self):
+        requests = []
+
+        def opener(request, timeout):
+            if request.data is not None:
+                requests.append(json.loads(request.data))
+                if len(requests) == 1:
+                    detail = json.dumps({
+                        "message": "Provider returned error",
+                        "code": 400,
+                        "provider": "First",
+                    }).encode()
+                    raise HTTPError(request.full_url, 400, "provider error", {}, BytesIO(detail))
+                return FakeResponse({
+                    "id": "gen-second-provider",
+                    "choices": [{"finish_reason": "stop", "message": {"content": "{}"}}],
+                    "usage": {"cost": 0.0001, "prompt_tokens": 4, "completion_tokens": 1},
+                })
+            if "endpoints/zdr" in request.full_url:
+                return FakeResponse({"data": [
+                    {
+                        "model_id": "fallback-model", "tag": "first/route", "provider_name": "First",
+                        "context_length": 131072, "max_completion_tokens": 131072,
+                        "pricing": {"prompt": "0.00000001", "completion": "0.00000001"},
+                        "supported_parameters": ["max_completion_tokens", "structured_outputs"],
+                    },
+                    {
+                        "model_id": "fallback-model", "tag": "second/route", "provider_name": "Second",
+                        "context_length": 131072, "max_completion_tokens": 131072,
+                        "pricing": {"prompt": "0.00000002", "completion": "0.00000002"},
+                        "supported_parameters": ["max_completion_tokens", "structured_outputs"],
+                    },
+                ]})
+            return FakeResponse({"data": [{
+                "id": "fallback-model", "context_length": 131072,
+                "top_provider": {"context_length": 131072, "max_completion_tokens": 131072},
+                "pricing": {"prompt": "0.00000001", "completion": "0.00000001"},
+                "supported_parameters": ["max_completion_tokens", "structured_outputs"],
+            }]})
+
+        completion = OpenRouterTransport(
+            "sk-or-v1-test-key", opener=opener,
+        ).complete(
+            "fallback-model", [{"role": "user", "content": "hello"}], max_tokens=25,
+            response_schema={"type": "object"},
+        )
+        self.assertEqual(completion.generation_id, "gen-second-provider")
         self.assertEqual(requests[1]["provider"]["only"], ["second/route"])
 
     def test_empty_completion_falls_back_to_another_preflighted_provider_without_expanding_tokens(self):

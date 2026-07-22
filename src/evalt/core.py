@@ -8,8 +8,12 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from dataclasses import asdict, dataclass, field, replace
+from functools import wraps
+import copy
 import json
 from pathlib import Path
+import re
+import secrets
 import sys
 import threading
 import time
@@ -30,6 +34,7 @@ from last_good_prompt.core import (
     ProviderError,
     Turn,
     _Budget,
+    _extract_single_numeric_scalar,
     _safe_provider_error_detail,
     _validate_evaluator_policy,
     normalize_request_options,
@@ -39,6 +44,103 @@ from .router import (
     DEFAULT_TARGETS, DurableRouter, RequestEnvelopeDriftWarning, RolePlan,
     RoutedAnswer, select_role_plan,
 )
+from .dashboard import DEFAULT_DASHBOARD_API_URL, WorkspaceSync, load_dashboard_config
+
+
+_NUMBER_WORDS = {
+    "zero": 0.0, "one": 1.0, "two": 2.0, "three": 3.0, "four": 4.0,
+    "five": 5.0, "six": 6.0, "seven": 7.0, "eight": 8.0,
+    "nine": 9.0, "ten": 10.0, "hundred": 100.0,
+}
+
+
+def _infer_numeric_scale_contract(*values: str) -> tuple[float, float] | None:
+    """Recover an explicit rating range from the customer-owned task contract."""
+
+    text = " ".join(str(value) for value in values).casefold()
+    numeric_patterns = (
+        r"\bfrom\s+(-?\d+(?:\.\d+)?)\b.{0,120}?\bto\s+(-?\d+(?:\.\d+)?)\b",
+        r"\bbetween\s+(-?\d+(?:\.\d+)?)\b.{0,80}?\band\s+(-?\d+(?:\.\d+)?)\b",
+        r"\b(-?\d+(?:\.\d+)?)\s*(?:-|–|—|to)\s*(-?\d+(?:\.\d+)?)\b",
+    )
+    for pattern in numeric_patterns:
+        match = re.search(pattern, text, flags=re.DOTALL)
+        if match:
+            minimum, maximum = float(match.group(1)), float(match.group(2))
+            if maximum > minimum:
+                return minimum, maximum
+    word_pattern = (
+        r"\b(" + "|".join(_NUMBER_WORDS) + r")\s*(?:-|–|—|to)\s*("
+        + "|".join(_NUMBER_WORDS) + r")\b"
+    )
+    match = re.search(word_pattern, text)
+    if match:
+        minimum = _NUMBER_WORDS[match.group(1)]
+        maximum = _NUMBER_WORDS[match.group(2)]
+        if maximum > minimum:
+            return minimum, maximum
+    return None
+
+
+def _default_numeric_tolerance(
+    task: str, prompt: str, minimum: float, maximum: float
+) -> float:
+    """Use a wider equivalence band only for irreducibly subjective ratings."""
+
+    contract = f"{task} {prompt}".casefold()
+    subjective_markers = (
+        "sentiment", "satisfaction", "tone", "mood", "preference",
+        "likelihood", "quality rating", "severity rating", "opinion",
+    )
+    fraction = 0.20 if any(marker in contract for marker in subjective_markers) else 0.10
+    return (maximum - minimum) * fraction
+
+
+def _dashboard_run_scope(method):
+    """Give one public SDK invocation a stable opaque dashboard lifecycle."""
+
+    @wraps(method)
+    def wrapped(self, suite_or_prompt, *args, **kwargs):
+        current = getattr(self._dashboard_run_local, "context", None)
+        if current is not None:
+            return method(self, suite_or_prompt, *args, **kwargs)
+        route = (
+            str(getattr(suite_or_prompt, "name", "") or "default")
+            if isinstance(suite_or_prompt, Suite)
+            else str(kwargs.get("route") or "default")
+        )
+        context = {
+            "run_id": f"evr_{secrets.token_urlsafe(12)}",
+            "run_state": "running",
+            "run_started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "route": route,
+        }
+        self._dashboard_run_local.context = context
+        self._emit_progress({"event": "run_started", "route": route})
+        try:
+            result = method(self, suite_or_prompt, *args, **kwargs)
+            context["run_state"] = "completed"
+            context["run_finished_at"] = time.strftime(
+                "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
+            )
+            self._emit_progress({"event": "run_completed", "route": route})
+            self.flush_dashboard(timeout_seconds=8.0)
+            return result
+        except Exception:
+            context["run_state"] = "failed"
+            context["run_finished_at"] = time.strftime(
+                "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
+            )
+            self._emit_progress({"event": "run_failed", "route": route})
+            self.flush_dashboard(timeout_seconds=4.0)
+            raise
+        finally:
+            try:
+                del self._dashboard_run_local.context
+            except AttributeError:
+                pass
+
+    return wrapped
 
 
 @dataclass(frozen=True)
@@ -449,6 +551,8 @@ class Evalt:
         request_timeout_seconds: float = 600,
         show_progress: bool | None = None,
         progress_callback: Callable[[dict[str, Any]], None] | None = None,
+        dashboard_token: str | None = None,
+        dashboard_api_url: str | None = None,
     ) -> None:
         if transport is not None and request_timeout_seconds != 600:
             raise ValueError("request_timeout_seconds cannot be combined with a custom transport.")
@@ -463,11 +567,37 @@ class Evalt:
             if show_progress is None else bool(show_progress)
         )
         self._progress_callback = progress_callback
+        dashboard_config = None
+        if dashboard_token is None:
+            try:
+                dashboard_config = load_dashboard_config(self._state_path)
+            except (OSError, ValueError):
+                # A missing, partial, or manually damaged optional dashboard config
+                # cannot prevent the local production router from starting.
+                dashboard_config = None
+        resolved_dashboard_token = dashboard_token or (dashboard_config or {}).get("workspace_token")
+        resolved_dashboard_url = dashboard_api_url or (dashboard_config or {}).get("api_url") or DEFAULT_DASHBOARD_API_URL
+        self._dashboard_sync = (
+            WorkspaceSync(resolved_dashboard_token, api_url=resolved_dashboard_url)
+            if resolved_dashboard_token and resolved_dashboard_url
+            else None
+        )
+        self._dashboard_run_local = threading.local()
         self._maintenance_guard = threading.Lock()
         self._maintenance_routes: set[str] = set()
         self._maintenance_threads: list[threading.Thread] = []
 
     def _emit_progress(self, event: dict[str, Any]) -> None:
+        event = dict(event)
+        run_context = getattr(self._dashboard_run_local, "context", None)
+        if run_context is not None:
+            for key in (
+                "run_id", "run_state", "run_started_at", "run_finished_at",
+            ):
+                if key in run_context:
+                    event.setdefault(key, run_context[key])
+        if self._dashboard_sync is not None:
+            self._dashboard_sync.publish_event(event)
         if self._progress_callback is not None:
             self._progress_callback(dict(event))
         if not self._show_progress:
@@ -839,7 +969,11 @@ class Evalt:
 
         requested_models = tuple(models) if models is not None else DEFAULT_TARGETS
         catalog: list[Mapping[str, Any]] = []
-        if models is None and hasattr(self.client.transport, "model_catalog"):
+        # Target candidates and orchestration roles are separate decisions. The
+        # outer Evalt.run call passes an already-shortlisted target set here, but
+        # the designer must still use the live catalog instead of falling back to
+        # a static role merely because target models are explicit.
+        if hasattr(self.client.transport, "model_catalog"):
             catalog = self.client.transport.model_catalog()
         role_plan = select_role_plan(
             catalog,
@@ -950,84 +1084,86 @@ class Evalt:
                 "representative_inputs_without_labels": representative_context,
                 "quality_target": quality_threshold,
             }
-            max_tokens = min(32768, max(4000, generated_count * 500))
-            if use_generated_groups:
-                # A flat list plus prose could not guarantee balanced strata in
-                # live structured output. Make the balance part of the schema:
-                # five named strata, each carrying its own bounded case list.
-                scenario_schema = schema["properties"].pop("scenarios")["items"]
-                scenario_schema["required"] = [
-                    value for value in scenario_schema["required"]
-                    if value != "group"
-                ]
-                scenario_schema["properties"].pop("group", None)
-                schema["required"] = [
-                    "evaluator", "judge_calibration", "strata", "design_notes"
-                ]
-                group_floor = generated_count // 5
-                group_ceiling = (generated_count + 4) // 5
-                schema["properties"]["strata"] = {
-                    "type": "array",
-                    "minItems": 5,
-                    "maxItems": 5,
-                    "items": {
-                        "type": "object",
-                        "additionalProperties": False,
-                        "required": ["group", "scenarios"],
-                        "properties": {
-                            "group": {"type": "string"},
-                            "scenarios": {
-                                "type": "array",
-                                "minItems": group_floor,
-                                "maxItems": group_ceiling,
-                                "items": scenario_schema,
-                            },
-                        },
-                    },
-                }
-                payload["required_output_shape"] = (
-                    f"Exactly five named behavior strata containing {generated_count} total scenarios; "
-                    f"each stratum must contain {group_floor} to {group_ceiling} scenarios."
-                )
-            group_instruction = (
-                "Return exactly five distinct, concise behavior strata in the required "
-                "nested shape. Put each scenario under its stratum; do not repeat cases "
-                "across strata. This ensures every behavior reaches training, validation, "
-                "and final-test splits."
-                if use_generated_groups
-                else "Set every scenario group to an empty string for this small exploratory draft."
+            coverage_focuses = (
+                "Routine and direct requests",
+                "Ambiguous and context-dependent requests",
+                "Adversarial, sarcastic, or deceptive requests",
+                "Boundary, neutral, and near-tie requests",
+                "Realistic vocabulary, tone, and domain variation",
             )
-            design_messages = [
-                {
-                    "role": "system",
-                    "content": (
-                        "Design a balanced evaluation suite for a recurring production AI task. "
-                        "Create genuinely distinct routine, complex, adversarial, boundary, format, "
-                        "and multi-turn cases where relevant; do not merely paraphrase seeds. "
-                        f"{group_instruction} "
-                        "Expected outputs describe the desired behavior, not what the current prompt happens to "
-                        "produce. Make each case concrete enough for a human to approve or edit. All "
-                        "cases are drafted before any train/validation/final-test split, so never label "
-                        "or target a split. Use numeric_tolerance for a scalar rating or score where nearby "
-                        "values are equivalent; include the stated minimum, maximum, and a defensible absolute "
-                        "tolerance (normally ten percent of the scale). Recommend exact_text or exact_json only "
-                        "when equivalent answers truly must match that deterministic contract; otherwise use semantic. "
-                        "Also create judge-calibration checks outside the scenario suite: at least two "
-                            "clear passes and one clear failure, each labeled with should_pass. A pass must "
-                            "fully satisfy every material requirement. A failure must be unmistakably wrong: "
-                            "contradict a required fact, omit a required field, choose an explicitly wrong "
-                            "label, or violate a hard format contract; never use a merely debatable wording. These are "
-                        "unapproved AI drafts. Representative inputs have no approved outputs; use them "
-                        "only to understand realistic shape, length, and domain, and do not copy them "
-                        "into the suite. Return only the required JSON."
+            if use_generated_groups:
+                base_count, remainder = divmod(generated_count, len(coverage_focuses))
+                job_specs = [
+                    (focus, base_count + int(index < remainder))
+                    for index, focus in enumerate(coverage_focuses)
+                ]
+            else:
+                job_specs = [("Exploratory coverage", generated_count)]
+            design_jobs: list[tuple[str, int, dict[str, Any], list[dict[str, str]], int]] = []
+            for focus, job_count in job_specs:
+                requested_job_count = job_count + 2 if use_generated_groups else job_count
+                job_schema = copy.deepcopy(schema)
+                job_schema["properties"]["scenarios"]["minItems"] = requested_job_count
+                job_schema["properties"]["scenarios"]["maxItems"] = requested_job_count
+                job_payload = dict(payload)
+                job_payload.update({
+                    "required_new_scenarios": requested_job_count,
+                    "coverage_focus": focus,
+                    "required_output_shape": (
+                        f"Exactly {requested_job_count} candidate scenarios for this coverage focus; "
+                        f"Evalt will retain five valid, contract-faithful cases. "
+                        f"Set every scenario group to {focus!r}."
                     ),
-                },
-                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
-            ]
+                })
+                group_instruction = (
+                    f"This is one of five parallel coverage batches. Focus only on {focus}. "
+                    f"Return exactly {requested_job_count} distinct candidate scenarios and set every group to {focus!r}. "
+                    "The other batches cover different behavior, so do not broaden into their territory."
+                    if use_generated_groups
+                    else "Set every scenario group to an empty string for this small exploratory draft."
+                )
+                job_messages = [
+                    {
+                        "role": "system",
+                        "content": (
+                            "Design a balanced evaluation suite batch for a recurring production AI task. "
+                            "Create genuinely distinct cases; do not merely paraphrase seeds. "
+                            f"{group_instruction} "
+                            "Preserve the customer's exact task contract. A scenario input is data the production "
+                            "prompt will receive, not a new instruction that changes the requested output shape. "
+                            "Never invent JSON, tables, multiple scores, explanations, IDs, or multi-turn behavior "
+                            "unless the current task or prompt explicitly requires it. If the task returns one scalar "
+                            "or one label, every approved output must contain exactly that one scalar or label. "
+                            "Expected outputs describe the desired behavior, not what the current prompt happens to "
+                            "produce. Make each case concrete enough for a human to approve or edit. All "
+                            "cases are drafted before any train/validation/final-test split, so never label "
+                            "or target a split. Use numeric_tolerance for a scalar rating or score where nearby "
+                            "values are equivalent; include the stated minimum, maximum, and a defensible absolute "
+                            "tolerance (twenty percent for subjective human ratings such as sentiment; tighter for objective values). Recommend exact_text or exact_json only "
+                            "when equivalent answers truly must match that deterministic contract; otherwise use semantic. "
+                            "Also create judge-calibration checks outside the scenario suite: at least two "
+                            "clear passes and one clear failure, each labeled with should_pass. A pass must "
+                            "fully satisfy every material requirement. A failure must be unmistakably wrong. "
+                            "These are unapproved AI drafts. Representative inputs have no approved outputs; use them "
+                            "only to understand realistic shape, length, and domain, and do not copy them "
+                            "into the suite. Return only the required JSON."
+                        ),
+                    },
+                    {"role": "user", "content": json.dumps(job_payload, ensure_ascii=False)},
+                ]
+                design_jobs.append((
+                    focus,
+                    job_count,
+                    job_schema,
+                    job_messages,
+                    min(12000, max(4000, requested_job_count * 600)),
+                ))
             designer_candidates = (
                 (selected_designer,)
                 if designer_model is not None
-                else tuple(dict.fromkeys((selected_designer, selected_evaluator)))
+                else tuple(dict.fromkeys(
+                    (selected_designer, *role_plan.designer_candidates)
+                ))
             )
             designer_failures: list[str] = []
             completion = None
@@ -1044,30 +1180,38 @@ class Evalt:
                     })
                     attempt_started = time.monotonic()
                     try:
-                        with ThreadPoolExecutor(max_workers=1) as pool:
-                            future = pool.submit(
-                                self.client._call,
-                                budget,
-                                designer_candidate,
-                                design_messages,
-                                max_tokens=max_tokens,
-                                response_schema=schema,
-                            )
-                            while True:
-                                try:
-                                    candidate_completion = future.result(timeout=10)
-                                    break
-                                except FutureTimeoutError:
-                                    self._emit_progress({
-                                        "event": "suite_design_heartbeat",
-                                        "route": route,
-                                        "designer_model": designer_candidate,
-                                        "attempt": structured_attempt,
-                                        "max_attempts": max_structured_attempts,
-                                        "elapsed_seconds": round(
-                                            time.monotonic() - attempt_started, 1
-                                        ),
-                                    })
+                        with ThreadPoolExecutor(max_workers=len(design_jobs)) as pool:
+                            futures = [
+                                pool.submit(
+                                    self.client._call,
+                                    budget,
+                                    designer_candidate,
+                                    job_messages,
+                                    max_tokens=job_max_tokens,
+                                    response_schema=job_schema,
+                                )
+                                for _focus, _count, job_schema, job_messages, job_max_tokens
+                                in design_jobs
+                            ]
+                            candidate_completions: list[Completion] = []
+                            for future in futures:
+                                while True:
+                                    try:
+                                        candidate_completions.append(
+                                            future.result(timeout=10)
+                                        )
+                                        break
+                                    except FutureTimeoutError:
+                                        self._emit_progress({
+                                            "event": "suite_design_heartbeat",
+                                            "route": route,
+                                            "designer_model": designer_candidate,
+                                            "attempt": structured_attempt,
+                                            "max_attempts": max_structured_attempts,
+                                            "elapsed_seconds": round(
+                                                time.monotonic() - attempt_started, 1
+                                            ),
+                                        })
                     except ProviderError as error:
                         designer_failures.append(f"{designer_candidate}: {error}")
                         self._emit_progress({
@@ -1079,22 +1223,158 @@ class Evalt:
                         break
 
                     try:
-                        candidate_text = str(candidate_completion.content).strip()
-                        if candidate_text.startswith("```"):
-                            candidate_text = (
-                                candidate_text.split("\n", 1)[-1]
-                                .rsplit("```", 1)[0]
-                                .strip()
+                        candidate_payloads: list[dict[str, Any]] = []
+                        for job_index, (
+                            focus, job_count, _job_schema, _job_messages, _job_tokens
+                        ) in enumerate(design_jobs):
+                            candidate_text = str(
+                                candidate_completions[job_index].content
+                            ).strip()
+                            if candidate_text.startswith("```"):
+                                candidate_text = (
+                                    candidate_text.split("\n", 1)[-1]
+                                    .rsplit("```", 1)[0]
+                                    .strip()
+                                )
+                            job_payload = json.loads(candidate_text)
+                            if not isinstance(job_payload, dict):
+                                raise TypeError("designer payload must be an object")
+                            required_payload_keys = {
+                                "evaluator", "judge_calibration", "design_notes", "scenarios",
+                            }
+                            if not required_payload_keys.issubset(job_payload):
+                                raise KeyError("designer payload is missing required fields")
+                            job_scenarios = list(job_payload["scenarios"])
+                            if len(job_scenarios) < job_count:
+                                raise ValueError(
+                                    f"{focus} returned {len(job_scenarios)} scenarios; needed at least {job_count}"
+                                )
+                            for scenario_index, raw_scenario in enumerate(job_scenarios):
+                                scenario = dict(raw_scenario)
+                                scenario["id"] = (
+                                    f"batch-{job_index + 1}-{scenario_index + 1}-"
+                                    f"{str(scenario.get('id') or 'case')}"
+                                )
+                                scenario["group"] = focus if use_generated_groups else ""
+                                job_scenarios[scenario_index] = scenario
+                            job_payload["scenarios"] = job_scenarios
+                            candidate_evaluator = dict(job_payload["evaluator"])
+                            if str(candidate_evaluator.get("type") or "") == "numeric_tolerance":
+                                missing_scale = any(
+                                    candidate_evaluator.get(key) is None
+                                    for key in ("minimum", "maximum", "absolute_tolerance")
+                                )
+                                if missing_scale:
+                                    inferred_scale = _infer_numeric_scale_contract(
+                                        task_text, prompt_text
+                                    )
+                                    if inferred_scale is not None:
+                                        minimum, maximum = inferred_scale
+                                        candidate_evaluator.update({
+                                            "minimum": minimum,
+                                            "maximum": maximum,
+                                            "absolute_tolerance": _default_numeric_tolerance(
+                                                task_text, prompt_text, minimum, maximum
+                                            ),
+                                        })
+                                        job_payload.setdefault("design_notes", []).append(
+                                            "Evalt recovered the explicit numeric scale from the customer task contract and applied a task-sensitive equivalence tolerance."
+                                        )
+                            job_payload["evaluator"] = _validate_evaluator_policy(
+                                candidate_evaluator
                             )
-                        candidate_payload = json.loads(candidate_text)
-                        if not isinstance(candidate_payload, dict):
-                            raise TypeError("designer payload must be an object")
-                        required_payload_keys = {
-                            "evaluator", "judge_calibration", "design_notes",
-                            "strata" if use_generated_groups else "scenarios",
-                        }
-                        if not required_payload_keys.issubset(candidate_payload):
-                            raise KeyError("designer payload is missing required fields")
+                            if job_payload["evaluator"]["type"] == "numeric_tolerance":
+                                minimum = float(job_payload["evaluator"]["minimum"])
+                                maximum = float(job_payload["evaluator"]["maximum"])
+                                allows_multiturn = any(
+                                    marker in f"{task_text} {prompt_text}".casefold()
+                                    for marker in (
+                                        "multi-turn", "multiturn", "conversation",
+                                        "chat history", "previous message", "prior message",
+                                    )
+                                )
+                                valid_scenarios: list[dict[str, Any]] = []
+                                for scenario in job_scenarios:
+                                    turns = list(scenario.get("turns") or [])
+                                    if not allows_multiturn and len(turns) != 1:
+                                        continue
+                                    scenario_valid = True
+                                    for turn in turns:
+                                        scalar = _extract_single_numeric_scalar(
+                                            turn.get("approved_output")
+                                        )
+                                        if scalar is None:
+                                            scenario_valid = False
+                                            break
+                                        if not minimum <= scalar <= maximum:
+                                            scenario_valid = False
+                                            break
+                                        turn["approved_output"] = f"{scalar:g}"
+                                    if scenario_valid:
+                                        valid_scenarios.append(scenario)
+                                if len(valid_scenarios) < job_count:
+                                    raise ValueError(
+                                        f"{focus} produced fewer than {job_count} valid numeric scenarios"
+                                    )
+                                job_payload["scenarios"] = valid_scenarios[:job_count]
+                            else:
+                                job_payload["scenarios"] = job_scenarios[:job_count]
+                            candidate_payloads.append(job_payload)
+                        # The first batch defines one evaluator contract for the
+                        # whole suite. Parallel batches may describe the same
+                        # scalar as JSON or prose; normalize every approved answer
+                        # against the shared contract before any split or spend.
+                        shared_evaluator = dict(candidate_payloads[0]["evaluator"])
+                        for job_payload in candidate_payloads:
+                            job_payload["evaluator"] = dict(shared_evaluator)
+                        if shared_evaluator["type"] == "numeric_tolerance":
+                            minimum = float(shared_evaluator["minimum"])
+                            maximum = float(shared_evaluator["maximum"])
+                            for (focus, job_count, *_rest), job_payload in zip(
+                                design_jobs, candidate_payloads
+                            ):
+                                valid_scenarios = []
+                                for scenario in job_payload["scenarios"]:
+                                    scenario_valid = True
+                                    for turn in scenario.get("turns") or []:
+                                        scalar = _extract_single_numeric_scalar(
+                                            turn.get("approved_output")
+                                        )
+                                        if scalar is None:
+                                            scenario_valid = False
+                                            break
+                                        if not minimum <= scalar <= maximum:
+                                            scenario_valid = False
+                                            break
+                                        turn["approved_output"] = f"{scalar:g}"
+                                    if scenario_valid:
+                                        valid_scenarios.append(scenario)
+                                if len(valid_scenarios) < job_count:
+                                    raise ValueError(
+                                        f"{focus} did not preserve enough one-scalar approved outputs"
+                                    )
+                                job_payload["scenarios"] = valid_scenarios[:job_count]
+                        candidate_payload = dict(candidate_payloads[0])
+                        if use_generated_groups:
+                            candidate_payload["strata"] = [
+                                {
+                                    "group": focus,
+                                    "scenarios": [
+                                        {
+                                            key: value for key, value in scenario.items()
+                                            if key != "group"
+                                        }
+                                        for scenario in job_payload["scenarios"]
+                                    ],
+                                }
+                                for (focus, _count, *_rest), job_payload
+                                in zip(design_jobs, candidate_payloads)
+                            ]
+                            candidate_payload["design_notes"] = [
+                                str(note)
+                                for job_payload in candidate_payloads
+                                for note in job_payload.get("design_notes", [])
+                            ]
                     except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
                         will_retry = structured_attempt < max_structured_attempts
                         designer_failures.append(
@@ -1112,7 +1392,7 @@ class Evalt:
                         })
                         continue
 
-                    completion = candidate_completion
+                    completion = candidate_completions[0]
                     parsed = candidate_payload
                     selected_designer = designer_candidate
                     break
@@ -1187,7 +1467,13 @@ class Evalt:
                         })
                     failure_turn = anchor_examples[0].conversation()[0]
                     if evaluator_type == "numeric_tolerance":
-                        expected_score = float(failure_turn.approved_output.strip())
+                        expected_score = _extract_single_numeric_scalar(
+                            failure_turn.approved_output
+                        )
+                        if expected_score is None:
+                            raise ValueError(
+                                "numeric approved output did not contain one unambiguous scalar"
+                            )
                         minimum = float(suggested_evaluator["minimum"])
                         maximum = float(suggested_evaluator["maximum"])
                         tolerance = float(suggested_evaluator["absolute_tolerance"])
@@ -1419,6 +1705,7 @@ class Evalt:
             self._router = DurableRouter(self.client, state_path=self._state_path)
         return self._router
 
+    @_dashboard_run_scope
     def run(
         self,
         suite_or_prompt: Suite | str,
@@ -1448,10 +1735,11 @@ class Evalt:
         task: str | None = None,
         first_run: str = "optimize",
         case_count: int = 25,
+        optimization_rounds: int = 1,
         designer_model: str | None = None,
         evaluator_model: str | None = None,
         test_request_timeout_seconds: float = 120,
-        designer_request_timeout_seconds: float = 300,
+        designer_request_timeout_seconds: float = 120,
     ) -> OptimizationResult | RoutedAnswer:
         if isinstance(suite_or_prompt, Suite):
             if input is not None:
@@ -1469,7 +1757,15 @@ class Evalt:
                     ),
                 )
             optimize_kwargs = suite_or_prompt.optimize_kwargs()
-            if self._show_progress or self._progress_callback is not None:
+            # A connected workspace is a progress consumer even when this is a
+            # non-interactive script with console logging disabled. Without this
+            # branch the dashboard received only the coarse outer run events and a
+            # long tournament looked frozen until its final snapshot arrived.
+            if (
+                self._show_progress
+                or self._progress_callback is not None
+                or self._dashboard_sync is not None
+            ):
                 def route_progress(event: dict[str, Any]) -> None:
                     scoped = dict(event)
                     scoped.setdefault("route", suite_or_prompt.name)
@@ -1501,6 +1797,8 @@ class Evalt:
             raise ValueError(
                 "designer_request_timeout_seconds must be greater than zero and no more than 7200 seconds."
             )
+        if not 1 <= int(optimization_rounds) <= 8:
+            raise ValueError("optimization_rounds must be between one and eight.")
         if isinstance(self.client.transport, OpenRouterTransport):
             self.client.transport.set_performance_policy(
                 preferred_max_latency_seconds=max_p90_latency_seconds,
@@ -1611,7 +1909,9 @@ class Evalt:
                     target_max_tokens=int(max_tokens or 600),
                     request_options=normalized_request_options,
                 )
-                initial_result = self.run(draft.autopilot_suite())
+                initial_result = self.run(replace(
+                    draft.autopilot_suite(), rounds=int(optimization_rounds)
+                ))
                 initial_test_spend_usd = round(
                     draft.designer_spend_usd + initial_result.total_provider_spend_usd,
                     10,
@@ -1678,10 +1978,16 @@ class Evalt:
             self._emit_progress({
                 "event": "production_call_failed", "route": route, "error": str(error)
             })
+            # A one-shot script can exit immediately after the exception. Give an
+            # explicitly connected dashboard a brief chance to receive the failure,
+            # without ever turning dashboard availability into a provider failure.
+            self.flush_dashboard(timeout_seconds=4.0)
             raise
         status = self.router.status(
             route, retest_after_calls=retest_after_calls, min_feedback=min_feedback
         )
+        if self._dashboard_sync is not None:
+            self._dashboard_sync.publish_route(status)
         self._emit_progress({
             "event": "production_call_completed",
             "route": route,
@@ -1698,9 +2004,15 @@ class Evalt:
             "request_envelope_validated": answer.request_envelope_validated,
             "request_options_sha256": answer.request_options_sha256,
         })
+        # Most SDK examples are short scripts. The daemon worker keeps long-running
+        # services fast, while this bounded flush makes the final route visible even
+        # when Python exits on the next line.
+        self.flush_dashboard(timeout_seconds=8.0)
 
         def on_feedback(receipt: dict[str, Any]) -> None:
             self._emit_progress(receipt)
+            if self._dashboard_sync is not None:
+                self._dashboard_sync.publish_route(self.router.status(route))
             if (
                 auto_maintain
                 and receipt.get("is_new")
@@ -1716,6 +2028,7 @@ class Evalt:
                     max_cost_per_run_usd=max_cost_per_run_usd,
                     min_feedback=min_feedback,
                 )
+            self.flush_dashboard(timeout_seconds=5.0)
 
         answer._on_feedback = on_feedback
         return answer
@@ -1730,7 +2043,15 @@ class Evalt:
         return self.router.maintain(route, test_budget_usd=float(resolved), role_plan=role_plan, objective=objective, max_cost_per_run_usd=max_cost_per_run_usd, rounds=rounds, min_feedback=min_feedback)
 
     def route_status(self, route: str, *, retest_after_calls: int = 500, min_feedback: int = 5) -> dict[str, Any]:
-        return self.router.status(route, retest_after_calls=retest_after_calls, min_feedback=min_feedback)
+        status = self.router.status(route, retest_after_calls=retest_after_calls, min_feedback=min_feedback)
+        if self._dashboard_sync is not None:
+            self._dashboard_sync.publish_route(status)
+            self.flush_dashboard(timeout_seconds=5.0)
+        return status
+
+    def flush_dashboard(self, timeout_seconds: float = 10.0) -> bool:
+        """Wait briefly for explicitly enabled dashboard metadata sync."""
+        return True if self._dashboard_sync is None else self._dashboard_sync.flush(timeout_seconds)
 
     def draft(
         self,

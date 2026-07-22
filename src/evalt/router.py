@@ -82,10 +82,12 @@ class RolePlan:
     target_models: tuple[str, ...]
     catalog_revision: str
     policy: str
+    designer_candidates: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         value = asdict(self)
         value["target_models"] = list(self.target_models)
+        value["designer_candidates"] = list(self.designer_candidates)
         return value
 
 
@@ -109,7 +111,18 @@ def select_role_plan(
         if supported and not ({"max_tokens", "max_completion_tokens"} & supported):
             continue
         try:
-            intelligence = float(item["intelligence"])
+            raw_intelligence = item.get("intelligence")
+            if raw_intelligence is None:
+                # The models endpoint is requested in descending intelligence
+                # order. Some catalog revisions omit the absolute benchmark value
+                # while preserving that rank. Keep selecting dynamically instead
+                # of silently dropping into a static role guess.
+                rank = max(1, int(item["intelligence_rank"]))
+                intelligence = max(0.0, 100.0 - 2.0 * (rank - 1))
+                intelligence_source = "catalog_rank"
+            else:
+                intelligence = float(raw_intelligence)
+                intelligence_source = "intelligence_index"
             price = float(item["blended_price"])
             model = str(item["id"])
         except (KeyError, TypeError, ValueError):
@@ -147,6 +160,7 @@ def select_role_plan(
                 "price": price,
                 "private_provider_routes": private_provider_routes,
                 "reasoning_efforts": tuple(dict.fromkeys(efforts)),
+                "intelligence_source": intelligence_source,
             })
 
     if maintenance_budget_usd < 0.50:
@@ -165,6 +179,7 @@ def select_role_plan(
             target_models=targets,
             catalog_revision="fallback",
             policy="No current intelligence metadata; explicit verified fallbacks are used until task tests can qualify a replacement.",
+            designer_candidates=(fallback_designer,),
         )
 
     normalized.sort(key=lambda item: (item["price"], -item["intelligence"], item["id"]))
@@ -247,15 +262,31 @@ def select_role_plan(
     revision = _hash(json.dumps(normalized, sort_keys=True, separators=(",", ":")))
     designer_choice = cheapest_above(designer_delta)
     judge_choice = cheapest_above(judge_delta, exclude={designer_choice})
+    fallback_designers = [
+        item for item in normalized
+        if item["intelligence"] >= maximum - max(designer_delta, 12.0)
+        and item["id"] not in {designer_choice, judge_choice}
+    ]
+    fallback_designers.sort(key=lambda item: (
+        0 if item["private_provider_routes"] >= 2 else 1,
+        item["price"],
+        -item["intelligence"],
+    ))
+    designer_candidates = tuple(dict.fromkeys((
+        designer_choice,
+        *(item["id"] for item in fallback_designers),
+    )))[:4]
     return RolePlan(
         tier=tier,
         test_designer_model=designer_choice,
         judge_model=judge_choice,
         target_models=tuple(target_ids),
         catalog_revision=revision,
+        designer_candidates=designer_candidates,
         policy=(
             f"The suite designer uses the cheapest model within {designer_delta:g} intelligence points of the current benchmark leader; "
             f"judging uses the cheapest different model within {judge_delta:g} points and must pass route-specific calibration; "
+            "designer failover stays inside a separate near-frontier live-catalog shortlist rather than borrowing the judge; "
             "the unqualified first call starts on a sufficiently intelligent provider-redundant route when available; production search then starts with one configuration across the price/intelligence frontier and spends remaining budget "
             "only on reasoning-effort variants in the task-specific capability band. Route holdouts, never benchmarks, promote the winner."
         ),

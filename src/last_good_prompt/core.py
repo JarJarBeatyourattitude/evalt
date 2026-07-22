@@ -10,6 +10,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import ssl
 import statistics
 import threading
@@ -450,7 +451,7 @@ class OpenRouterTransport:
         self._limits = {}
         self._providers = {}
         self._provider_route_names = {}
-        for item in payload.get("data", []):
+        for intelligence_rank, item in enumerate(payload.get("data", []), start=1):
             pricing = item.get("pricing") or {}
             try:
                 model_id = str(item["id"])
@@ -536,6 +537,11 @@ class OpenRouterTransport:
                     completion_limit = None
                 self._limits[model_id] = (context_limit, completion_limit)
                 provider_tags = [str(value["tag"]) for value in provider_pool if value.get("tag")]
+                provider_families = {
+                    str(value.get("provider_name") or value.get("tag") or "").strip().casefold()
+                    for value in provider_pool
+                    if value.get("provider_name") or value.get("tag")
+                }
                 if provider_tags:
                     self._providers[model_id] = provider_tags[:3]
                     self._provider_route_names[model_id] = {
@@ -550,12 +556,16 @@ class OpenRouterTransport:
                 catalog_items.append({
                     "id": str(item["id"]),
                     "intelligence": intelligence,
+                    "intelligence_rank": intelligence_rank,
                     "blended_price": prices[model_id][0] * 1_000_000 + prices[model_id][1] * 2_000_000,
                     "supported_parameters": sorted(self._supported_parameters[model_id]),
                     "reasoning": item.get("reasoning") or {},
                     "context_length": context_limit,
                     "max_completion_tokens": completion_limit,
-                    "private_provider_routes": len(provider_tags),
+                    # Count genuinely independent serving organizations, not two
+                    # regional endpoints owned by the same provider. This number
+                    # drives reliability preferences in role shortlisting.
+                    "private_provider_routes": len(provider_families),
                 })
             except (KeyError, TypeError, ValueError):
                 continue
@@ -738,7 +748,8 @@ class OpenRouterTransport:
                     if not failed_provider or route_names.get(tag) != failed_provider
                 ]
                 if (
-                    getattr(error, "status_code", None) != 429
+                    getattr(error, "status_code", None)
+                    not in {400, 408, 409, 422, 429, 500, 502, 503, 504}
                     or not failed_provider
                     or not remaining_routes
                     or remaining_routes == current_routes
@@ -2766,6 +2777,25 @@ def _validate_evaluator_policy(value: dict[str, Any] | None) -> dict[str, Any]:
     return policy
 
 
+def _extract_single_numeric_scalar(value: Any) -> float | None:
+    """Extract one unambiguous scalar without pretending multi-number prose is one."""
+
+    text = str(value).strip()
+    try:
+        return float(text)
+    except (TypeError, ValueError):
+        matches = re.findall(
+            r"(?<![\w.])-?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?(?![\w.])",
+            text,
+        )
+        if len(matches) != 1:
+            return None
+        try:
+            return float(matches[0])
+        except ValueError:
+            return None
+
+
 def _validate_difficulty_thresholds(value: dict[str, float] | None) -> dict[str, float]:
     thresholds: dict[str, float] = {}
     for raw_name, raw_floor in dict(value or {}).items():
@@ -2786,11 +2816,10 @@ def _deterministic_judgment(
         passed = str(output).strip() == str(approved_output).strip()
         return Judgment(passed, 1.0 if passed else 0.0, "Exact text matched." if passed else "Exact text differed.")
     if evaluator["type"] == "numeric_tolerance":
-        try:
-            actual = float(str(output).strip())
-            expected = float(str(approved_output).strip())
-        except (TypeError, ValueError):
-            return Judgment(False, 0.0, "Actual and approved answers must each be one numeric scalar.")
+        actual = _extract_single_numeric_scalar(output)
+        expected = _extract_single_numeric_scalar(approved_output)
+        if actual is None or expected is None:
+            return Judgment(False, 0.0, "Actual and approved answers must each contain one unambiguous numeric scalar.")
         minimum = float(evaluator["minimum"])
         maximum = float(evaluator["maximum"])
         tolerance = float(evaluator["absolute_tolerance"])

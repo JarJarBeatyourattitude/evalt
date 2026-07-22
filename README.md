@@ -16,6 +16,20 @@ then answer the real input through that package. Later calls reuse it immediatel
 pip install evalt
 ```
 
+Optionally connect this project's local routes to the hosted workspace:
+
+```bash
+evalt connect
+```
+
+The command opens the private dashboard and stores its capability token beside the local
+route database. Evalt synchronizes only operational route metadata and bounded progress;
+prompts, inputs, outputs, cases, provider keys, request bodies, and raw responses stay
+local. Each invocation gets an opaque run ID, so repeated tournaments on one durable
+route have separate running, completed, or failed progress streams. Use `evalt dashboard`
+to reopen it and `evalt disconnect` to remove the local connection. Dashboard
+availability never affects a production call.
+
 Migrating from OpenAI Evals result JSONL? Evalt can recover only the reviewable
 input/reference pairs, offline, and reports everything it cannot honestly reconstruct:
 
@@ -31,7 +45,7 @@ repository checkout:
 
 ```bash
 python -m venv .venv
-python -m pip install dist/evalt-0.9.5-py3-none-any.whl
+python -m pip install dist/evalt-0.10.4-py3-none-any.whl
 evalt --version
 ```
 
@@ -64,8 +78,9 @@ print(answer.content)
 
 For a new route, that one call visibly:
 
-1. uses a smart designer to create 25 routine, boundary, adversarial, format, and
-   multi-turn cases where relevant;
+1. chooses a test designer from the current intelligence-and-price catalog, then creates
+   25 routine, ambiguous, adversarial, boundary, and realistic-domain cases in five
+   parallel batches;
 2. calibrates the proposed exact, semantic, or numeric-tolerance judge on separate controls;
 3. searches the original prompt, prompt rewrites, training-only few-shot packages,
    current models, providers, and supported reasoning efforts in parallel;
@@ -113,8 +128,8 @@ result = evalt.run(suite)
 print(result.winner.model, result.winner.holdout_pass_rate)
 ```
 
-The designer covers routine, complex, adversarial, format, boundary, and multi-turn
-cases where relevant, and recommends exact, semantic, or numeric-tolerance judging.
+The catalog-selected designer covers routine, ambiguous, adversarial, boundary, and
+realistic-domain cases, and recommends exact, semantic, or numeric-tolerance judging.
 Scalar ratings such as 0–10 or 0–100 use an explicit scale and absolute tolerance
 instead of exact equality or an LLM's unspoken tolerance. AI-generated semantic suites
 must use a judge model different from the suite designer; Evalt does not use its
@@ -227,8 +242,8 @@ before provider spend instead. Normalized tool responses are available as
 `answer.tool_calls`; multimodal content parts or complete user/tool/assistant message
 lists may be supplied as the production input.
 
-Automatic first-route requests give the one-time AI suite designer 300 seconds, then
-use a 120-second per-provider deadline for candidate and production responses. Set
+Automatic first-route requests give each one-time AI suite-design request 120 seconds,
+then use a 120-second per-provider deadline for candidate and production responses. Set
 `designer_request_timeout_seconds=` or `test_request_timeout_seconds=` on
 `Evalt.run(...)` when the workload needs different limits. A candidate effort that
 times out cannot earn a higher reasoning rung. Explicit `Suite` workflows keep their
@@ -236,7 +251,10 @@ independently configurable 600-second default. During the broad screen, interact
 progress reports each settled model configuration, validation rate, latency, spend,
 and total elapsed time. The same stream names every designer model and attempt. A
 malformed structured draft is rejected and retried once inside the same workflow
-budget before Evalt falls back to another cost-qualified designer role or fails closed.
+budget before Evalt falls back through a separate live-catalog designer shortlist or
+fails closed. The judge is never reused as a designer fallback. For an automatic first
+route, `optimization_rounds=1` tests one prompt rewrite by default; raise it up to eight
+when a harder workload justifies deeper prompt search.
 For semantic judges, Evalt also replaces AI-authored positive calibration guesses with
 identity controls: each known-pass candidate is exactly its approved answer. This keeps
 a designer from calling a different score or factual claim a known pass.

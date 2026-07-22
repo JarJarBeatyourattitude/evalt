@@ -8,10 +8,19 @@ from pathlib import Path
 import sys
 import threading
 import time
+import webbrowser
 
 from .core import BudgetExceeded, Evalt, ProviderError, Suite, check_result
 from .migration import migrate_openai_results
 from .reporting import compare_results, render_comparison_html, write_reports
+from .dashboard import (
+    DEFAULT_DASHBOARD_API_URL,
+    DEFAULT_DASHBOARD_APP_URL,
+    generate_workspace_token,
+    load_dashboard_config,
+    remove_dashboard_config,
+    save_dashboard_config,
+)
 
 
 STARTER_SUITE = {
@@ -135,7 +144,7 @@ def parser() -> argparse.ArgumentParser:
         prog="evalt",
         description="Run prompts through a durable, tested, budget-bounded model route.",
     )
-    root.add_argument("--version", action="version", version="evalt 0.9.5")
+    root.add_argument("--version", action="version", version="evalt 0.10.4")
     commands = root.add_subparsers(dest="command", required=True)
 
     init = commands.add_parser("init", help="Write a reviewable starter suite; no provider call.")
@@ -219,6 +228,19 @@ def parser() -> argparse.ArgumentParser:
     check.add_argument("--max-cost-per-success", type=float)
     check.add_argument("--require-complete-coverage", action="store_true")
     check.add_argument("--json", action="store_true", help="Print the gate report as JSON.")
+
+    connect = commands.add_parser("connect", help="Connect local route metadata to a private hosted workspace.")
+    connect.add_argument("token", nargs="?", help="Existing evw_ workspace token; omitted creates one.")
+    connect.add_argument("--state", default=".evalt/evalt.db")
+    connect.add_argument("--api-url", default=DEFAULT_DASHBOARD_API_URL)
+    connect.add_argument("--app-url", default=DEFAULT_DASHBOARD_APP_URL)
+    connect.add_argument("--no-open", action="store_true", help="Do not open the connected dashboard in a browser.")
+
+    dashboard = commands.add_parser("dashboard", help="Open the connected hosted workspace without exposing the token in output.")
+    dashboard.add_argument("--state", default=".evalt/evalt.db")
+
+    disconnect = commands.add_parser("disconnect", help="Remove the local hosted-workspace connection.")
+    disconnect.add_argument("--state", default=".evalt/evalt.db")
     return root
 
 
@@ -260,6 +282,36 @@ def main(argv: list[str] | None = None) -> int:
             stream.reconfigure(encoding="utf-8", errors="replace")
     args = parser().parse_args(argv)
     try:
+        if args.command == "connect":
+            token = args.token or generate_workspace_token()
+            path = save_dashboard_config(
+                token, state_path=args.state, api_url=args.api_url, app_url=args.app_url
+            )
+            dashboard_url = f"{str(args.app_url).rstrip('/')}#workspace={token}"
+            opened = False if args.no_open else bool(webbrowser.open(dashboard_url))
+            payload = {
+                "connected": True,
+                "config": str(path),
+                "dashboard": str(args.app_url).rstrip("/"),
+                "browser_opened": opened,
+                "sync_scope": "route metadata and bounded progress only; prompts, inputs, outputs, cases, provider keys, and raw responses stay local",
+            }
+            if args.no_open and args.token is None:
+                payload["workspace_token"] = token
+                payload["warning"] = "Treat workspace_token like a password; it grants access to synced route metadata."
+            print(json.dumps(payload, indent=2))
+            return 0
+        if args.command == "dashboard":
+            config = load_dashboard_config(args.state)
+            if not config:
+                raise ValueError("No hosted workspace is connected. Run: evalt connect")
+            opened = bool(webbrowser.open(f"{config['app_url']}#workspace={config['workspace_token']}"))
+            print(json.dumps({"opened": opened, "dashboard": config["app_url"], "workspace_token_printed": False}, indent=2))
+            return 0
+        if args.command == "disconnect":
+            removed = remove_dashboard_config(args.state)
+            print(json.dumps({"connected": False, "local_config_removed": removed, "remote_metadata_deleted": False}, indent=2))
+            return 0
         if args.command == "init":
             path = Path(args.path)
             _write_starter(path, force=args.force)
@@ -341,7 +393,8 @@ def main(argv: list[str] | None = None) -> int:
             }, indent=2, ensure_ascii=False))
             return 0
         if args.command == "run":
-            answer = Evalt(state_path=args.state).run(
+            evalt = Evalt(state_path=args.state)
+            answer = evalt.run(
                 args.prompt,
                 args.input,
                 route=args.route,
@@ -361,6 +414,7 @@ def main(argv: list[str] | None = None) -> int:
                     answer.accept()
                 else:
                     answer.correct(args.approved_output)
+            evalt.flush_dashboard()
             print(json.dumps(answer.to_dict(), indent=2, ensure_ascii=False))
             return 0
         if args.command == "status":
