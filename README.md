@@ -10,6 +10,15 @@ call, it can design and calibrate the test, compare prompt/model/reasoning/few-s
 configurations under one hard budget, remember the lowest-cost passing package, and
 then answer the real input through that package. Later calls reuse it immediately.
 
+`target_accuracy` is an observed frozen-suite gate, not a guarantee about the unknown
+production distribution. Results separately report distinct final-test scenarios,
+repeated executions, a one-sided 95% exact lower bound when equal-weight binomial
+evidence is appropriate, and whether that bound actually supports the requested
+target. Repeats measure consistency and never inflate the distinct-scenario count. A
+10/10 final test therefore installs a clearly provisional route: its lower bound is
+about 74.1%, and 59/59 distinct successes would be needed to support a 95% target
+under those assumptions.
+
 ## Install
 
 ```bash
@@ -52,7 +61,7 @@ repository checkout:
 
 ```bash
 python -m venv .venv
-python -m pip install dist/evalt-0.10.9-py3-none-any.whl
+python -m pip install dist/evalt-0.10.10-py3-none-any.whl
 evalt --version
 ```
 
@@ -503,9 +512,10 @@ and offline-validatable before spend.
 }
 ```
 
-With the default 20% final-test split, use at least 25 approved scenarios to obtain the
-minimum five distinct final-test scenarios for a non-exploratory result. Repeats measure
-consistency; they never inflate the distinct scenario count. A scenario may contain
+For suites with at least 25 approved scenarios, the default split reserves 40% for the
+final test, yielding ten distinct final-test scenarios from 25. Five remains the minimum
+for a non-exploratory result, not a strong reliability claim. Repeats measure consistency;
+they never inflate the distinct scenario count. A scenario may contain
 a `turns` array for multi-turn behavior; Evalt keeps the whole conversation in one split
 and replays prior assistant context. Few-shot examples can come only from the training
 split and are removed while evaluating their own scenario.

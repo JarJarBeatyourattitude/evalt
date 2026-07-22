@@ -227,6 +227,11 @@ class ModelResult:
     few_shot_example_ids: list[str] = field(default_factory=list)
     few_shot_provenance: list[dict[str, Any]] = field(default_factory=list)
     cases: list[CaseResult] = field(default_factory=list)
+    final_test_evidence_status: str = "NO_FINAL_TEST"
+    final_test_confidence_level: float = 0.95
+    final_test_accuracy_lower_bound: float | None = None
+    target_accuracy_statistically_supported: bool = False
+    minimum_zero_failure_scenarios: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -1543,6 +1548,11 @@ class Client:
                             "prompt_candidates_tested": item.prompt_candidates_tested,
                             "prompt_rewrites_tested": item.prompt_rewrites_tested,
                             "selected_prompt_changed": item.selected_prompt_changed,
+                            "final_test_evidence_status": item.final_test_evidence_status,
+                            "final_test_confidence_level": item.final_test_confidence_level,
+                            "final_test_accuracy_lower_bound": item.final_test_accuracy_lower_bound,
+                            "target_accuracy_statistically_supported": item.target_accuracy_statistically_supported,
+                            "minimum_zero_failure_scenarios": item.minimum_zero_failure_scenarios,
                             "elapsed_seconds": round(time.monotonic() - optimization_started, 3),
                         })
                     except BudgetExceeded as error:
@@ -1574,6 +1584,11 @@ class Client:
                             "prompt_candidates_tested": item.prompt_candidates_tested,
                             "prompt_rewrites_tested": item.prompt_rewrites_tested,
                             "selected_prompt_changed": item.selected_prompt_changed,
+                            "final_test_evidence_status": item.final_test_evidence_status,
+                            "final_test_confidence_level": item.final_test_confidence_level,
+                            "final_test_accuracy_lower_bound": item.final_test_accuracy_lower_bound,
+                            "target_accuracy_statistically_supported": item.target_accuracy_statistically_supported,
+                            "minimum_zero_failure_scenarios": item.minimum_zero_failure_scenarios,
                             "elapsed_seconds": round(time.monotonic() - optimization_started, 3),
                         })
                     except BudgetExceeded as error:
@@ -2327,6 +2342,15 @@ class Client:
             warnings.append(
                 f"Only {len(holdout)} distinct final-test scenario(s): this is exploratory and not a reliability claim."
             )
+        elif winner.passed_quality_floor and not winner.target_accuracy_statistically_supported:
+            if winner.final_test_accuracy_lower_bound is None:
+                warnings.append(
+                    "The observed final-test rate cleared the route gate, but weighted or non-binomial evidence cannot establish a confidence bound; the route remains provisional."
+                )
+            else:
+                warnings.append(
+                    f"The observed final-test rate cleared the route gate, but the one-sided {winner.final_test_confidence_level:.0%} exact lower bound is {winner.final_test_accuracy_lower_bound:.1%}, below the {quality_threshold:.1%} target; the route remains provisional."
+                )
         if not passing:
             warnings.append("No prompt/model pair cleared the requested quality threshold.")
         if max_cost_per_run_usd is not None and not within_cost:
@@ -2387,6 +2411,11 @@ class Client:
             "request_options_sha256": request_options_fingerprint(target_request_options),
             "holdout_repeats": int(holdout_repeats),
             "holdout_unique_scenarios": len(holdout),
+            "final_test_evidence_status": winner.final_test_evidence_status,
+            "final_test_confidence_level": winner.final_test_confidence_level,
+            "final_test_accuracy_lower_bound": winner.final_test_accuracy_lower_bound,
+            "target_accuracy_statistically_supported": winner.target_accuracy_statistically_supported,
+            "minimum_zero_failure_scenarios": winner.minimum_zero_failure_scenarios,
             "minimum_meaningful_quality_gain": minimum_meaningful_quality_gain,
             "optimize_prompt": bool(optimize_prompt),
             "watch": {
@@ -2782,6 +2811,9 @@ class Client:
                 })
         holdout_execution_rate = _pass_rate(selected_holdout)
         holdout_rate = _scenario_pass_rate(selected_holdout)
+        final_test_evidence = _final_test_evidence(
+            selected_holdout, target_accuracy=threshold
+        )
         holdout_by_difficulty = _scenario_pass_rates_by_difficulty(selected_holdout)
         passed_difficulty_floors = all(
             difficulty in holdout_by_difficulty
@@ -2859,6 +2891,11 @@ class Client:
                 }
                 for example_id in selected_few_shot_ids
             ],
+            final_test_evidence_status=final_test_evidence["status"],
+            final_test_confidence_level=final_test_evidence["confidence_level"],
+            final_test_accuracy_lower_bound=final_test_evidence["accuracy_lower_bound"],
+            target_accuracy_statistically_supported=final_test_evidence["target_supported"],
+            minimum_zero_failure_scenarios=final_test_evidence["minimum_zero_failure_scenarios"],
             cases=all_cases,
         )
 
@@ -3353,6 +3390,82 @@ def _scenario_pass_rate(results: list[CaseResult]) -> float:
         if all(value["outcomes"])
     )
     return passed_weight / total_weight
+
+
+def _binomial_exact_lower_bound(
+    successes: int, trials: int, confidence_level: float = 0.95
+) -> float | None:
+    """One-sided Clopper-Pearson lower bound without a statistics dependency."""
+
+    if trials <= 0 or successes < 0 or successes > trials:
+        return None
+    if successes == 0:
+        return 0.0
+    alpha = 1.0 - float(confidence_level)
+    low, high = 0.0, 1.0
+    for _ in range(80):
+        probability = (low + high) / 2
+        upper_tail = sum(
+            math.comb(trials, count)
+            * probability ** count
+            * (1 - probability) ** (trials - count)
+            for count in range(successes, trials + 1)
+        )
+        if upper_tail < alpha:
+            low = probability
+        else:
+            high = probability
+    return round((low + high) / 2, 6)
+
+
+def _final_test_evidence(
+    results: list[CaseResult], *, target_accuracy: float, confidence_level: float = 0.95
+) -> dict[str, Any]:
+    """Describe sampling precision without treating repeats as new scenarios."""
+
+    scenarios: dict[str, dict[str, Any]] = {}
+    for item in results:
+        scenario_id = item.example_id.split(":turn-", 1)[0]
+        scenario = scenarios.setdefault(
+            scenario_id, {"outcomes": [], "weight": float(item.weight)}
+        )
+        scenario["outcomes"].append(bool(item.passed))
+    trials = len(scenarios)
+    minimum = None
+    if 0 < target_accuracy < 1 and 0 < confidence_level < 1:
+        minimum = math.ceil(
+            math.log(1 - confidence_level) / math.log(target_accuracy)
+        )
+    base = {
+        "confidence_level": float(confidence_level),
+        "accuracy_lower_bound": None,
+        "target_supported": False,
+        "minimum_zero_failure_scenarios": minimum,
+    }
+    if not trials:
+        return {"status": "NO_FINAL_TEST", **base}
+    weights = [float(item["weight"]) for item in scenarios.values()]
+    if max(weights) - min(weights) > 1e-12:
+        return {"status": "PROVISIONAL_WEIGHTED_FINAL_TEST", **base}
+    successes = sum(
+        1 for item in scenarios.values() if all(item["outcomes"])
+    )
+    lower_bound = _binomial_exact_lower_bound(
+        successes, trials, confidence_level
+    )
+    supported = bool(
+        lower_bound is not None and lower_bound >= float(target_accuracy)
+    )
+    return {
+        "status": (
+            "TARGET_SUPPORTED_UNDER_BINOMIAL_ASSUMPTIONS"
+            if supported
+            else "PROVISIONAL_SMALL_FINAL_TEST"
+        ),
+        **base,
+        "accuracy_lower_bound": lower_bound,
+        "target_supported": supported,
+    }
 
 
 def _scenario_pass_rates_by_difficulty(results: list[CaseResult]) -> dict[str, float]:

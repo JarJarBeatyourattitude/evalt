@@ -726,6 +726,12 @@ class DurableRouter:
             "winner_prompt_version": _hash(winner.selected_prompt)[:16],
             "holdout_pass_rate": winner.holdout_pass_rate,
             "final_test_scenarios": winner.holdout_unique_scenarios,
+            "final_test_executions": winner.holdout_executions,
+            "final_test_evidence_status": winner.final_test_evidence_status,
+            "final_test_confidence_level": winner.final_test_confidence_level,
+            "final_test_accuracy_lower_bound": winner.final_test_accuracy_lower_bound,
+            "target_accuracy_statistically_supported": winner.target_accuracy_statistically_supported,
+            "minimum_zero_failure_scenarios": winner.minimum_zero_failure_scenarios,
             "tested_configurations": len(result.models),
             "prompt_candidates_tested": sum(
                 item.prompt_candidates_tested for item in result.models

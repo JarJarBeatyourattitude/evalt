@@ -167,6 +167,9 @@ def sanitize_progress_event(event: Mapping[str, Any]) -> dict[str, Any]:
         "run_id", "run_state", "run_started_at", "run_finished_at",
         "test_design_seconds", "tournament_seconds", "route_install_seconds",
         "production_call_seconds", "orchestration_seconds", "total_elapsed_seconds",
+        "final_test_evidence_status", "final_test_confidence_level",
+        "final_test_accuracy_lower_bound", "target_accuracy_statistically_supported",
+        "minimum_zero_failure_scenarios",
     }
     safe = {
         key: (
@@ -211,6 +214,9 @@ def sanitize_route_snapshot(status: Mapping[str, Any]) -> dict[str, Any]:
             "final_test_scenarios", "final_test_executions", "estimated_cost_per_successful_call_usd",
             "optimization_spend_usd", "quality_gate_status", "few_shot_examples",
             "designer_model", "evaluator_model", "judge_calibration_checks", "request_options_sha256",
+            "final_test_evidence_status", "final_test_confidence_level",
+            "final_test_accuracy_lower_bound", "target_accuracy_statistically_supported",
+            "minimum_zero_failure_scenarios",
         }
         safe["last_test_summary"] = {key: _safe_scalar(value) for key, value in summary.items() if key in summary_allowed}
     safe["schema"] = "evalt-workspace-route-v1"

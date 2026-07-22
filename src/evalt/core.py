@@ -791,9 +791,22 @@ class Evalt:
         elif kind == "initial_optimization_completed":
             message = (
                 f"Evalt · {route} · ROUTE SELECTED · {event.get('winner_model')} · "
-                f"{float(event.get('holdout_pass_rate') or 0):.0%} final test · "
+                f"{float(event.get('holdout_pass_rate') or 0):.0%} observed final test · "
                 f"${float(event.get('workflow_spend_usd') or 0):.6f} test spend"
             )
+            if not event.get("target_accuracy_statistically_supported"):
+                lower = event.get("final_test_accuracy_lower_bound")
+                evidence = (
+                    f"{float(lower):.1%} one-sided "
+                    f"{float(event.get('final_test_confidence_level') or .95):.0%} lower bound"
+                    if lower is not None
+                    else "no binomial confidence bound"
+                )
+                message += (
+                    f"\nEvalt · {route} · PROVISIONAL EVIDENCE · {evidence} · "
+                    f"{int(event.get('final_test_scenarios') or 0)} distinct scenario(s) · "
+                    "observed gate passed; target reliability is not yet established"
+                )
         elif kind == "first_route_timing_completed":
             message = (
                 f"Evalt · {route} · FIRST ROUTE TIMING · "
@@ -822,7 +835,7 @@ class Evalt:
         elif kind == "model_completed":
             final_scenarios = int(event.get("final_test_scenarios") or 0)
             final_result = (
-                f"{float(event.get('final_test_pass_rate') or 0):.0%} final test · "
+                f"{float(event.get('final_test_pass_rate') or 0):.0%} observed final test · "
                 f"{final_scenarios} scenario(s) / "
                 f"{int(event.get('final_test_executions') or 0)} execution(s)"
                 if final_scenarios
@@ -1009,7 +1022,7 @@ class Evalt:
         if len(prompt_text) < 8:
             raise ValueError("prompt must contain at least eight characters.")
         if not 5 <= int(case_count) <= 100:
-            raise ValueError("case_count must be between 5 and 100; use 25 or more for five final-test cases.")
+            raise ValueError("case_count must be between 5 and 100; use 25 or more for ten distinct final-test scenarios.")
         if not 0 < float(workflow_budget_usd) <= 100:
             raise ValueError("workflow_budget_usd must be greater than zero and no more than 100.")
         if not 0 < float(quality_threshold) <= 1:

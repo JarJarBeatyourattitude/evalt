@@ -146,7 +146,7 @@ def parser() -> argparse.ArgumentParser:
         prog="evalt",
         description="Run prompts through a durable, tested, budget-bounded model route.",
     )
-    root.add_argument("--version", action="version", version="evalt 0.10.9")
+    root.add_argument("--version", action="version", version="evalt 0.10.10")
     commands = root.add_subparsers(dest="command", required=True)
 
     init = commands.add_parser("init", help="Write a reviewable starter suite; no provider call.")
@@ -189,7 +189,7 @@ def parser() -> argparse.ArgumentParser:
     run.add_argument("--objective", choices=("match_baseline_at_lowest_cost", "best_within_price", "lowest_cost_at_accuracy"), default="lowest_cost_at_accuracy")
     run.add_argument("--state", default=".evalt/evalt.db")
     run.add_argument("--model", action="append", dest="models")
-    run.add_argument("--cases", type=int, default=25, help="AI-designed cases for a new route; 25 provides five final-test cases.")
+    run.add_argument("--cases", type=int, default=25, help="AI-designed cases for a new route; 25 provides ten distinct final-test scenarios.")
     run.add_argument("--bootstrap-only", action="store_true", help="Skip first-route optimization and make one explicitly untested provider call.")
     run.add_argument("--fixed-prompt", action="store_true", help="Compare routes without rewriting the supplied prompt or adding few-shot examples.")
     run.add_argument("--approved-output", help="Immediately record an accepted/corrected answer for future tests.")
@@ -261,6 +261,11 @@ def _summary(result, path: str) -> dict[str, object]:
         "final_test_scenarios": result.winner.holdout_unique_scenarios,
         "final_test_executions": result.winner.holdout_executions,
         "final_test_execution_pass_rate": result.winner.holdout_execution_pass_rate,
+        "final_test_evidence_status": result.winner.final_test_evidence_status,
+        "final_test_confidence_level": result.winner.final_test_confidence_level,
+        "final_test_accuracy_lower_bound": result.winner.final_test_accuracy_lower_bound,
+        "target_accuracy_statistically_supported": result.winner.target_accuracy_statistically_supported,
+        "minimum_zero_failure_scenarios": result.winner.minimum_zero_failure_scenarios,
         "estimated_cost_per_successful_call_usd": result.winner.estimated_cost_per_successful_call_usd,
         "optimization_spend_usd": result.total_provider_spend_usd,
         "elapsed_seconds": result.elapsed_seconds,

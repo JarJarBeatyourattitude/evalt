@@ -21,10 +21,45 @@ from evalt.migration import migrate_openai_results
 from evalt.dashboard import WorkspaceSync, dashboard_config_path, generate_workspace_token, load_dashboard_config, remove_dashboard_config, sanitize_progress_event, sanitize_route_snapshot, save_dashboard_config, workspace_fingerprint
 from modelsieve import Client as ModelSieveClient
 from last_good_prompt import Client as LegacyClient
-from last_good_prompt.core import _Budget, CaseResult, ModelResult
+from last_good_prompt.core import _Budget, CaseResult, ModelResult, _binomial_exact_lower_bound, _final_test_evidence
 
 
 class CompatibilityTests(unittest.TestCase):
+    @staticmethod
+    def _case(example_id: str, *, passed: bool = True, weight: float = 1.0) -> CaseResult:
+        return CaseResult(
+            example_id=example_id, split="holdout", prompt_kind="candidate",
+            output="ok", approved_output="ok", passed=passed,
+            score=1.0 if passed else 0.0, reason="fixture",
+            target_cost_usd=0.0, evaluator_cost_usd=0.0,
+            target_generation_id="target", evaluator_generation_id="judge",
+            weight=weight,
+        )
+
+    def test_exact_lower_bound_does_not_turn_ten_perfect_cases_into_a_95_percent_claim(self):
+        self.assertAlmostEqual(_binomial_exact_lower_bound(10, 10), 0.741134, places=6)
+        self.assertGreaterEqual(_binomial_exact_lower_bound(59, 59), 0.95)
+
+    def test_repeated_executions_do_not_inflate_distinct_scenario_confidence(self):
+        results = [
+            self._case(f"case-{index}")
+            for index in range(10)
+            for _repeat in range(2)
+        ]
+        evidence = _final_test_evidence(results, target_accuracy=0.95)
+        self.assertEqual(evidence["status"], "PROVISIONAL_SMALL_FINAL_TEST")
+        self.assertAlmostEqual(evidence["accuracy_lower_bound"], 0.741134, places=6)
+        self.assertFalse(evidence["target_supported"])
+        self.assertEqual(evidence["minimum_zero_failure_scenarios"], 59)
+
+    def test_weighted_suite_refuses_an_unjustified_binomial_bound(self):
+        evidence = _final_test_evidence([
+            self._case("routine", weight=0.9),
+            self._case("critical", weight=0.1),
+        ], target_accuracy=0.95)
+        self.assertEqual(evidence["status"], "PROVISIONAL_WEIGHTED_FINAL_TEST")
+        self.assertIsNone(evidence["accuracy_lower_bound"])
+
     def test_earlier_imports_resolve_to_evalt_client(self):
         self.assertIs(LegacyClient, Client)
         self.assertIs(ModelSieveClient, Client)
@@ -114,6 +149,11 @@ class DashboardBridgeTests(unittest.TestCase):
             "test_design_seconds": 11.2, "tournament_seconds": 38.4,
             "route_install_seconds": 0.1, "production_call_seconds": 0.8,
             "orchestration_seconds": 1.5, "total_elapsed_seconds": 52.0,
+            "final_test_evidence_status": "PROVISIONAL_SMALL_FINAL_TEST",
+            "final_test_confidence_level": 0.95,
+            "final_test_accuracy_lower_bound": 0.741134,
+            "target_accuracy_statistically_supported": False,
+            "minimum_zero_failure_scenarios": 59,
             "prompt": "private prompt",
         })
         self.assertEqual(event["configurations"], 12)
@@ -129,6 +169,10 @@ class DashboardBridgeTests(unittest.TestCase):
         self.assertEqual(event["test_design_seconds"], 11.2)
         self.assertEqual(event["tournament_seconds"], 38.4)
         self.assertEqual(event["total_elapsed_seconds"], 52.0)
+        self.assertEqual(event["final_test_evidence_status"], "PROVISIONAL_SMALL_FINAL_TEST")
+        self.assertEqual(event["final_test_accuracy_lower_bound"], 0.741134)
+        self.assertFalse(event["target_accuracy_statistically_supported"])
+        self.assertEqual(event["minimum_zero_failure_scenarios"], 59)
         self.assertNotIn("prompt", event)
 
     def test_dashboard_failure_never_raises_into_the_provider_workflow(self):
@@ -1839,6 +1883,19 @@ class SdkTests(unittest.TestCase):
                 "elapsed_seconds": 24.6,
             })
             evalt._emit_progress({
+                "event": "initial_optimization_completed",
+                "route": "support-routing",
+                "winner_model": "cheap#reasoning=low",
+                "holdout_pass_rate": 1,
+                "workflow_spend_usd": 0.2,
+                "final_test_scenarios": 10,
+                "final_test_evidence_status": "PROVISIONAL_SMALL_FINAL_TEST",
+                "final_test_confidence_level": 0.95,
+                "final_test_accuracy_lower_bound": 0.741134,
+                "target_accuracy_statistically_supported": False,
+                "minimum_zero_failure_scenarios": 59,
+            })
+            evalt._emit_progress({
                 "event": "first_route_timing_completed",
                 "route": "support-routing",
                 "test_design_seconds": 11.2,
@@ -1858,7 +1915,10 @@ class SdkTests(unittest.TestCase):
         self.assertIn("support-routing · SCREENED · cheap#reasoning=low · 80% validation", rendered)
         self.assertIn("support-routing · DEEP TEST STARTED · cheap#reasoning=low", rendered)
         self.assertIn("FINAL CONFIRMATION · cheap#reasoning=low · 10 unseen scenario(s) · 20 execution(s)", rendered)
-        self.assertIn("100% final test · 10 scenario(s) / 20 execution(s)", rendered)
+        self.assertIn("100% observed final test · 10 scenario(s) / 20 execution(s)", rendered)
+        self.assertIn("100% observed final test · $0.200000 test spend", rendered)
+        self.assertIn("PROVISIONAL EVIDENCE · 74.1% one-sided 95% lower bound", rendered)
+        self.assertIn("target reliability is not yet established", rendered)
         self.assertIn("support-routing · BROAD SCREEN COMPLETE · 11/12 configuration(s) settled · 24.6s", rendered)
 
         self.assertIn("FIRST ROUTE TIMING", rendered)
