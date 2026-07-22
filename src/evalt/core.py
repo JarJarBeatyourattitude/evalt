@@ -794,6 +794,16 @@ class Evalt:
                 f"{float(event.get('holdout_pass_rate') or 0):.0%} final test · "
                 f"${float(event.get('workflow_spend_usd') or 0):.6f} test spend"
             )
+        elif kind == "first_route_timing_completed":
+            message = (
+                f"Evalt · {route} · FIRST ROUTE TIMING · "
+                f"design {float(event.get('test_design_seconds') or 0):.1f}s · "
+                f"tournament {float(event.get('tournament_seconds') or 0):.1f}s · "
+                f"install {float(event.get('route_install_seconds') or 0):.1f}s · "
+                f"production {float(event.get('production_call_seconds') or 0):.1f}s · "
+                f"other {float(event.get('orchestration_seconds') or 0):.1f}s · "
+                f"total {float(event.get('total_elapsed_seconds') or 0):.1f}s"
+            )
         elif kind == "maintenance_started":
             message = (
                 f"Evalt · {route} · TOURNAMENT STARTED · "
@@ -1846,6 +1856,12 @@ class Evalt:
             return result
         if input is None:
             raise ValueError("input is required when executing a prompt through Evalt.")
+        workflow_started = time.monotonic()
+        first_route_optimized = False
+        test_design_seconds = 0.0
+        tournament_seconds = 0.0
+        route_install_seconds = 0.0
+        production_call_seconds = 0.0
         normalized_request_options = (
             None if request_options is None else normalize_request_options(request_options)
         )
@@ -1954,6 +1970,7 @@ class Evalt:
                     self.client.transport.set_timeout_seconds(
                         float(designer_request_timeout_seconds)
                     )
+                design_started = time.monotonic()
                 draft = self.design_suite(
                     task=(task or suite_or_prompt),
                     prompt=suite_or_prompt,
@@ -1973,6 +1990,7 @@ class Evalt:
                     target_max_tokens=int(max_tokens or 600),
                     request_options=normalized_request_options,
                 )
+                test_design_seconds = time.monotonic() - design_started
                 if max_tokens is None:
                     draft = replace(
                         draft,
@@ -1980,13 +1998,16 @@ class Evalt:
                             draft.evaluator, draft.examples
                         ),
                     )
+                tournament_started = time.monotonic()
                 initial_result = self.run(replace(
                     draft.autopilot_suite(), rounds=int(optimization_rounds)
                 ))
+                tournament_seconds = time.monotonic() - tournament_started
                 initial_test_spend_usd = round(
                     draft.designer_spend_usd + initial_result.total_provider_spend_usd,
                     10,
                 )
+                install_started = time.monotonic()
                 try:
                     summary = self.router.install_initial_result(
                         route=route,
@@ -2006,6 +2027,8 @@ class Evalt:
                     )
                 except ValueError as error:
                     raise ProviderError(str(error)) from error
+                route_install_seconds = time.monotonic() - install_started
+                first_route_optimized = True
                 self._emit_progress({
                     "event": "initial_optimization_completed",
                     "route": route,
@@ -2025,6 +2048,7 @@ class Evalt:
                 "test_budget_policy": test_budget_policy,
                 "test_budget_spent_usd": initial_test_spend_usd,
             })
+            production_started = time.monotonic()
             answer = self.router.run(
                 route=route,
                 prompt=suite_or_prompt,
@@ -2045,6 +2069,7 @@ class Evalt:
                 min_feedback=min_feedback,
                 catalog_revision=role_plan.catalog_revision,
             )
+            production_call_seconds = time.monotonic() - production_started
         except Exception as error:
             self._emit_progress({
                 "event": "production_call_failed", "route": route, "error": str(error)
@@ -2075,6 +2100,26 @@ class Evalt:
             "request_envelope_validated": answer.request_envelope_validated,
             "request_options_sha256": answer.request_options_sha256,
         })
+        if first_route_optimized:
+            total_elapsed_seconds = time.monotonic() - workflow_started
+            measured_phase_seconds = (
+                test_design_seconds
+                + tournament_seconds
+                + route_install_seconds
+                + production_call_seconds
+            )
+            self._emit_progress({
+                "event": "first_route_timing_completed",
+                "route": route,
+                "test_design_seconds": round(test_design_seconds, 3),
+                "tournament_seconds": round(tournament_seconds, 3),
+                "route_install_seconds": round(route_install_seconds, 3),
+                "production_call_seconds": round(production_call_seconds, 3),
+                "orchestration_seconds": round(
+                    max(0.0, total_elapsed_seconds - measured_phase_seconds), 3
+                ),
+                "total_elapsed_seconds": round(total_elapsed_seconds, 3),
+            })
         # Most SDK examples are short scripts. The daemon worker keeps long-running
         # services fast, while this bounded flush makes the final route visible even
         # when Python exits on the next line.

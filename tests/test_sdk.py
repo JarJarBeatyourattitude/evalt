@@ -98,6 +98,9 @@ class DashboardBridgeTests(unittest.TestCase):
             "candidate": 1, "kind": "optimizer_rewrite",
             "training_pass_rate": 0.6, "selected": False,
             "quality_threshold": 0.95, "reason": "validation did not clear the gate",
+            "test_design_seconds": 11.2, "tournament_seconds": 38.4,
+            "route_install_seconds": 0.1, "production_call_seconds": 0.8,
+            "orchestration_seconds": 1.5, "total_elapsed_seconds": 52.0,
             "prompt": "private prompt",
         })
         self.assertEqual(event["configurations"], 12)
@@ -110,6 +113,9 @@ class DashboardBridgeTests(unittest.TestCase):
         self.assertEqual(event["reason"], "validation did not clear the gate")
         self.assertEqual(event["run_id"], "evr_abcdefghijklmnop")
         self.assertEqual(event["run_state"], "running")
+        self.assertEqual(event["test_design_seconds"], 11.2)
+        self.assertEqual(event["tournament_seconds"], 38.4)
+        self.assertEqual(event["total_elapsed_seconds"], 52.0)
         self.assertNotIn("prompt", event)
 
     def test_dashboard_failure_never_raises_into_the_provider_workflow(self):
@@ -1819,6 +1825,16 @@ class SdkTests(unittest.TestCase):
                 "completed_configurations": 11,
                 "elapsed_seconds": 24.6,
             })
+            evalt._emit_progress({
+                "event": "first_route_timing_completed",
+                "route": "support-routing",
+                "test_design_seconds": 11.2,
+                "tournament_seconds": 38.4,
+                "route_install_seconds": 0.1,
+                "production_call_seconds": 0.8,
+                "orchestration_seconds": 1.5,
+                "total_elapsed_seconds": 52.0,
+            })
         rendered = stream.getvalue()
         self.assertIn("25 cases · smart-designer · deadline 120s", rendered)
         self.assertIn("smart-designer · attempt 1/2 · request started", rendered)
@@ -1831,6 +1847,12 @@ class SdkTests(unittest.TestCase):
         self.assertIn("FINAL CONFIRMATION · cheap#reasoning=low · 10 unseen scenario(s) · 20 execution(s)", rendered)
         self.assertIn("100% final test · 10 scenario(s) / 20 execution(s)", rendered)
         self.assertIn("support-routing · BROAD SCREEN COMPLETE · 11/12 configuration(s) settled · 24.6s", rendered)
+
+        self.assertIn("FIRST ROUTE TIMING", rendered)
+        self.assertIn("design 11.2s", rendered)
+        self.assertIn("tournament 38.4s", rendered)
+        self.assertIn("production 0.8s", rendered)
+        self.assertIn("total 52.0s", rendered)
 
     def test_primary_run_is_a_durable_budget_bounded_router_not_a_json_export(self):
         with TemporaryDirectory() as directory:
@@ -1974,6 +1996,23 @@ class SdkTests(unittest.TestCase):
             self.assertIn("initial_optimization_started", event_names)
             self.assertIn("initial_optimization_completed", event_names)
             self.assertIn("prompt_candidate_completed", event_names)
+            timing_events = [
+                event for event in events
+                if event["event"] == "first_route_timing_completed"
+            ]
+            self.assertEqual(len(timing_events), 1)
+            timing = timing_events[0]
+            timing_fields = (
+                "test_design_seconds", "tournament_seconds",
+                "route_install_seconds", "production_call_seconds",
+                "orchestration_seconds", "total_elapsed_seconds",
+            )
+            for field in timing_fields:
+                self.assertGreaterEqual(timing[field], 0)
+            self.assertGreaterEqual(
+                timing["total_elapsed_seconds"] + 0.006,
+                sum(timing[field] for field in timing_fields[:-1]),
+            )
 
     def test_bootstrap_only_is_an_explicit_escape_hatch(self):
         with TemporaryDirectory() as directory:

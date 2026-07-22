@@ -28,7 +28,9 @@ match. Evalt synchronizes only operational route metadata and bounded progress;
 prompts, inputs, outputs, cases, provider keys, request bodies, and raw responses stay
 local. Each invocation gets an opaque run ID, so repeated tournaments on one durable
 route have separate running, completed, or failed progress streams. Every visible run
-prints either `DASHBOARD SYNCED` or `DASHBOARD SYNC FAILED`. Use `evalt dashboard`
+prints either `DASHBOARD SYNCED` or `DASHBOARD SYNC FAILED`. A newly optimized route
+also reports separate test-design, tournament, route-install, production-call,
+orchestration, and total timings so a slow first run has an inspectable cause. Use `evalt dashboard`
 to reopen it, `evalt dashboard --status` to compare the ID without opening a browser,
 and `evalt disconnect` to remove the local connection. Dashboard
 availability never affects a production call.
@@ -48,7 +50,7 @@ repository checkout:
 
 ```bash
 python -m venv .venv
-python -m pip install dist/evalt-0.10.7-py3-none-any.whl
+python -m pip install dist/evalt-0.10.8-py3-none-any.whl
 evalt --version
 ```
 
