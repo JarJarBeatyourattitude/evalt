@@ -1832,7 +1832,14 @@ class Client:
                     if not remaining:
                         break
                     needed = max(1, completed_floor - len(full_results))
-                    wave = remaining[:needed]
+                    # Provider failures are common enough that launching exactly
+                    # ``needed`` lanes turns one timeout into a whole extra serial
+                    # wave. Overbook by at most two independent finalists inside
+                    # the same shared budget. Successful redundant lanes remain
+                    # useful measured frontier evidence; the cap still fails
+                    # closed before any unaffordable call starts.
+                    failure_headroom = min(2, max(0, len(remaining) - needed))
+                    wave = remaining[: needed + failure_headroom]
                     attempted_for_full.extend(wave)
                     full_results.extend(run_batch(wave))
                 results.extend(full_results)

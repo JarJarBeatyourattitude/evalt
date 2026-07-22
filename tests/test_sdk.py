@@ -2979,7 +2979,7 @@ class SdkTests(unittest.TestCase):
             max_parallel_models=6,
         )
         self.assertEqual(transport.deadlines[:6], [30.0] * 6)
-        self.assertEqual(transport.deadlines[6:], [45.0] * 4)
+        self.assertEqual(transport.deadlines[6:], [45.0] * 6)
 
     def test_default_transport_uses_a_bundled_verified_ca_context(self):
         with mock.patch("last_good_prompt.core.urlopen", return_value=FakeResponse({"ok": True})) as opener:
@@ -4133,12 +4133,12 @@ class SdkTests(unittest.TestCase):
             progress_callback=events.append,
         )
         self.assertEqual(len(result.screening_results), 6)
-        self.assertEqual(len(result.models), 4)
+        self.assertEqual(len(result.models), 6)
         self.assertEqual(result.winner.model, "strong-cheap")
-        self.assertEqual(len(result.pruned_models), 2)
+        self.assertEqual(len(result.pruned_models), 0)
         self.assertTrue(all(model.startswith("weak-") for model in result.pruned_models))
         self.assertTrue(any(event["event"] == "model_screen_completed" for event in events))
-        self.assertTrue(any(event["event"] == "model_pruned" for event in events))
+        self.assertFalse(any(event["event"] == "model_pruned" for event in events))
 
     def test_weak_adaptive_screen_preserves_one_catalog_intelligence_anchor(self):
         class AnchorTransport(FakeTransport):
@@ -4259,7 +4259,7 @@ class SdkTests(unittest.TestCase):
             max_optimization_cost_usd=5,
             max_parallel_models=6,
         )
-        self.assertEqual(client.maximum_active, 4)
+        self.assertEqual(client.maximum_active, 6)
 
     def test_prompt_rewrite_training_and_validation_splits_overlap(self):
         class SplitTrackingClient(Client):
@@ -4408,15 +4408,12 @@ class SdkTests(unittest.TestCase):
             item for item in result.models
             if item.prompt_origin.startswith("propagated_from:")
         ]
-        self.assertEqual(len(result.models), 4)
+        self.assertEqual(len(result.models), 6)
         self.assertEqual(propagated, [])
-        self.assertEqual(
-            result.pruned_models,
-            ["candidate-5", "candidate-6"],
-        )
+        self.assertEqual(result.pruned_models, [])
         self.assertEqual(
             sum(item["status"] == "PRUNED" for item in result.screening_results),
-            2,
+            0,
         )
 
     def test_draft_becomes_approved_or_corrected_example(self):
