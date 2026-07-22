@@ -45,7 +45,7 @@ repository checkout:
 
 ```bash
 python -m venv .venv
-python -m pip install dist/evalt-0.10.5-py3-none-any.whl
+python -m pip install dist/evalt-0.10.6-py3-none-any.whl
 evalt --version
 ```
 
@@ -242,7 +242,7 @@ before provider spend instead. Normalized tool responses are available as
 `answer.tool_calls`; multimodal content parts or complete user/tool/assistant message
 lists may be supplied as the production input.
 
-Automatic first-route requests give each one-time AI suite-design request 120 seconds,
+Automatic first-route requests give each one-time AI suite-design request 45 seconds,
 then use a 120-second per-provider deadline for candidate and production responses. Set
 `designer_request_timeout_seconds=` or `test_request_timeout_seconds=` on
 `Evalt.run(...)` when the workload needs different limits. A candidate effort that
