@@ -96,6 +96,33 @@ def _default_numeric_tolerance(
     return (maximum - minimum) * fraction
 
 
+def _automatic_target_max_tokens(
+    evaluator: Mapping[str, Any], examples: Iterable[Example]
+) -> int:
+    """Choose a safe tested output envelope from the drafted task contract.
+
+    A scalar or tiny exact label should not reserve the same 600-token worst case as
+    prose, JSON, or code. Explicit developer ``max_tokens`` always bypasses this
+    inference; this helper only shapes the default first-run tournament and installed
+    route.
+    """
+    outputs = [
+        turn.approved_output
+        for example in examples
+        for turn in example.conversation()
+    ]
+    longest_chars = max((len(value) for value in outputs), default=0)
+    evaluator_type = str(evaluator.get("type") or "semantic")
+    if evaluator_type == "numeric_tolerance":
+        return 128
+    if evaluator_type == "exact_text" and longest_chars <= 48:
+        return 128
+    estimated_tokens = max(1, (longest_chars + 2) // 3)
+    if evaluator_type == "exact_json":
+        return min(8192, max(512, estimated_tokens * 6 + 128))
+    return min(8192, max(600, estimated_tokens * 6 + 128))
+
+
 def _dashboard_run_scope(method):
     """Give one public SDK invocation a stable opaque dashboard lifecycle."""
 
@@ -1739,7 +1766,7 @@ class Evalt:
         designer_model: str | None = None,
         evaluator_model: str | None = None,
         test_request_timeout_seconds: float = 120,
-        designer_request_timeout_seconds: float = 120,
+        designer_request_timeout_seconds: float = 45,
     ) -> OptimizationResult | RoutedAnswer:
         if isinstance(suite_or_prompt, Suite):
             if input is not None:
@@ -1909,6 +1936,13 @@ class Evalt:
                     target_max_tokens=int(max_tokens or 600),
                     request_options=normalized_request_options,
                 )
+                if max_tokens is None:
+                    draft = replace(
+                        draft,
+                        target_max_tokens=_automatic_target_max_tokens(
+                            draft.evaluator, draft.examples
+                        ),
+                    )
                 initial_result = self.run(replace(
                     draft.autopilot_suite(), rounds=int(optimization_rounds)
                 ))

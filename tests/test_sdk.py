@@ -16,7 +16,7 @@ from urllib.error import HTTPError
 from evalt import BudgetExceeded, Client, Evalt, Example, ProviderError, RequestEnvelopeDriftWarning, Suite, check_result, compare_results, render_comparison_html, render_html_report, render_junit_report, select_role_plan
 from evalt.cli import STARTER_SUITE, main as cli_main, parser as cli_parser
 from evalt.acceptance import AcceptanceFailure, redact_trace, validate_auto_first_route_receipt
-from evalt.core import Completion, OpenRouterTransport, _safe_provider_error_detail
+from evalt.core import Completion, OpenRouterTransport, _automatic_target_max_tokens, _safe_provider_error_detail
 from evalt.migration import migrate_openai_results
 from evalt.dashboard import WorkspaceSync, generate_workspace_token, load_dashboard_config, remove_dashboard_config, sanitize_progress_event, sanitize_route_snapshot, save_dashboard_config
 from modelsieve import Client as ModelSieveClient
@@ -28,6 +28,23 @@ class CompatibilityTests(unittest.TestCase):
     def test_earlier_imports_resolve_to_evalt_client(self):
         self.assertIs(LegacyClient, Client)
         self.assertIs(ModelSieveClient, Client)
+
+    def test_automatic_output_envelope_is_small_only_for_small_contracts(self):
+        scalar = [Example("How happy?", "7", "score")]
+        self.assertEqual(
+            _automatic_target_max_tokens({"type": "numeric_tolerance"}, scalar),
+            128,
+        )
+        label = [Example("Route this", "technical", "label")]
+        self.assertEqual(
+            _automatic_target_max_tokens({"type": "exact_text"}, label),
+            128,
+        )
+        prose = [Example("Summarize", "A" * 600, "summary")]
+        self.assertGreaterEqual(
+            _automatic_target_max_tokens({"type": "semantic"}, prose),
+            600,
+        )
 
 
 class DashboardBridgeTests(unittest.TestCase):
@@ -603,6 +620,7 @@ class DesignerFallbackTransport(CaseDesignerTransport):
                 "id": "primary-designer",
                 "intelligence": 100,
                 "blended_price": 1.0,
+                "private_provider_routes": 3,
                 "supported_parameters": ["max_tokens"],
             },
             {
@@ -2142,6 +2160,62 @@ class SdkTests(unittest.TestCase):
         self.assertGreaterEqual(len(deep.target_models), len(lean.target_models))
         self.assertNotEqual(lean.judge_model, "tiny")
 
+    def test_designer_role_prefers_redundant_structured_routes_over_a_fragile_leader(self):
+        catalog = [
+            {
+                "id": "fragile-leader", "intelligence": 60, "blended_price": 1,
+                "private_provider_routes": 1, "designer_provider_routes": 1,
+                "supported_parameters": ["max_tokens", "response_format"],
+            },
+            {
+                "id": "reliable-designer", "intelligence": 58, "blended_price": 2,
+                "private_provider_routes": 3, "designer_provider_routes": 3,
+                "designer_p90_latency_ms": 2500,
+                "supported_parameters": ["max_tokens", "response_format"],
+            },
+            {
+                "id": "no-schema", "intelligence": 59, "blended_price": 0.1,
+                "private_provider_routes": 5, "designer_provider_routes": 0,
+                "supported_parameters": ["max_tokens"],
+            },
+            {
+                "id": "judge", "intelligence": 50, "blended_price": 0.2,
+                "private_provider_routes": 3, "designer_provider_routes": 3,
+                "supported_parameters": ["max_tokens", "response_format"],
+            },
+        ]
+        plan = select_role_plan(catalog, maintenance_budget_usd=1.0)
+        self.assertEqual(plan.test_designer_model, "reliable-designer")
+        self.assertNotIn("no-schema", plan.designer_candidates)
+
+    def test_designer_role_disables_optional_default_reasoning(self):
+        catalog = [
+            {
+                "id": "adaptive-designer", "intelligence": 60,
+                "blended_price": 1, "private_provider_routes": 3,
+                "designer_provider_routes": 3,
+                "supported_parameters": [
+                    "max_tokens", "response_format", "reasoning",
+                ],
+                "reasoning": {
+                    "mandatory": False,
+                    "default_enabled": True,
+                    "default_effort": "medium",
+                    "supported_efforts": ["low", "medium", "high"],
+                },
+            },
+            {
+                "id": "judge", "intelligence": 45, "blended_price": 0.1,
+                "private_provider_routes": 3, "designer_provider_routes": 3,
+                "supported_parameters": ["max_tokens", "response_format"],
+            },
+        ]
+        plan = select_role_plan(catalog, maintenance_budget_usd=1.0)
+        self.assertEqual(
+            plan.test_designer_model,
+            "adaptive-designer#reasoning=none",
+        )
+
     def test_role_policy_uses_live_catalog_rank_when_absolute_scores_are_missing(self):
         catalog = [
             {
@@ -2878,8 +2952,110 @@ class SdkTests(unittest.TestCase):
             response_schema={"type": "object"},
         )
         sent = requests[-1]
-        self.assertEqual(sent["provider"]["only"], ["reliable/structured"])
+        self.assertEqual(sent["provider"]["only"], ["reliable"])
         self.assertEqual(sent["response_format"]["type"], "json_schema")
+
+    def test_endpoint_selection_uses_request_sized_fast_route_not_model_maximum(self):
+        requests = []
+
+        def opener(request, timeout):
+            if request.data is not None:
+                requests.append(json.loads(request.data))
+                return FakeResponse({
+                    "id": "gen-request-sized",
+                    "choices": [{"finish_reason": "stop", "message": {"content": "{}"}}],
+                    "usage": {"cost": 0.0001, "prompt_tokens": 4, "completion_tokens": 1},
+                })
+            if "endpoints/zdr" in request.full_url:
+                return FakeResponse({"data": [
+                    {
+                        "model_id": "request-sized", "tag": "slow/full", "provider_name": "Slow",
+                        "context_length": 131072, "max_completion_tokens": 131072,
+                        "latency_last_30m": {"p90": 9000}, "uptime_last_5m": 100,
+                        "pricing": {"prompt": "0.00000001", "completion": "0.00000001"},
+                        "supported_parameters": ["max_tokens", "response_format"],
+                    },
+                    {
+                        "model_id": "request-sized", "tag": "fast/right-sized", "provider_name": "Fast",
+                        "context_length": 32768, "max_completion_tokens": 16384,
+                        "latency_last_30m": {"p90": 800}, "uptime_last_5m": 100,
+                        "pricing": {"prompt": "0.00000002", "completion": "0.00000002"},
+                        "supported_parameters": ["max_tokens", "response_format"],
+                    },
+                ]})
+            return FakeResponse({"data": [{
+                "id": "request-sized", "context_length": 131072,
+                "top_provider": {"context_length": 131072, "max_completion_tokens": 131072},
+                "pricing": {"prompt": "0.00000001", "completion": "0.00000001"},
+                "supported_parameters": ["max_tokens", "response_format"],
+            }]})
+
+        OpenRouterTransport("sk-or-v1-test-key", opener=opener).complete(
+            "request-sized", [{"role": "user", "content": "hello"}],
+            max_tokens=4000, response_schema={"type": "object"},
+        )
+        self.assertEqual(requests[-1]["provider"]["only"][0], "fast")
+
+    def test_plain_orchestration_model_does_not_send_an_invalid_none_effort(self):
+        requests = []
+
+        def opener(request, timeout):
+            if request.data is not None:
+                requests.append(json.loads(request.data))
+                return FakeResponse({
+                    "id": "gen-plain", "choices": [{"message": {"content": "{}"}}],
+                    "usage": {"cost": 0.0001, "prompt_tokens": 4, "completion_tokens": 1},
+                })
+            if "endpoints/zdr" in request.full_url:
+                return FakeResponse({"data": [{
+                    "model_id": "plain-reasoner", "tag": "fixture/reasoner",
+                    "provider_name": "Fixture", "context_length": 131072,
+                    "max_completion_tokens": 131072,
+                    "pricing": {"prompt": "0.000001", "completion": "0.000002"},
+                    "supported_parameters": ["max_tokens", "reasoning", "response_format"],
+                }]})
+            return FakeResponse({"data": [{
+                "id": "plain-reasoner", "context_length": 131072,
+                "pricing": {"prompt": "0.000001", "completion": "0.000002"},
+                "supported_parameters": ["max_tokens", "reasoning", "response_format"],
+                "reasoning": {
+                    "mandatory": False, "default_enabled": True,
+                    "supported_efforts": ["high", "medium", "low"],
+                },
+            }]})
+
+        OpenRouterTransport("sk-or-v1-test-key", opener=opener).complete(
+            "plain-reasoner", [{"role": "user", "content": "hello"}],
+            max_tokens=25, response_schema={"type": "object"},
+        )
+        self.assertNotIn("reasoning", requests[-1])
+
+    def test_provider_schema_omits_nonportable_bounds_but_keeps_structure(self):
+        portable = OpenRouterTransport._portable_response_schema({
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["score", "items"],
+            "properties": {
+                "score": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 10,
+                    "exclusiveMinimum": -1,
+                },
+                "items": {
+                    "type": "array",
+                    "minItems": 5,
+                    "maxItems": 5,
+                    "items": {"type": "string", "minLength": 1},
+                },
+            },
+        })
+        self.assertEqual(portable["required"], ["score", "items"])
+        self.assertFalse(portable["additionalProperties"])
+        self.assertNotIn("minimum", portable["properties"]["score"])
+        self.assertNotIn("maximum", portable["properties"]["score"])
+        self.assertNotIn("minItems", portable["properties"]["items"])
+        self.assertNotIn("maxItems", portable["properties"]["items"])
 
     def test_provider_429_retries_the_same_model_on_a_preflighted_fallback_route(self):
         requests = []
@@ -2929,8 +3105,53 @@ class SdkTests(unittest.TestCase):
             response_schema={"type": "object"},
         )
         self.assertEqual(completion.generation_id, "gen-fallback")
-        self.assertEqual(requests[0]["provider"]["only"], ["first/route", "second/route"])
-        self.assertEqual(requests[1]["provider"]["only"], ["second/route"])
+        self.assertEqual(requests[0]["provider"]["only"], ["first", "second"])
+        self.assertEqual(requests[1]["provider"]["only"], ["second"])
+
+    def test_single_preflighted_route_gets_one_short_transient_retry(self):
+        requests = []
+
+        def opener(request, timeout):
+            if request.data is not None:
+                requests.append(json.loads(request.data))
+                if len(requests) == 1:
+                    detail = json.dumps({
+                        "error": {
+                            "message": "rate limited",
+                            "code": 429,
+                            "metadata": {"provider_name": "Only Provider"},
+                        }
+                    }).encode()
+                    raise HTTPError(request.full_url, 429, "rate limited", {}, BytesIO(detail))
+                return FakeResponse({
+                    "id": "gen-transient-retry",
+                    "choices": [{"finish_reason": "stop", "message": {"content": "{}"}}],
+                    "usage": {"cost": 0.0001, "prompt_tokens": 4, "completion_tokens": 1},
+                })
+            if "endpoints/zdr" in request.full_url:
+                return FakeResponse({"data": [{
+                    "model_id": "one-route-model", "tag": "only-provider/fp8",
+                    "provider_name": "Only Provider", "context_length": 131072,
+                    "max_completion_tokens": 131072,
+                    "pricing": {"prompt": "0.00000001", "completion": "0.00000001"},
+                    "supported_parameters": ["max_tokens", "response_format"],
+                }]})
+            return FakeResponse({"data": [{
+                "id": "one-route-model", "context_length": 131072,
+                "pricing": {"prompt": "0.00000001", "completion": "0.00000001"},
+                "supported_parameters": ["max_tokens", "response_format"],
+            }]})
+
+        completion = OpenRouterTransport(
+            "sk-or-v1-test-key", opener=opener
+        ).complete(
+            "one-route-model", [{"role": "user", "content": "hello"}],
+            max_tokens=25, response_schema={"type": "object"},
+        )
+        self.assertEqual(completion.generation_id, "gen-transient-retry")
+        self.assertEqual(len(requests), 2)
+        self.assertEqual(requests[0]["provider"]["only"], ["only-provider"])
+        self.assertEqual(requests[1]["provider"]["only"], ["only-provider"])
 
     def test_provider_specific_400_retries_another_preflighted_route(self):
         requests = []
@@ -2979,7 +3200,7 @@ class SdkTests(unittest.TestCase):
             response_schema={"type": "object"},
         )
         self.assertEqual(completion.generation_id, "gen-second-provider")
-        self.assertEqual(requests[1]["provider"]["only"], ["second/route"])
+        self.assertEqual(requests[1]["provider"]["only"], ["second"])
 
     def test_empty_completion_falls_back_to_another_preflighted_provider_without_expanding_tokens(self):
         requests = []
@@ -3030,7 +3251,7 @@ class SdkTests(unittest.TestCase):
         self.assertEqual(completion.generation_id, "gen-good")
         self.assertAlmostEqual(completion.cost_usd, 0.00013)
         self.assertEqual(requests[0]["max_completion_tokens"], requests[1]["max_completion_tokens"])
-        self.assertEqual(requests[1]["provider"]["only"], ["second/route"])
+        self.assertEqual(requests[1]["provider"]["only"], ["second"])
 
     def test_reasoning_effort_is_a_costed_auditable_model_configuration(self):
         requests = []
@@ -3181,7 +3402,7 @@ class SdkTests(unittest.TestCase):
             "reasoner#reasoning=high", [{"role": "user", "content": "hello"}], max_tokens=100,
         )
         sent = requests[-1]
-        self.assertEqual(sent["provider"]["only"], ["full/capacity"])
+        self.assertEqual(sent["provider"]["only"], ["full"])
         self.assertFalse(sent["provider"]["allow_fallbacks"])
         self.assertGreater(sent["max_completion_tokens"], 100000)
 

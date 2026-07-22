@@ -154,11 +154,40 @@ def select_role_plan(
                 )
             except (TypeError, ValueError):
                 private_provider_routes = 0
+            try:
+                designer_provider_routes = max(
+                    0,
+                    int(
+                        item.get("designer_provider_routes")
+                        if item.get("designer_provider_routes") is not None
+                        else private_provider_routes
+                    ),
+                )
+            except (TypeError, ValueError):
+                designer_provider_routes = 0
+            try:
+                designer_p90_latency_ms = float(item.get("designer_p90_latency_ms"))
+            except (TypeError, ValueError):
+                designer_p90_latency_ms = float("inf")
+            designer_parameter_compatible = (
+                not supported
+                or bool({"response_format", "structured_outputs"} & supported)
+            )
             normalized.append({
                 "id": model,
                 "intelligence": intelligence,
                 "price": price,
                 "private_provider_routes": private_provider_routes,
+                "designer_provider_routes": designer_provider_routes,
+                "designer_compatible": (
+                    designer_parameter_compatible
+                    and (designer_provider_routes > 0 or not supported)
+                ),
+                "designer_p90_latency_ms": designer_p90_latency_ms,
+                "designer_default_effort": str(
+                    reasoning.get("default_effort")
+                    or ("medium" if reasoning.get("default_enabled") else "none")
+                ),
                 "reasoning_efforts": tuple(dict.fromkeys(efforts)),
                 "intelligence_source": intelligence_source,
             })
@@ -185,15 +214,25 @@ def select_role_plan(
     normalized.sort(key=lambda item: (item["price"], -item["intelligence"], item["id"]))
     maximum = max(item["intelligence"] for item in normalized)
 
-    def cheapest_above(delta: float, *, exclude: set[str] | None = None) -> str:
+    def cheapest_above(
+        delta: float,
+        *,
+        exclude: set[str] | None = None,
+        pool: Sequence[Mapping[str, Any]] | None = None,
+    ) -> str:
         excluded = exclude or set()
+        source = list(pool) if pool is not None else normalized
+        source_maximum = max(
+            (item["intelligence"] for item in source),
+            default=maximum,
+        )
         eligible = [
-            item for item in normalized
-            if item["intelligence"] >= maximum - delta
+            item for item in source
+            if item["intelligence"] >= source_maximum - delta
             and item["id"] not in excluded
         ]
         if not eligible:
-            eligible = [item for item in normalized if item["id"] not in excluded]
+            eligible = [item for item in source if item["id"] not in excluded]
         if not eligible:
             eligible = list(normalized)
         return min(eligible, key=lambda item: (item["price"], -item["intelligence"]))["id"]
@@ -260,25 +299,50 @@ def select_role_plan(
                 hone_ids.append(configured)
     target_ids = (broad_ids + hone_ids)[:25]
     revision = _hash(json.dumps(normalized, sort_keys=True, separators=(",", ":")))
-    designer_choice = cheapest_above(designer_delta)
+    designer_pool = [item for item in normalized if item["designer_compatible"]]
+    if not designer_pool:
+        designer_pool = list(normalized)
+    reliable_designer_pool = [
+        item for item in designer_pool if item["designer_provider_routes"] >= 2
+    ]
+    if reliable_designer_pool:
+        designer_pool = reliable_designer_pool
+    designer_choice = cheapest_above(designer_delta, pool=designer_pool)
     judge_choice = cheapest_above(judge_delta, exclude={designer_choice})
+
+    def bounded_designer_configuration(model_id: str) -> str:
+        item = next(
+            (value for value in designer_pool if value["id"] == model_id),
+            None,
+        )
+        if (
+            item is not None
+            and item.get("designer_default_effort") != "none"
+            and "none" in (item.get("reasoning_efforts") or ())
+        ):
+            return f"{model_id}#reasoning=none"
+        return model_id
     fallback_designers = [
-        item for item in normalized
-        if item["intelligence"] >= maximum - max(designer_delta, 12.0)
+        item for item in designer_pool
+        if item["intelligence"] >= max(
+            value["intelligence"] for value in designer_pool
+        ) - max(designer_delta, 12.0)
         and item["id"] not in {designer_choice, judge_choice}
     ]
     fallback_designers.sort(key=lambda item: (
-        0 if item["private_provider_routes"] >= 2 else 1,
+        0 if item["designer_default_effort"] not in {"high", "xhigh", "max"} else 1,
+        0 if item["designer_provider_routes"] >= 2 else 1,
+        item["designer_p90_latency_ms"],
         item["price"],
         -item["intelligence"],
     ))
     designer_candidates = tuple(dict.fromkeys((
-        designer_choice,
-        *(item["id"] for item in fallback_designers),
+        bounded_designer_configuration(designer_choice),
+        *(bounded_designer_configuration(item["id"]) for item in fallback_designers),
     )))[:4]
     return RolePlan(
         tier=tier,
-        test_designer_model=designer_choice,
+        test_designer_model=bounded_designer_configuration(designer_choice),
         judge_model=judge_choice,
         target_models=tuple(target_ids),
         catalog_revision=revision,

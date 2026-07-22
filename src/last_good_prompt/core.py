@@ -337,6 +337,7 @@ class OpenRouterTransport:
         self._limits: dict[str, tuple[int | None, int | None]] = {}
         self._providers: dict[str, list[str]] = {}
         self._provider_route_names: dict[str, dict[str, str]] = {}
+        self._endpoint_routes: dict[str, list[dict[str, Any]]] = {}
         self._catalog_items: list[dict[str, Any]] = []
         self._preferred_max_latency_seconds: float | None = None
         self._provider_sort = "price"
@@ -451,6 +452,7 @@ class OpenRouterTransport:
         self._limits = {}
         self._providers = {}
         self._provider_route_names = {}
+        self._endpoint_routes = {}
         for intelligence_rank, item in enumerate(payload.get("data", []), start=1):
             pricing = item.get("pricing") or {}
             try:
@@ -460,6 +462,7 @@ class OpenRouterTransport:
                     # A model-level listing is not an executable private route. Omit
                     # it before spend instead of launching a guaranteed ZDR 404.
                     continue
+                self._endpoint_routes[model_id] = [dict(value) for value in endpoints]
                 top_provider = item.get("top_provider") or {}
 
                 def endpoint_capacity(value: dict[str, Any]) -> int:
@@ -542,6 +545,29 @@ class OpenRouterTransport:
                     for value in provider_pool
                     if value.get("provider_name") or value.get("tag")
                 }
+                designer_endpoints = [
+                    value for value in endpoints
+                    if endpoint_capacity(value) >= 12000
+                    and ({"response_format", "structured_outputs"} & {
+                        str(parameter)
+                        for parameter in value.get("supported_parameters") or []
+                    })
+                    and value.get("status") in {None, 0}
+                ]
+                designer_provider_families = {
+                    str(value.get("provider_name") or value.get("tag") or "")
+                    .strip().casefold()
+                    for value in designer_endpoints
+                    if value.get("provider_name") or value.get("tag")
+                }
+                designer_latencies = []
+                for value in designer_endpoints:
+                    try:
+                        designer_latencies.append(
+                            float((value.get("latency_last_30m") or {})["p90"])
+                        )
+                    except (KeyError, TypeError, ValueError):
+                        pass
                 if provider_tags:
                     self._providers[model_id] = provider_tags[:3]
                     self._provider_route_names[model_id] = {
@@ -566,6 +592,10 @@ class OpenRouterTransport:
                     # regional endpoints owned by the same provider. This number
                     # drives reliability preferences in role shortlisting.
                     "private_provider_routes": len(provider_families),
+                    "designer_provider_routes": len(designer_provider_families),
+                    "designer_p90_latency_ms": (
+                        min(designer_latencies) if designer_latencies else None
+                    ),
                 })
             except (KeyError, TypeError, ValueError):
                 continue
@@ -582,6 +612,176 @@ class OpenRouterTransport:
         """
         self._load_prices()
         return [dict(item) for item in self._catalog_items]
+
+    @staticmethod
+    def _endpoint_capacity(endpoint: Mapping[str, Any]) -> int:
+        raw = endpoint.get("max_completion_tokens") or endpoint.get("context_length") or 0
+        try:
+            return max(0, int(raw))
+        except (TypeError, ValueError):
+            return 0
+
+    @staticmethod
+    def _endpoint_latency(endpoint: Mapping[str, Any]) -> float:
+        try:
+            return max(0.0, float((endpoint.get("latency_last_30m") or {})["p90"]))
+        except (KeyError, TypeError, ValueError):
+            return float("inf")
+
+    @staticmethod
+    def _provider_family_slug(endpoint_tag: Any) -> str:
+        """Return the resilient provider-family slug for an endpoint catalog tag.
+
+        OpenRouter's ZDR endpoint feed includes region and quantization tags such as
+        ``google-vertex/global`` and ``deepinfra/fp4``. Those exact endpoint tags can
+        disappear between catalog fetch and execution even while another endpoint in
+        the same provider family is healthy. Base slugs still let
+        ``require_parameters`` enforce the request envelope without pinning a brittle
+        variant.
+        """
+        return str(endpoint_tag or "").strip().split("/", 1)[0]
+
+    @classmethod
+    def _portable_response_schema(cls, value: Any) -> Any:
+        """Return the strict-schema subset shared by current routed providers.
+
+        Some provider-native compilers reject otherwise valid JSON Schema keywords.
+        Amazon Bedrock, for example, accepts ``minItems`` only for 0 or 1 and rejects
+        numeric bounds and ``maxItems``. Evalt validates those stronger constraints
+        after decoding, so omitting them from the provider grammar keeps routing
+        portable without weakening the executable suite contract.
+        """
+        if isinstance(value, list):
+            return [cls._portable_response_schema(item) for item in value]
+        if not isinstance(value, dict):
+            return value
+        unsupported = {
+            "minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum",
+            "multipleOf", "maxItems", "minLength", "maxLength",
+        }
+        portable: dict[str, Any] = {}
+        for key, item in value.items():
+            if key in unsupported:
+                continue
+            if key == "minItems" and item not in {0, 1}:
+                continue
+            portable[str(key)] = cls._portable_response_schema(item)
+        return portable
+
+    def _routes_for_request(
+        self,
+        model: str,
+        *,
+        max_tokens: int,
+        response_schema: Mapping[str, Any] | None,
+        reasoning_requested: bool,
+    ) -> tuple[list[str], dict[str, str], str | None, set[str]]:
+        """Choose current endpoints for this request, not for the model's maximum size.
+
+        The catalog's largest-context endpoint is often slower or less capable than a
+        smaller endpoint that easily fits a 4k-token orchestration call.  Pinning the
+        former made suite design both slow and brittle.  This preflight uses the actual
+        bounded request and only returns routes that can honor its envelope.
+        """
+        endpoints = [
+            value for value in self._endpoint_routes.get(model, [])
+            if value.get("status") in {None, 0}
+            and self._endpoint_capacity(value) >= int(max_tokens)
+        ]
+        if response_schema:
+            exact = [
+                value for value in endpoints
+                if "response_format" in {
+                    str(parameter)
+                    for parameter in value.get("supported_parameters") or []
+                }
+            ]
+            if exact:
+                endpoints = exact
+            else:
+                endpoints = [
+                    value for value in endpoints
+                    if "structured_outputs" in {
+                        str(parameter)
+                        for parameter in value.get("supported_parameters") or []
+                    }
+                ]
+        if reasoning_requested:
+            endpoints = [
+                value for value in endpoints
+                if {"reasoning", "reasoning_effort"} & {
+                    str(parameter)
+                    for parameter in value.get("supported_parameters") or []
+                }
+            ]
+        if not endpoints:
+            return [], {}, None, set()
+
+        token_fields = []
+        for token_field in ("max_tokens", "max_completion_tokens"):
+            supporting = [
+                value for value in endpoints
+                if token_field in {
+                    str(parameter)
+                    for parameter in value.get("supported_parameters") or []
+                }
+            ]
+            if supporting:
+                families = {
+                    str(value.get("provider_name") or value.get("tag") or "").casefold()
+                    for value in supporting
+                }
+                token_fields.append((len(families), len(supporting), token_field, supporting))
+        if not token_fields:
+            return [], {}, None, set()
+        _family_count, _route_count, token_field, endpoints = max(
+            token_fields,
+            key=lambda item: (item[0], item[1], item[2] == "max_tokens"),
+        )
+
+        def route_price(value: Mapping[str, Any]) -> float:
+            try:
+                pricing = value.get("pricing") or {}
+                return float(pricing.get("prompt") or 0) + float(
+                    pricing.get("completion") or 0
+                )
+            except (TypeError, ValueError):
+                return float("inf")
+
+        endpoints.sort(key=lambda value: (
+            0 if float(value.get("uptime_last_5m") or 0) >= 99 else 1,
+            self._endpoint_latency(value),
+            route_price(value),
+        ))
+        selected: list[Mapping[str, Any]] = []
+        selected_families: set[str] = set()
+        for value in endpoints:
+            family = str(value.get("provider_name") or value.get("tag") or "").casefold()
+            if family in selected_families:
+                continue
+            selected.append(value)
+            selected_families.add(family)
+            if len(selected) == 3:
+                break
+        if not selected:
+            selected = endpoints[:1]
+        tags = list(dict.fromkeys(
+            self._provider_family_slug(value.get("tag"))
+            for value in selected
+            if self._provider_family_slug(value.get("tag"))
+        ))
+        names = {
+            self._provider_family_slug(value.get("tag")): str(value.get("provider_name") or "")
+            for value in selected if value.get("tag")
+        }
+        common_parameters = set.intersection(*(
+            {
+                str(parameter)
+                for parameter in value.get("supported_parameters") or []
+            }
+            for value in selected
+        ))
+        return tags, names, token_field, common_parameters
 
     def configuration_support(self, configuration: str) -> dict[str, Any]:
         """Preflight a model/effort pair against current routed capabilities."""
@@ -657,6 +857,24 @@ class OpenRouterTransport:
         max_tokens = self._bounded_output_tokens(model, messages, max_tokens, reasoning_effort)
         supported = self._supported_parameters.get(model, set())
         target_options = normalize_request_options(request_options)
+        requested_reasoning_option = target_options.get("reasoning")
+        reasoning_is_requested = bool(
+            explicit_reasoning
+            or reasoning_metadata.get("mandatory")
+            or requested_reasoning_option is not None
+        )
+        route_tags, route_names, routed_token_field, routed_supported = (
+            self._routes_for_request(
+                model,
+                max_tokens=max_tokens,
+                response_schema=response_schema,
+                reasoning_requested=reasoning_is_requested,
+            )
+        )
+        if route_tags:
+            self._providers[model] = route_tags
+            self._provider_route_names[model] = route_names
+            supported = routed_supported
         body: dict[str, Any] = {
             "model": model,
             "messages": messages,
@@ -677,7 +895,11 @@ class OpenRouterTransport:
             body["provider"]["preferred_max_latency"] = {
                 "p90": self._preferred_max_latency_seconds
             }
-        if "max_completion_tokens" in supported:
+        if routed_token_field == "max_tokens":
+            body["max_tokens"] = max_tokens
+        elif routed_token_field == "max_completion_tokens":
+            body["max_completion_tokens"] = max_tokens
+        elif "max_completion_tokens" in supported:
             body["max_completion_tokens"] = max_tokens
         elif "max_tokens" in supported:
             body["max_tokens"] = max_tokens
@@ -697,15 +919,19 @@ class OpenRouterTransport:
             raise ProviderError(
                 f"The current ZDR endpoint for {model!r} does not list reasoning effort {reasoning_effort!r}."
             )
-        if reasoning_supported:
-            body["reasoning"] = {"effort": reasoning_effort, "exclude": True}
+        if reasoning_supported and (explicit_reasoning or reasoning_metadata.get("mandatory")):
+            body["reasoning"] = (
+                {"enabled": False, "exclude": True}
+                if reasoning_effort == "none"
+                else {"effort": reasoning_effort, "exclude": True}
+            )
         if response_schema and ({"structured_outputs", "response_format"} & supported):
             body["response_format"] = {
                 "type": "json_schema",
                 "json_schema": {
                     "name": "evalt_result",
                     "strict": True,
-                    "schema": response_schema,
+                    "schema": self._portable_response_schema(response_schema),
                 },
             }
         # The customer envelope wins over Evalt defaults but never over the
@@ -736,6 +962,7 @@ class OpenRouterTransport:
         body["usage"] = {"include": True}
         started = time.monotonic()
         fallback_spend_usd = 0.0
+        transient_same_route_retries = 0
         while True:
             try:
                 payload = self._request(OPENROUTER_CHAT_URL, body)
@@ -747,6 +974,22 @@ class OpenRouterTransport:
                     tag for tag in current_routes
                     if not failed_provider or route_names.get(tag) != failed_provider
                 ]
+                retryable_status = getattr(error, "status_code", None) in {
+                    408, 409, 429, 500, 502, 503, 504,
+                }
+                if (
+                    retryable_status
+                    and current_routes
+                    and not remaining_routes
+                    and transient_same_route_retries < 1
+                ):
+                    # A sole private route can be healthy immediately before a
+                    # burst-level 429. One short same-envelope retry is cheaper and
+                    # more reliable than abandoning an otherwise qualified model;
+                    # configuration errors (400/422) never retry.
+                    transient_same_route_retries += 1
+                    time.sleep(0.25)
+                    continue
                 if (
                     getattr(error, "status_code", None)
                     not in {400, 408, 409, 422, 429, 500, 502, 503, 504}
@@ -2282,37 +2525,54 @@ class Client:
                 "validation_pass_rate": round(baseline_dev_rate, 6),
                 "selected": True,
             })
-        for round_number in (range(1, int(rounds) + 1) if optimize_prompt else ()):
-            revised_prompt, revised_few_shot_ids = self._propose_prompt(
-                selected_prompt,
-                model,
-                train,
-                selected_train,
-                optimizer_model,
-                budget,
-                allow_few_shot,
-                max_few_shot_examples,
-            )
-            # Training evidence breaks a validation tie; the candidate must never
-            # regress on validation. This avoids silently skipping a useful rewrite
-            # after a lucky perfect score on a small validation slice.
-            revised_train = self._run_cases(
-                revised_prompt,
-                f"candidate-{round_number}",
-                train,
-                "train",
-                model,
-                evaluator_model,
-                budget,
-                train,
-                revised_few_shot_ids,
-                evaluator=evaluator,
-                max_parallel_scenarios=max_parallel_scenarios,
-                target_max_tokens=target_max_tokens, request_options=request_options,
-            )
-            candidate_cases += revised_train
-            revised_dev = self._run_cases(revised_prompt, f"candidate-{round_number}", dev, "dev", model, evaluator_model, budget, train, revised_few_shot_ids, evaluator=evaluator, max_parallel_scenarios=max_parallel_scenarios, target_max_tokens=target_max_tokens, request_options=request_options)
-            candidate_cases += revised_dev
+        should_search_prompt = bool(optimize_prompt)
+        for round_number in (
+            range(1, int(rounds) + 1) if should_search_prompt else ()
+        ):
+            try:
+                revised_prompt, revised_few_shot_ids = self._propose_prompt(
+                    selected_prompt,
+                    model,
+                    train,
+                    selected_train,
+                    optimizer_model,
+                    budget,
+                    allow_few_shot,
+                    max_few_shot_examples,
+                )
+                # Training evidence breaks a validation tie; the candidate must never
+                # regress on validation. This avoids silently skipping a useful rewrite
+                # after a lucky perfect score on a small validation slice.
+                revised_train = self._run_cases(
+                    revised_prompt,
+                    f"candidate-{round_number}",
+                    train,
+                    "train",
+                    model,
+                    evaluator_model,
+                    budget,
+                    train,
+                    revised_few_shot_ids,
+                    evaluator=evaluator,
+                    max_parallel_scenarios=max_parallel_scenarios,
+                    target_max_tokens=target_max_tokens, request_options=request_options,
+                )
+                candidate_cases += revised_train
+                revised_dev = self._run_cases(revised_prompt, f"candidate-{round_number}", dev, "dev", model, evaluator_model, budget, train, revised_few_shot_ids, evaluator=evaluator, max_parallel_scenarios=max_parallel_scenarios, target_max_tokens=target_max_tokens, request_options=request_options)
+                candidate_cases += revised_dev
+            except BudgetExceeded as error:
+                # Prompt search is optional. Preserve the fully measured starting
+                # package and continue to final confirmation when a rewrite cannot
+                # fit under the shared tournament cap.
+                if progress_callback is not None:
+                    progress_callback({
+                        "event": "prompt_candidate_skipped_budget",
+                        "model": model,
+                        "candidate": round_number,
+                        "reason": str(error),
+                        "validation_pass_rate": round(selected_rate, 6),
+                    })
+                break
             revised_rate = _pass_rate(revised_dev)
             revised_train_rate = _pass_rate(revised_train)
             prompt_candidates_tested += 1
