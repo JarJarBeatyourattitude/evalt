@@ -2178,6 +2178,31 @@ class Evalt:
             self.flush_dashboard(timeout_seconds=5.0)
         return status
 
+    def sync_existing_routes(self, timeout_seconds: float = 10.0) -> dict[str, Any]:
+        """Publish current sanitized route summaries without making provider calls."""
+
+        routes = self.router.list_routes()
+        if self._dashboard_sync is None:
+            return {
+                "local_route_count": len(routes),
+                "route_summaries_queued": 0,
+                "sync_succeeded": False,
+                "sync_error": "No hosted workspace is connected.",
+            }
+        for route in routes:
+            self._dashboard_sync.publish_route(self.router.status(route))
+        succeeded = self.flush_dashboard(timeout_seconds=timeout_seconds)
+        return {
+            "local_route_count": len(routes),
+            "route_summaries_queued": len(routes),
+            "sync_succeeded": succeeded,
+            "sync_error": (
+                None
+                if succeeded
+                else str(getattr(self._dashboard_sync, "last_error", "") or "Hosted sync did not finish.")[:180]
+            ),
+        }
+
     def flush_dashboard(self, timeout_seconds: float = 10.0) -> bool:
         """Wait briefly for explicitly enabled dashboard metadata sync."""
         return True if self._dashboard_sync is None else self._dashboard_sync.flush(timeout_seconds)

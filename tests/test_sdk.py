@@ -19,7 +19,7 @@ from evalt.cli import STARTER_SUITE, main as cli_main, parser as cli_parser
 from evalt.acceptance import AcceptanceFailure, redact_trace, validate_auto_first_route_receipt
 from evalt.core import Completion, OpenRouterTransport, _automatic_target_max_tokens, _safe_provider_error_detail
 from evalt.migration import migrate_openai_results
-from evalt.dashboard import WorkspaceSync, dashboard_config_path, generate_workspace_token, load_dashboard_config, remove_dashboard_config, sanitize_progress_event, sanitize_route_snapshot, save_dashboard_config, workspace_fingerprint
+from evalt.dashboard import WorkspaceSync, dashboard_config_path, generate_workspace_token, inspect_workspace, load_dashboard_config, remove_dashboard_config, sanitize_progress_event, sanitize_route_snapshot, save_dashboard_config, workspace_fingerprint
 from modelsieve import Client as ModelSieveClient
 from last_good_prompt import Client as LegacyClient
 from last_good_prompt.core import _Budget, CaseResult, ModelResult, _binomial_exact_lower_bound, _final_test_evidence, _submit_with_context
@@ -104,6 +104,22 @@ class DashboardBridgeTests(unittest.TestCase):
                 self.assertTrue(path.exists())
                 self.assertTrue(remove_dashboard_config(state))
                 self.assertIsNone(load_dashboard_config(state))
+
+    def test_hosted_inspection_reports_only_reachability_and_route_count(self):
+        token = generate_workspace_token()
+        response = mock.MagicMock()
+        response.__enter__.return_value = response
+        response.read.return_value = b'[{"route":"private-name"},{"route":"another"}]'
+        opened = mock.Mock(return_value=response)
+        result = inspect_workspace(token, api_url="https://api.example", opener=opened)
+        self.assertEqual(result, {
+            "hosted_reachable": True,
+            "remote_route_count": 2,
+            "hosted_error": None,
+        })
+        request = opened.call_args.args[0]
+        self.assertEqual(request.get_header("Authorization"), f"Bearer {token}")
+        self.assertNotIn(token, json.dumps(result))
 
     def test_user_wide_connection_follows_scripts_across_project_folders(self):
         with TemporaryDirectory() as directory:
@@ -278,7 +294,10 @@ class DashboardBridgeTests(unittest.TestCase):
             state = Path(directory) / ".evalt" / "evalt.db"
             token = generate_workspace_token()
             output = StringIO()
-            with redirect_stdout(output):
+            with mock.patch(
+                "evalt.cli.inspect_workspace",
+                return_value={"hosted_reachable": True, "remote_route_count": 0, "hosted_error": None},
+            ), redirect_stdout(output):
                 self.assertEqual(cli_main([
                     "connect", token, "--state", str(state), "--no-open",
                     "--api-url", "https://api.example", "--app-url", "https://app.example",
@@ -291,19 +310,108 @@ class DashboardBridgeTests(unittest.TestCase):
             )
             self.assertEqual(load_dashboard_config(state)["workspace_token"], token)
 
+    def test_connect_recovers_existing_route_summaries_without_provider_calls(self):
+        class CapturingSync:
+            workspace_id = "ws_safe"
+            last_error = None
+
+            def __init__(self): self.routes = []
+            def publish_event(self, _value): pass
+            def publish_route(self, value): self.routes.append(dict(value))
+            def flush(self, _timeout_seconds): return True
+
+        with TemporaryDirectory() as directory:
+            state = Path(directory) / ".evalt" / "evalt.db"
+            token = generate_workspace_token()
+            global_home = Path(directory) / "global"
+            with mock.patch.dict(os.environ, {"EVALT_CONFIG_HOME": str(global_home)}, clear=False):
+                local = Evalt(transport=FakeTransport(), state_path=state)
+                local.run(
+                    "Return one label.", "charged twice", route="support",
+                    first_run="bootstrap", models=["cheap"], auto_maintain=False,
+                )
+                sync = CapturingSync()
+                output = StringIO()
+                with mock.patch("evalt.core.WorkspaceSync", return_value=sync), mock.patch(
+                    "evalt.cli.inspect_workspace",
+                    return_value={"hosted_reachable": True, "remote_route_count": 1, "hosted_error": None},
+                ), redirect_stdout(output):
+                    self.assertEqual(cli_main([
+                        "connect", token, "--state", str(state), "--no-open",
+                        "--api-url", "https://api.example", "--app-url", "https://app.example",
+                    ]), 0)
+            payload = json.loads(output.getvalue())
+            self.assertEqual(payload["local_route_count"], 1)
+            self.assertEqual(payload["route_summaries_queued"], 1)
+            self.assertTrue(payload["sync_succeeded"])
+            self.assertEqual([item["route"] for item in sync.routes], ["support"])
+            self.assertNotIn("charged twice", output.getvalue())
+            self.assertNotIn("Return one label", output.getvalue())
+
+    def test_connect_keeps_local_config_but_returns_failure_when_hosted_check_fails(self):
+        with TemporaryDirectory() as directory:
+            state = Path(directory) / ".evalt" / "evalt.db"
+            token = generate_workspace_token()
+            output = StringIO()
+            with mock.patch(
+                "evalt.cli.inspect_workspace",
+                return_value={
+                    "hosted_reachable": False,
+                    "remote_route_count": None,
+                    "hosted_error": "hosted workspace returned HTTP 503",
+                },
+            ), redirect_stdout(output):
+                self.assertEqual(cli_main([
+                    "connect", token, "--state", str(state), "--no-open",
+                    "--no-sync-existing", "--api-url", "https://api.example",
+                ]), 2)
+            payload = json.loads(output.getvalue())
+            self.assertFalse(payload["hosted_reachable"])
+            self.assertTrue(Path(payload["config"]).exists())
+            self.assertNotIn(token, output.getvalue())
+
     def test_dashboard_status_exposes_comparable_id_without_opening_or_leaking_token(self):
         with TemporaryDirectory() as directory:
             state = Path(directory) / ".evalt" / "evalt.db"
             token = generate_workspace_token()
             save_dashboard_config(token, state_path=state, app_url="https://app.example")
             output = StringIO()
-            with mock.patch("evalt.cli.webbrowser.open") as opened, redirect_stdout(output):
+            with mock.patch("evalt.cli.webbrowser.open") as opened, mock.patch(
+                "evalt.cli.inspect_workspace",
+                return_value={"hosted_reachable": True, "remote_route_count": 1, "hosted_error": None},
+            ), redirect_stdout(output):
                 self.assertEqual(cli_main(["dashboard", "--state", str(state), "--status"]), 0)
             payload = json.loads(output.getvalue())
             self.assertEqual(payload["workspace_id"], workspace_fingerprint(token))
             self.assertFalse(payload["opened"])
+            self.assertTrue(payload["hosted_reachable"])
+            self.assertEqual(payload["remote_route_count"], 1)
+            self.assertTrue(payload["sdk_version"])
+            self.assertTrue(payload["python_executable"])
+            self.assertIn("-m evalt doctor", payload["same_interpreter_command"])
             self.assertNotIn(token, output.getvalue())
             opened.assert_not_called()
+
+    def test_doctor_explains_when_existing_local_routes_are_not_online(self):
+        with TemporaryDirectory() as directory:
+            state = Path(directory) / ".evalt" / "evalt.db"
+            token = generate_workspace_token()
+            save_dashboard_config(token, state_path=state, api_url="https://api.example")
+            Evalt(transport=FakeTransport(), state_path=state).run(
+                "Return one label.", "charged twice", route="support",
+                first_run="bootstrap", models=["cheap"], auto_maintain=False,
+            )
+            output = StringIO()
+            with mock.patch(
+                "evalt.cli.inspect_workspace",
+                return_value={"hosted_reachable": True, "remote_route_count": 0, "hosted_error": None},
+            ), redirect_stdout(output):
+                self.assertEqual(cli_main(["doctor", "--state", str(state)]), 0)
+            payload = json.loads(output.getvalue())
+            self.assertEqual(payload["local_route_count"], 1)
+            self.assertEqual(payload["remote_route_count"], 0)
+            self.assertIn("--sync-existing", payload["next"])
+            self.assertNotIn(token, output.getvalue())
 
     def test_visible_progress_names_workspace_and_reports_sync_failure(self):
         class FailedSync:

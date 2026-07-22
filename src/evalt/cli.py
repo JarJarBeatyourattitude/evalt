@@ -18,11 +18,27 @@ from .dashboard import (
     DEFAULT_DASHBOARD_APP_URL,
     dashboard_config_path,
     generate_workspace_token,
+    inspect_workspace,
     load_dashboard_config,
     remove_dashboard_config,
     save_dashboard_config,
     workspace_fingerprint,
 )
+
+
+def _sdk_version() -> str:
+    from . import __version__
+    return __version__
+
+
+def _runtime_identity() -> dict[str, str]:
+    executable = str(Path(sys.executable).resolve())
+    return {
+        "sdk_version": _sdk_version(),
+        "python_executable": executable,
+        "evalt_package": str(Path(__file__).resolve().parent),
+        "same_interpreter_command": f'"{executable}" -m evalt doctor',
+    }
 
 
 STARTER_SUITE = {
@@ -146,7 +162,7 @@ def parser() -> argparse.ArgumentParser:
         prog="evalt",
         description="Run prompts through a durable, tested, budget-bounded model route.",
     )
-    root.add_argument("--version", action="version", version="evalt 0.10.14")
+    root.add_argument("--version", action="version", version=f"evalt {_sdk_version()}")
     commands = root.add_subparsers(dest="command", required=True)
 
     init = commands.add_parser("init", help="Write a reviewable starter suite; no provider call.")
@@ -237,10 +253,15 @@ def parser() -> argparse.ArgumentParser:
     connect.add_argument("--api-url", default=DEFAULT_DASHBOARD_API_URL)
     connect.add_argument("--app-url", default=DEFAULT_DASHBOARD_APP_URL)
     connect.add_argument("--no-open", action="store_true", help="Do not open the connected dashboard in a browser.")
+    connect.add_argument("--no-sync-existing", action="store_true", help="Save the connection without publishing current sanitized route summaries.")
 
     dashboard = commands.add_parser("dashboard", help="Open the connected hosted workspace without exposing the token in output.")
     dashboard.add_argument("--state", help="Prefer a project-scoped connection for this route database.")
     dashboard.add_argument("--status", action="store_true", help="Show the connected workspace ID without opening a browser.")
+    dashboard.add_argument("--sync-existing", action="store_true", help="Publish current sanitized route summaries without provider calls.")
+
+    doctor = commands.add_parser("doctor", help="Diagnose the local package, route database, and hosted workspace without provider calls.")
+    doctor.add_argument("--state", default=".evalt/evalt.db")
 
     disconnect = commands.add_parser("disconnect", help="Remove the local hosted-workspace connection.")
     disconnect.add_argument("--state", help="Remove a project-scoped connection instead of the user-wide default.")
@@ -297,32 +318,91 @@ def main(argv: list[str] | None = None) -> int:
             )
             dashboard_url = f"{str(args.app_url).rstrip('/')}#workspace={token}"
             opened = False if args.no_open else bool(webbrowser.open(dashboard_url))
+            sync = {
+                "local_route_count": 0,
+                "route_summaries_queued": 0,
+                "sync_succeeded": None,
+                "sync_error": None,
+            }
+            if not args.no_sync_existing:
+                sync = Evalt(
+                    transport=_OfflineTransport(),
+                    state_path=args.state or ".evalt/evalt.db",
+                    dashboard_token=token,
+                    dashboard_api_url=args.api_url,
+                ).sync_existing_routes()
+            hosted = inspect_workspace(token, api_url=args.api_url)
             payload = {
                 "connected": True,
                 "workspace_id": workspace_fingerprint(token),
                 "config": str(path),
                 "dashboard": str(args.app_url).rstrip("/"),
                 "browser_opened": opened,
+                **sync,
+                **hosted,
+                **_runtime_identity(),
                 "sync_scope": "route metadata and bounded progress only; prompts, inputs, outputs, cases, provider keys, and raw responses stay local",
             }
             if args.no_open and args.token is None:
                 payload["workspace_token"] = token
                 payload["warning"] = "Treat workspace_token like a password; it grants access to synced route metadata."
             print(json.dumps(payload, indent=2))
-            return 0
+            return 0 if hosted["hosted_reachable"] and sync["sync_succeeded"] is not False else 2
         if args.command == "dashboard":
             config = load_dashboard_config(args.state)
             if not config:
                 raise ValueError("No hosted workspace is connected. Run: evalt connect")
+            sync = None
+            if args.sync_existing:
+                sync = Evalt(
+                    transport=_OfflineTransport(),
+                    state_path=args.state or ".evalt/evalt.db",
+                    dashboard_token=config["workspace_token"],
+                    dashboard_api_url=config["api_url"],
+                ).sync_existing_routes()
             opened = False if args.status else bool(webbrowser.open(f"{config['app_url']}#workspace={config['workspace_token']}"))
-            print(json.dumps({
+            payload = {
                 "connected": True,
                 "workspace_id": workspace_fingerprint(config["workspace_token"]),
                 "opened": opened,
                 "dashboard": config["app_url"],
                 "config": config.get("config_path", str(dashboard_config_path(args.state))),
                 "workspace_token_printed": False,
-            }, indent=2))
+                **inspect_workspace(config["workspace_token"], api_url=config["api_url"]),
+                **_runtime_identity(),
+            }
+            if sync is not None:
+                payload.update(sync)
+            print(json.dumps(payload, indent=2))
+            return 0
+        if args.command == "doctor":
+            state = Path(args.state).expanduser().resolve()
+            config = load_dashboard_config(state)
+            local_route_count = 0
+            if state.exists():
+                local_route_count = len(
+                    Evalt(transport=_OfflineTransport(), state_path=state).router.list_routes()
+                )
+            payload = {
+                **_runtime_identity(),
+                "route_state": str(state),
+                "local_route_count": local_route_count,
+                "connected": bool(config),
+                "workspace_id": workspace_fingerprint(config["workspace_token"]) if config else None,
+                "config": config.get("config_path") if config else None,
+                "workspace_token_printed": False,
+            }
+            if config:
+                payload.update(inspect_workspace(config["workspace_token"], api_url=config["api_url"]))
+                payload["next"] = (
+                    "Run `evalt dashboard --sync-existing` to publish current route summaries."
+                    if local_route_count and not payload.get("remote_route_count")
+                    else "Local and hosted workspace diagnostics completed."
+                )
+            else:
+                payload.update({"hosted_reachable": False, "remote_route_count": None, "hosted_error": None})
+                payload["next"] = "Run `evalt connect` to create or attach a private hosted workspace."
+            print(json.dumps(payload, indent=2))
             return 0
         if args.command == "disconnect":
             removed = remove_dashboard_config(args.state)

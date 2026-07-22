@@ -31,8 +31,10 @@ Optionally connect local routes to the hosted workspace:
 evalt connect
 ```
 
-The command opens the private dashboard and stores its capability token once for the
-current user, so routes remain connected when scripts run from another project folder.
+The command opens the private dashboard, stores its capability token once for the
+current user, and immediately publishes any existing sanitized route summaries from
+the current `.evalt/evalt.db` without calling a model. Routes remain connected when
+scripts run from another project folder.
 Pass `--state path/to/evalt.db` only when a project needs a separate workspace. The CLI
 and browser show a safe `ws_...` workspace ID; those IDs must
 match. Evalt synchronizes only operational route metadata and bounded progress;
@@ -43,7 +45,12 @@ prints either `DASHBOARD SYNCED` or `DASHBOARD SYNC FAILED`. A newly optimized r
 also reports separate test-design, tournament, route-install, production-call,
 orchestration, and total timings so a slow first run has an inspectable cause. Use `evalt dashboard`
 to reopen it, `evalt dashboard --status` to compare the ID without opening a browser,
-and `evalt disconnect` to remove the local connection. Dashboard
+and `evalt disconnect` to remove the local connection. If a route is missing, run
+`evalt doctor` to compare the package path, Python executable, safe workspace ID, and
+local/hosted route counts, then `evalt dashboard --sync-existing` to recover current
+route summaries without provider spend. `python3 -m evalt doctor` is the canonical
+same-interpreter diagnostic when a machine has more than one Python installation.
+Dashboard
 availability never affects a production call.
 
 Migrating from OpenAI Evals result JSONL? Evalt can recover only the reviewable
@@ -61,7 +68,7 @@ repository checkout:
 
 ```bash
 python -m venv .venv
-python -m pip install dist/evalt-0.10.14-py3-none-any.whl
+python -m pip install dist/evalt-0.10.15-py3-none-any.whl
 evalt --version
 ```
 

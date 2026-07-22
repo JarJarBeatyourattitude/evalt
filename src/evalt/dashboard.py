@@ -137,6 +137,42 @@ def remove_dashboard_config(state_path: str | Path | None = None) -> bool:
     return True
 
 
+def inspect_workspace(
+    token: str,
+    *,
+    api_url: str = DEFAULT_DASHBOARD_API_URL,
+    timeout_seconds: float = 8.0,
+    opener: Callable[..., Any] = urlopen,
+) -> dict[str, Any]:
+    """Check one hosted workspace without exposing its capability or route content."""
+
+    validated = validate_workspace_token(token)
+    request = Request(
+        f"{str(api_url).rstrip('/')}/api/workspace/routes",
+        method="GET",
+        headers={"Authorization": f"Bearer {validated}", "Accept": "application/json"},
+    )
+    try:
+        with opener(request, timeout=float(timeout_seconds)) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+            if not isinstance(payload, list):
+                raise ValueError("hosted workspace returned an invalid route index")
+            return {
+                "hosted_reachable": True,
+                "remote_route_count": len(payload),
+                "hosted_error": None,
+            }
+    except HTTPError as error:
+        detail = f"hosted workspace returned HTTP {error.code}"
+    except (URLError, OSError, TimeoutError, ValueError, json.JSONDecodeError) as error:
+        detail = str(error)[:180] or error.__class__.__name__
+    return {
+        "hosted_reachable": False,
+        "remote_route_count": None,
+        "hosted_error": detail,
+    }
+
+
 def _safe_scalar(value: Any, maximum: int = 240) -> Any:
     if isinstance(value, (bool, int, float)) or value is None:
         return value
@@ -316,7 +352,7 @@ class WorkspaceSync:
 
 __all__ = [
     "DEFAULT_DASHBOARD_API_URL", "DEFAULT_DASHBOARD_APP_URL", "WorkspaceSync",
-    "dashboard_config_path", "generate_workspace_token", "global_dashboard_config_path", "load_dashboard_config",
+    "dashboard_config_path", "generate_workspace_token", "global_dashboard_config_path", "inspect_workspace", "load_dashboard_config",
     "remove_dashboard_config", "sanitize_progress_event", "sanitize_route_snapshot",
     "save_dashboard_config", "validate_workspace_token", "workspace_fingerprint",
 ]

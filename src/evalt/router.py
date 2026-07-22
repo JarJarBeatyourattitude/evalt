@@ -1235,6 +1235,17 @@ class DurableRouter:
             "decisions": decisions,
         }
 
+    def list_routes(self) -> tuple[str, ...]:
+        """Return durable route names without reading prompts, calls, or outputs."""
+
+        with self._db() as db:
+            return tuple(
+                str(item["route"])
+                for item in db.execute(
+                    "SELECT route FROM routes ORDER BY updated_at DESC, route ASC"
+                )
+            )
+
     def export_audit(self, route: str, path: str | Path) -> None:
         Path(path).write_text(json.dumps(self.status(route), indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
