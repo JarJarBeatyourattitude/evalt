@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "evalt"
-version = "0.10.15"
+version = "0.10.16"
 description = "A durable LLM router that finds the most accurate configuration at your price."
 readme = "README.md"
 requires-python = ">=3.10"

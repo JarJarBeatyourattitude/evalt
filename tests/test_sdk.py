@@ -17,7 +17,7 @@ from urllib.error import HTTPError
 from evalt import BudgetExceeded, Client, Evalt, Example, ProviderError, RequestEnvelopeDriftWarning, Suite, check_result, compare_results, render_comparison_html, render_html_report, render_junit_report, select_role_plan
 from evalt.cli import STARTER_SUITE, main as cli_main, parser as cli_parser
 from evalt.acceptance import AcceptanceFailure, redact_trace, validate_auto_first_route_receipt
-from evalt.core import Completion, OpenRouterTransport, _automatic_target_max_tokens, _safe_provider_error_detail
+from evalt.core import Completion, OpenRouterTransport, _automatic_target_max_tokens, _is_closed_label_contract, _safe_provider_error_detail
 from evalt.migration import migrate_openai_results
 from evalt.dashboard import WorkspaceSync, dashboard_config_path, generate_workspace_token, inspect_workspace, load_dashboard_config, remove_dashboard_config, sanitize_progress_event, sanitize_route_snapshot, save_dashboard_config, workspace_fingerprint
 from modelsieve import Client as ModelSieveClient
@@ -81,6 +81,23 @@ class CompatibilityTests(unittest.TestCase):
             _automatic_target_max_tokens({"type": "semantic"}, prose),
             600,
         )
+
+    def test_explicit_small_label_contract_uses_a_deterministic_judge(self):
+        examples = [
+            Example("charged twice", "billing", "billing"),
+            Example("cannot sign in", "account", "account"),
+            Example("app crashes", "technical", "technical"),
+            Example("need invoice", "billing", "billing-2"),
+            Example("reset password", "account", "account-2"),
+            Example("sync failed", "technical", "technical-2"),
+        ]
+        self.assertTrue(_is_closed_label_contract(
+            "Return exactly one lowercase label: billing, account, or technical.",
+            examples,
+        ))
+        self.assertFalse(_is_closed_label_contract(
+            "Explain the best routing label and why.", examples,
+        ))
 
 
 class DashboardBridgeTests(unittest.TestCase):
@@ -2038,6 +2055,24 @@ class SdkTests(unittest.TestCase):
         self.assertIn("production 0.8s", rendered)
         self.assertIn("total 52.0s", rendered)
 
+    def test_broken_progress_stream_never_aborts_routing(self):
+        class BrokenProgressStream:
+            def write(self, _value):
+                raise OSError(22, "Invalid argument")
+
+            def flush(self):
+                raise OSError(22, "Invalid argument")
+
+        evalt = Evalt(transport=FakeTransport(), show_progress=True)
+        with redirect_stderr(BrokenProgressStream()):
+            evalt._emit_progress({
+                "event": "suite_design_heartbeat",
+                "route": "support-routing",
+                "designer_model": "smart-designer",
+                "elapsed_seconds": 10,
+            })
+        self.assertFalse(evalt._show_progress)
+
     def test_primary_run_is_a_durable_budget_bounded_router_not_a_json_export(self):
         with TemporaryDirectory() as directory:
             state = Path(directory) / "evalt.db"
@@ -2222,7 +2257,7 @@ class SdkTests(unittest.TestCase):
                 transport=FailingCaseDesignerTransport(),
                 state_path=Path(directory) / "evalt.db",
             )
-            with self.assertRaisesRegex(ProviderError, "route was not promoted"):
+            with self.assertRaisesRegex(ProviderError, "route was not promoted") as raised:
                 evalt.run(
                     "Return exactly one lowercase label: billing, account, or technical.",
                     "The website will not load.",
@@ -2233,6 +2268,8 @@ class SdkTests(unittest.TestCase):
                     designer_model="designer",
                     evaluator_model="evaluator",
                 )
+            self.assertGreater(raised.exception.provider_spend_usd, 0)
+            self.assertEqual(raised.exception.test_budget_usd, 1)
             with self.assertRaises(KeyError):
                 evalt.route_status("no-passing-route")
 
@@ -2770,7 +2807,7 @@ class SdkTests(unittest.TestCase):
             ):
                 evalt.design_suite(
                     task="Classify recurring support tickets into one routing label.",
-                    prompt="Return exactly one lowercase label: billing, account, or technical.",
+                    prompt="Classify the ticket as billing, account, or technical.",
                     route="bad-judge",
                     case_count=25,
                     workflow_budget_usd=1,

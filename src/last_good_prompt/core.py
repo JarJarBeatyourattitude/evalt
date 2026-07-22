@@ -118,6 +118,9 @@ def request_options_fingerprint(value: Mapping[str, Any] | None) -> str:
 class ProviderError(RuntimeError):
     """The model provider could not complete a request."""
 
+    provider_spend_usd: float | None = None
+    test_budget_usd: float | None = None
+
 
 class BudgetExceeded(RuntimeError):
     """A new provider call would exceed the customer-approved hard cap."""

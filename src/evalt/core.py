@@ -123,6 +123,31 @@ def _automatic_target_max_tokens(
     return min(8192, max(600, estimated_tokens * 6 + 128))
 
 
+def _is_closed_label_contract(prompt: str, examples: Iterable[Example]) -> bool:
+    """Detect an explicit small-label contract that needs no semantic judge."""
+
+    contract = str(prompt).casefold()
+    explicit = any(marker in contract for marker in (
+        "return exactly one", "one lowercase label", "choose exactly one",
+        "return only the label", "respond with exactly one",
+    ))
+    if not explicit:
+        return False
+    outputs = [
+        turn.approved_output.strip()
+        for example in examples
+        for turn in example.conversation()
+    ]
+    if not outputs or any(
+        not value or "\n" in value or len(value) > 48
+        or value.startswith(("{", "["))
+        for value in outputs
+    ):
+        return False
+    unique = set(outputs)
+    return 2 <= len(unique) <= min(20, max(2, len(outputs) // 2))
+
+
 def _dashboard_run_scope(method):
     """Give one public SDK invocation a stable opaque dashboard lifecycle."""
 
@@ -156,12 +181,16 @@ def _dashboard_run_scope(method):
                 synced = self.flush_dashboard(timeout_seconds=8.0)
                 self._emit_dashboard_status(route, "synced" if synced else "failed")
             return result
-        except Exception:
+        except Exception as error:
             context["run_state"] = "failed"
             context["run_finished_at"] = time.strftime(
                 "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
             )
-            self._emit_progress({"event": "run_failed", "route": route})
+            failed_event = {"event": "run_failed", "route": route}
+            provider_spend = getattr(error, "provider_spend_usd", None)
+            if isinstance(provider_spend, (int, float)):
+                failed_event["workflow_spend_usd"] = round(float(provider_spend), 10)
+            self._emit_progress(failed_event)
             if self._dashboard_sync is not None:
                 synced = self.flush_dashboard(timeout_seconds=4.0)
                 self._emit_dashboard_status(route, "synced" if synced else "failed")
@@ -619,6 +648,17 @@ class Evalt:
         self._maintenance_routes: set[str] = set()
         self._maintenance_threads: list[threading.Thread] = []
 
+    def _print_progress_message(self, message: str) -> None:
+        """Keep optional terminal rendering from affecting routing correctness."""
+
+        try:
+            print(message, file=sys.stderr, flush=True)
+        except (OSError, ValueError):
+            # Redirected streams can disappear while provider workers are still
+            # settling (notably when a parent process detaches on Windows). Progress
+            # is observational; a broken terminal must never fail a paid workflow.
+            self._show_progress = False
+
     def _emit_dashboard_status(self, route: str, status: str) -> None:
         """Report hosted visibility locally without recursively syncing the report."""
 
@@ -649,7 +689,7 @@ class Evalt:
                 f"Evalt · {route} · LOCAL WORKSPACE ONLY · "
                 "run `evalt connect` to show this route at evalt.dev"
             )
-        print(message, file=sys.stderr, flush=True)
+        self._print_progress_message(message)
 
     def _emit_progress(self, event: dict[str, Any]) -> None:
         event = dict(event)
@@ -920,7 +960,7 @@ class Evalt:
             )
         else:
             return
-        print(message, file=sys.stderr, flush=True)
+        self._print_progress_message(message)
 
     def _maintain_in_background(self, **kwargs: Any) -> None:
         route = str(kwargs.get("route") or "route")
@@ -1533,6 +1573,15 @@ class Evalt:
                         })
                         _validate_evaluator_policy(suggested_evaluator)
                     design_notes.insert(0, f"Evaluator: {str(raw_evaluator.get('reason') or '').strip()}")
+                if (
+                    suggested_evaluator.get("type") == "semantic"
+                    and _is_closed_label_contract(prompt_text, drafted_examples)
+                ):
+                    suggested_evaluator = {"type": "exact_text"}
+                    design_notes.insert(
+                        1,
+                        "Evaluator override: the customer prompt requires one value from a small closed label set, so Evalt uses deterministic exact text.",
+                    )
                 calibration_rows = list(parsed.get("judge_calibration") or [])
                 evaluator_type = str(suggested_evaluator.get("type") or "semantic")
                 if evaluator_type in {"exact_text", "exact_json", "numeric_tolerance"}:
@@ -2039,7 +2088,10 @@ class Evalt:
                         request_options=draft.request_options,
                     )
                 except ValueError as error:
-                    raise ProviderError(str(error)) from error
+                    provider_error = ProviderError(str(error))
+                    provider_error.provider_spend_usd = initial_test_spend_usd
+                    provider_error.test_budget_usd = resolved_test_budget_usd
+                    raise provider_error from error
                 route_install_seconds = time.monotonic() - install_started
                 first_route_optimized = True
                 self._emit_progress({
