@@ -167,6 +167,7 @@ def sanitize_progress_event(event: Mapping[str, Any]) -> dict[str, Any]:
         "run_id", "run_state", "run_started_at", "run_finished_at",
         "test_design_seconds", "tournament_seconds", "route_install_seconds",
         "production_call_seconds", "orchestration_seconds", "total_elapsed_seconds",
+        "model_elapsed_seconds",
         "final_test_evidence_status", "final_test_confidence_level",
         "final_test_accuracy_lower_bound", "target_accuracy_statistically_supported",
         "minimum_zero_failure_scenarios",

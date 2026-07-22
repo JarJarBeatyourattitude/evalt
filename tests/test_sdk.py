@@ -149,6 +149,7 @@ class DashboardBridgeTests(unittest.TestCase):
             "test_design_seconds": 11.2, "tournament_seconds": 38.4,
             "route_install_seconds": 0.1, "production_call_seconds": 0.8,
             "orchestration_seconds": 1.5, "total_elapsed_seconds": 52.0,
+            "model_elapsed_seconds": 17.25,
             "final_test_evidence_status": "PROVISIONAL_SMALL_FINAL_TEST",
             "final_test_confidence_level": 0.95,
             "final_test_accuracy_lower_bound": 0.741134,
@@ -169,6 +170,7 @@ class DashboardBridgeTests(unittest.TestCase):
         self.assertEqual(event["test_design_seconds"], 11.2)
         self.assertEqual(event["tournament_seconds"], 38.4)
         self.assertEqual(event["total_elapsed_seconds"], 52.0)
+        self.assertEqual(event["model_elapsed_seconds"], 17.25)
         self.assertEqual(event["final_test_evidence_status"], "PROVISIONAL_SMALL_FINAL_TEST")
         self.assertEqual(event["final_test_accuracy_lower_bound"], 0.741134)
         self.assertFalse(event["target_accuracy_statistically_supported"])
@@ -2977,7 +2979,7 @@ class SdkTests(unittest.TestCase):
             max_parallel_models=6,
         )
         self.assertEqual(transport.deadlines[:6], [30.0] * 6)
-        self.assertEqual(transport.deadlines[6:], [45.0] * 3)
+        self.assertEqual(transport.deadlines[6:], [45.0] * 4)
 
     def test_default_transport_uses_a_bundled_verified_ca_context(self):
         with mock.patch("last_good_prompt.core.urlopen", return_value=FakeResponse({"ok": True})) as opener:
@@ -3772,7 +3774,7 @@ class SdkTests(unittest.TestCase):
         plan = select_role_plan(transport.model_catalog(), maintenance_budget_usd=0.25)
         self.assertEqual(plan.target_models, ("catalog-reasoning-only#reasoning=none",))
 
-    def test_adaptive_search_broadens_first_then_prunes_effort_variants_outside_the_capability_band(self):
+    def test_adaptive_search_only_escalates_reasoning_for_models_below_the_validation_gate(self):
         class AdaptiveTransport(FakeTransport):
             @staticmethod
             def base(model):
@@ -3804,8 +3806,8 @@ class SdkTests(unittest.TestCase):
         )
         self.assertIn("far#reasoning=high", result.pruned_models)
         self.assertNotIn("cheap#reasoning=high", result.pruned_models)
-        self.assertNotIn("near#reasoning=high", result.pruned_models)
-        self.assertTrue(any(
+        self.assertIn("near#reasoning=high", result.pruned_models)
+        self.assertFalse(any(
             item.model == "near#reasoning=high" for item in result.models
         ))
         self.assertEqual(result.winner.model, "near#reasoning=low")
@@ -3861,7 +3863,7 @@ class SdkTests(unittest.TestCase):
                     model=model,
                     selected_prompt=args[0],
                     baseline_pass_rate=1.0,
-                    selected_pass_rate=1.0,
+                    selected_pass_rate=1.0 if passed else 0.9,
                     holdout_pass_rate=1.0 if passed else 0.9,
                     baseline_holdout_pass_rate=0.9,
                     estimated_production_cost_per_call_usd=cost,
@@ -4131,9 +4133,9 @@ class SdkTests(unittest.TestCase):
             progress_callback=events.append,
         )
         self.assertEqual(len(result.screening_results), 6)
-        self.assertEqual(len(result.models), 3)
+        self.assertEqual(len(result.models), 4)
         self.assertEqual(result.winner.model, "strong-cheap")
-        self.assertEqual(len(result.pruned_models), 3)
+        self.assertEqual(len(result.pruned_models), 2)
         self.assertTrue(all(model.startswith("weak-") for model in result.pruned_models))
         self.assertTrue(any(event["event"] == "model_screen_completed" for event in events))
         self.assertTrue(any(event["event"] == "model_pruned" for event in events))
@@ -4257,7 +4259,7 @@ class SdkTests(unittest.TestCase):
             max_optimization_cost_usd=5,
             max_parallel_models=6,
         )
-        self.assertEqual(client.maximum_active, 3)
+        self.assertEqual(client.maximum_active, 4)
 
     def test_prompt_rewrite_training_and_validation_splits_overlap(self):
         class SplitTrackingClient(Client):
@@ -4352,10 +4354,10 @@ class SdkTests(unittest.TestCase):
             max_optimization_cost_usd=5,
         )
         self.assertEqual(len(result.screening_results), 6)
-        self.assertEqual(len(result.models), 3)
-        self.assertEqual(result.pruned_models, ["candidate-6"])
+        self.assertEqual(len(result.models), 4)
+        self.assertEqual(result.pruned_models, [])
         self.assertEqual(
-            {item["status"] for item in result.screening_results}, {"FULL", "PRUNED"},
+            {item["status"] for item in result.screening_results}, {"FULL"},
         )
 
     def test_successful_rewrite_does_not_propagate_to_cost_dominated_models(self):
@@ -4406,15 +4408,15 @@ class SdkTests(unittest.TestCase):
             item for item in result.models
             if item.prompt_origin.startswith("propagated_from:")
         ]
-        self.assertEqual(len(result.models), 3)
+        self.assertEqual(len(result.models), 4)
         self.assertEqual(propagated, [])
         self.assertEqual(
             result.pruned_models,
-            ["candidate-4", "candidate-5", "candidate-6"],
+            ["candidate-5", "candidate-6"],
         )
         self.assertEqual(
             sum(item["status"] == "PRUNED" for item in result.screening_results),
-            3,
+            2,
         )
 
     def test_draft_becomes_approved_or_corrected_example(self):

@@ -1498,7 +1498,20 @@ class Client:
                     seen_base_models.add(base_model)
                     broad_models.append(configuration)
             model_list = broad_models + hone_models
+        model_started_at: dict[str, float] = {}
+        model_timing_lock = threading.Lock()
+
+        def model_elapsed_seconds(model: str) -> float | None:
+            with model_timing_lock:
+                started_at = model_started_at.get(model)
+            return (
+                round(time.monotonic() - started_at, 3)
+                if started_at is not None else None
+            )
+
         def evaluate(model: str) -> ModelResult:
+            with model_timing_lock:
+                model_started_at[model] = time.monotonic()
             emit_progress({
                 "event": "model_started", "model": model,
                 "optimize_prompt": bool(
@@ -1553,16 +1566,25 @@ class Client:
                             "final_test_accuracy_lower_bound": item.final_test_accuracy_lower_bound,
                             "target_accuracy_statistically_supported": item.target_accuracy_statistically_supported,
                             "minimum_zero_failure_scenarios": item.minimum_zero_failure_scenarios,
+                            "model_elapsed_seconds": model_elapsed_seconds(model),
                             "elapsed_seconds": round(time.monotonic() - optimization_started, 3),
                         })
                     except BudgetExceeded as error:
                         incomplete_models.append({"model": model, "reason": str(error)})
-                        emit_progress({"event": "model_incomplete", "model": model, "reason": str(error)})
+                        emit_progress({
+                            "event": "model_incomplete", "model": model,
+                            "reason": str(error),
+                            "model_elapsed_seconds": model_elapsed_seconds(model),
+                        })
                         skipped_budget_models.extend(configurations[model_index + 1 :])
                         break
                     except ProviderError as error:
                         unavailable_models.append({"model": model, "reason": str(error)})
-                        emit_progress({"event": "model_unavailable", "model": model, "reason": str(error)})
+                        emit_progress({
+                            "event": "model_unavailable", "model": model,
+                            "reason": str(error),
+                            "model_elapsed_seconds": model_elapsed_seconds(model),
+                        })
                 return completed_sequential
             completed: dict[str, ModelResult] = {}
             with ThreadPoolExecutor(max_workers=min(int(max_parallel_models), len(configurations))) as pool:
@@ -1589,14 +1611,23 @@ class Client:
                             "final_test_accuracy_lower_bound": item.final_test_accuracy_lower_bound,
                             "target_accuracy_statistically_supported": item.target_accuracy_statistically_supported,
                             "minimum_zero_failure_scenarios": item.minimum_zero_failure_scenarios,
+                            "model_elapsed_seconds": model_elapsed_seconds(model),
                             "elapsed_seconds": round(time.monotonic() - optimization_started, 3),
                         })
                     except BudgetExceeded as error:
                         incomplete_models.append({"model": model, "reason": str(error)})
-                        emit_progress({"event": "model_incomplete", "model": model, "reason": str(error)})
+                        emit_progress({
+                            "event": "model_incomplete", "model": model,
+                            "reason": str(error),
+                            "model_elapsed_seconds": model_elapsed_seconds(model),
+                        })
                     except ProviderError as error:
                         unavailable_models.append({"model": model, "reason": str(error)})
-                        emit_progress({"event": "model_unavailable", "model": model, "reason": str(error)})
+                        emit_progress({
+                            "event": "model_unavailable", "model": model,
+                            "reason": str(error),
+                            "model_elapsed_seconds": model_elapsed_seconds(model),
+                        })
             return [completed[model] for model in configurations if model in completed]
 
         def screen_model(model: str) -> dict[str, Any]:
@@ -1790,12 +1821,12 @@ class Client:
                 # other finalists. Running the anchor alone added a complete
                 # prompt-search/final-test round to every weak-starting-prompt
                 # workflow without buying stronger evidence.
-                # Three completed deep lanes plus the broad screen are enough to
-                # move on to task-specific reasoning hone. Provider failures are
-                # evidence too; repeatedly backfilling a fourth weak lane delayed
-                # useful effort tests even after the cost/quality frontier was
-                # already clear.
-                completed_floor = min(3, full_limit)
+                # Launch the complete deep finalist set in one bounded wave. This
+                # spends a little redundant work when a very early lane passes,
+                # but avoids serial deep waves and gives a cheapest-route search a
+                # real cross-model frontier before prompt propagation or reasoning
+                # hone starts.
+                completed_floor = full_limit
                 while len(full_results) < completed_floor:
                     remaining = [model for model in full_priority if model not in attempted_for_full]
                     if not remaining:
@@ -2072,24 +2103,11 @@ class Client:
                 candidate_rank = effort_rank[candidate_effort]
                 broad_rank = effort_rank[broad_effort]
                 if broad_result.selected_pass_rate >= quality_threshold:
-                    # Once a base model clears the quality gate, more reasoning is
-                    # usually dominated for a lowest-cost search, and a cheaper
-                    # lower effort remains worth measuring. With only a five-case
-                    # validation split, however, one perfect result is too brittle
-                    # to justify skipping every stronger rung of the cheapest base.
-                    # Measure medium/high siblings in parallel before the frozen
-                    # final result is known; this adds robustness without tuning on
-                    # final-test answers.
-                    return bool(
-                        candidate_rank < broad_rank
-                        or (
-                            len(dev) < 20
-                            and candidate_rank > broad_rank
-                            and candidate_rank <= effort_rank["high"]
-                            and broad_result.estimated_production_cost_per_call_usd
-                            <= cheapest_pass_cost * 1.25 + 1e-12
-                        )
-                    )
+                    # A stronger rung is dominated once the same base model clears
+                    # validation in a lowest-cost search. Still measure every
+                    # cheaper lower rung so the route is not promoted merely
+                    # because the first passing effort happened to be expensive.
+                    return candidate_rank < broad_rank
                 # If the broad effort missed, only extra reasoning can plausibly
                 # repair accuracy.  Do not spend on a still-weaker configuration.
                 return candidate_rank > broad_rank
