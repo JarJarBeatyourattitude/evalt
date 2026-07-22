@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager, nullcontext
+import contextvars
 from dataclasses import asdict, dataclass, field
 from fractions import Fraction
 import hashlib
@@ -22,6 +23,14 @@ from urllib.request import Request, urlopen
 
 import certifi
 from dotenv import load_dotenv
+
+
+def _submit_with_context(
+    pool: ThreadPoolExecutor, function: Callable[..., Any], *args: Any
+):
+    """Submit work with the caller's request limits and deadlines attached."""
+    context = contextvars.copy_context()
+    return pool.submit(context.run, function, *args)
 
 
 OPENROUTER_CHAT_URL = "https://openrouter.ai/api/v1/chat/completions"
@@ -347,7 +356,15 @@ class OpenRouterTransport:
         self._catalog_items: list[dict[str, Any]] = []
         self._preferred_max_latency_seconds: float | None = None
         self._provider_sort = "price"
-        self._request_timeout_local = threading.local()
+        self._request_timeout_override_var: contextvars.ContextVar[float | None] = (
+            contextvars.ContextVar("evalt_request_timeout_override", default=None)
+        )
+        self._request_deadline_var: contextvars.ContextVar[float | None] = (
+            contextvars.ContextVar("evalt_request_deadline", default=None)
+        )
+        self._request_deadline_limit_var: contextvars.ContextVar[float | None] = (
+            contextvars.ContextVar("evalt_request_deadline_limit", default=None)
+        )
 
     @property
     def timeout_seconds(self) -> float:
@@ -365,18 +382,11 @@ class OpenRouterTransport:
         resolved = float(value)
         if not 0 < resolved <= 7200:
             raise ValueError("timeout override must be greater than zero and no more than 7200 seconds.")
-        previous = getattr(self._request_timeout_local, "value", None)
-        self._request_timeout_local.value = resolved
+        token = self._request_timeout_override_var.set(resolved)
         try:
             yield
         finally:
-            if previous is None:
-                try:
-                    del self._request_timeout_local.value
-                except AttributeError:
-                    pass
-            else:
-                self._request_timeout_local.value = previous
+            self._request_timeout_override_var.reset(token)
 
     @contextmanager
     def request_deadline_override(self, value: float):
@@ -384,22 +394,15 @@ class OpenRouterTransport:
         resolved = float(value)
         if not 0 < resolved <= 7200:
             raise ValueError("request deadline must be greater than zero and no more than 7200 seconds.")
-        previous_deadline = getattr(self._request_timeout_local, "absolute_deadline", None)
-        previous_limit = getattr(self._request_timeout_local, "deadline_limit", None)
-        self._request_timeout_local.absolute_deadline = time.monotonic() + resolved
-        self._request_timeout_local.deadline_limit = resolved
+        deadline_token = self._request_deadline_var.set(
+            time.monotonic() + resolved
+        )
+        limit_token = self._request_deadline_limit_var.set(resolved)
         try:
             yield
         finally:
-            if previous_deadline is None:
-                for name in ("absolute_deadline", "deadline_limit"):
-                    try:
-                        delattr(self._request_timeout_local, name)
-                    except AttributeError:
-                        pass
-            else:
-                self._request_timeout_local.absolute_deadline = previous_deadline
-                self._request_timeout_local.deadline_limit = previous_limit
+            self._request_deadline_var.reset(deadline_token)
+            self._request_deadline_limit_var.reset(limit_token)
 
     def set_performance_policy(
         self,
@@ -431,18 +434,15 @@ class OpenRouterTransport:
             data = json.dumps(body).encode("utf-8")
         request = Request(url, data=data, headers=headers, method="POST" if data else "GET")
         started = time.monotonic()
+        request_override = self._request_timeout_override_var.get()
         request_timeout = float(
-            getattr(self._request_timeout_local, "value", self._timeout)
+            request_override if request_override is not None else self._timeout
         )
-        absolute_deadline = getattr(
-            self._request_timeout_local, "absolute_deadline", None
-        )
+        absolute_deadline = self._request_deadline_var.get()
         if absolute_deadline is not None:
             remaining = float(absolute_deadline) - started
             if remaining <= 0:
-                limit = float(getattr(
-                    self._request_timeout_local, "deadline_limit", 0.0
-                ))
+                limit = float(self._request_deadline_limit_var.get() or 0.0)
                 raise ProviderError(
                     f"model evaluation exceeded its {limit:g}s total deadline"
                 )
@@ -1642,7 +1642,10 @@ class Client:
                 return completed_sequential
             completed: dict[str, ModelResult] = {}
             with ThreadPoolExecutor(max_workers=min(int(max_parallel_models), len(configurations))) as pool:
-                futures = {pool.submit(evaluate, model): model for model in configurations}
+                futures = {
+                    _submit_with_context(pool, evaluate, model): model
+                    for model in configurations
+                }
                 for future in as_completed(futures):
                     model = futures[future]
                     try:
@@ -1736,7 +1739,10 @@ class Client:
                 "elapsed_seconds": round(time.monotonic() - optimization_started, 3),
             })
             with ThreadPoolExecutor(max_workers=min(int(max_parallel_models), len(configurations))) as pool:
-                futures = {pool.submit(screen_model, model): model for model in configurations}
+                futures = {
+                    _submit_with_context(pool, screen_model, model): model
+                    for model in configurations
+                }
                 for future in as_completed(futures):
                     model = futures[future]
                     try:
@@ -2024,7 +2030,7 @@ class Client:
                         max_workers=min(int(max_parallel_models), len(propagation_candidates))
                     ) as pool:
                         futures = {
-                            pool.submit(screen_propagated, model): model
+                            _submit_with_context(pool, screen_propagated, model): model
                             for model in propagation_candidates
                         }
                         for future in as_completed(futures):
@@ -2714,11 +2720,13 @@ class Client:
             and int(max_parallel_scenarios) > 1
         ):
             with ThreadPoolExecutor(max_workers=2) as pool:
-                train_future = pool.submit(
+                train_future = _submit_with_context(
+                    pool,
                     run_split, train, "train", initial_prompt, "baseline",
                     initial_few_shot_ids,
                 )
-                dev_future = pool.submit(
+                dev_future = _submit_with_context(
+                    pool,
                     run_split, dev, "dev", initial_prompt, "baseline",
                     initial_few_shot_ids,
                 )
@@ -2779,11 +2787,13 @@ class Client:
                 # after a lucky perfect score on a small validation slice.
                 if train and dev and int(max_parallel_scenarios) > 1:
                     with ThreadPoolExecutor(max_workers=2) as pool:
-                        train_future = pool.submit(
+                        train_future = _submit_with_context(
+                            pool,
                             run_split, train, "train", revised_prompt,
                             f"candidate-{round_number}", revised_few_shot_ids,
                         )
-                        dev_future = pool.submit(
+                        dev_future = _submit_with_context(
+                            pool,
                             run_split, dev, "dev", revised_prompt,
                             f"candidate-{round_number}", revised_few_shot_ids,
                         )
@@ -3054,7 +3064,11 @@ class Client:
             return [result for example, repeat_index in executions for result in run_execution(example, repeat_index)]
         completed: dict[tuple[str, int], list[CaseResult]] = {}
         with ThreadPoolExecutor(max_workers=min(int(max_parallel_scenarios), len(executions))) as pool:
-            futures = {pool.submit(run_execution, example, repeat_index): (example.id, repeat_index) for example, repeat_index in executions}
+            futures = {
+                _submit_with_context(pool, run_execution, example, repeat_index):
+                (example.id, repeat_index)
+                for example, repeat_index in executions
+            }
             for future in as_completed(futures):
                 completed[futures[future]] = future.result()
         return [result for example, repeat_index in executions for result in completed[(example.id, repeat_index)]]

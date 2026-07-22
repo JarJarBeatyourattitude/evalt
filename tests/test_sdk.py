@@ -1,4 +1,5 @@
 import hashlib
+from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 import json
 import os
@@ -21,7 +22,7 @@ from evalt.migration import migrate_openai_results
 from evalt.dashboard import WorkspaceSync, dashboard_config_path, generate_workspace_token, load_dashboard_config, remove_dashboard_config, sanitize_progress_event, sanitize_route_snapshot, save_dashboard_config, workspace_fingerprint
 from modelsieve import Client as ModelSieveClient
 from last_good_prompt import Client as LegacyClient
-from last_good_prompt.core import _Budget, CaseResult, ModelResult, _binomial_exact_lower_bound, _final_test_evidence
+from last_good_prompt.core import _Budget, CaseResult, ModelResult, _binomial_exact_lower_bound, _final_test_evidence, _submit_with_context
 
 
 class CompatibilityTests(unittest.TestCase):
@@ -2965,7 +2966,10 @@ class SdkTests(unittest.TestCase):
             side_effect=[100.0, 105.0],
         ):
             with transport.request_deadline_override(20):
-                transport._request("https://openrouter.ai/test")
+                with ThreadPoolExecutor(max_workers=1) as pool:
+                    _submit_with_context(
+                        pool, transport._request, "https://openrouter.ai/test"
+                    ).result()
         self.assertEqual(observed, [15.0])
 
     def test_broad_screen_caps_only_its_provider_request_deadline(self):

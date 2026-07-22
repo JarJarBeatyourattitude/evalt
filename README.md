@@ -61,7 +61,7 @@ repository checkout:
 
 ```bash
 python -m venv .venv
-python -m pip install dist/evalt-0.10.13-py3-none-any.whl
+python -m pip install dist/evalt-0.10.14-py3-none-any.whl
 evalt --version
 ```
 
