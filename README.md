@@ -128,7 +128,7 @@ repository checkout:
 
 ```bash
 python -m venv .venv
-python -m pip install dist/evalt-0.10.31-py3-none-any.whl
+python -m pip install dist/evalt-0.10.32-py3-none-any.whl
 python -m evalt --version
 ```
 
@@ -744,6 +744,48 @@ Custom-scorer baselines require the same explicit scorer ID, version, and local
 registration for every recheck. Evalt resolves that registration before the first target
 model request. A missing or changed scorer therefore cannot spend against the monitor
 cap or silently change the frozen measurement contract.
+
+### Signed aggregate alerts
+
+Add an explicit HTTPS destination to send one versioned aggregate event after the
+measurement. The secret is read from the environment and neither the URL nor secret is
+written to the suite, result, dashboard, or delivery audit:
+
+```bash
+export EVALT_WEBHOOK_SECRET="replace-with-a-long-random-secret"
+
+python3 -m evalt monitor evalt-baseline.json \
+  --route support-routing \
+  --max-cost-usd 0.10 \
+  --webhook-url https://alerts.example.com/evalt \
+  --webhook-destination-id incident-pipeline \
+  --webhook-required
+```
+
+Events are signed with
+`HMAC-SHA256(secret, X-Evalt-Timestamp + "." + exact_request_body)`. The stable
+`evt_...` ID is also the `Idempotency-Key` across bounded retries and explicit replay.
+Evalt emits `route.health.degraded`, `route.health.recovered`, or
+`route.health.checked` from the prior aggregate audit state. Route names are replaced
+by an opaque reference unless `--webhook-include-route-name` is explicit.
+
+The default transport requires HTTPS, follows no redirects, resolves and pins a public
+address for each attempt, and rejects private, loopback, link-local, reserved,
+multicast, and unspecified addresses. Retryable transport failures and selected HTTP
+statuses receive bounded exponential backoff; numeric `Retry-After` is capped. The
+local JSONL audit retains only the exact aggregate event and delivery mechanics.
+
+Replay a failed event with the same identity:
+
+```bash
+python3 -m evalt webhook replay evt_0123456789abcdef0123456789abcdef \
+  --webhook-url https://alerts.example.com/evalt \
+  --webhook-destination-id incident-pipeline \
+  --webhook-secret-env EVALT_WEBHOOK_SECRET
+```
+
+The Python API accepts `Evalt(webhook=WebhookDestination(...))`; inspect
+`MonitorResult.webhook_delivery` for the bounded, content-free outcome.
 
 ## Explicit suite API
 

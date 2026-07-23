@@ -41,10 +41,20 @@ from .dashboard import (
     save_dashboard_config,
     workspace_fingerprint,
 )
-from .scorers import CommandScorer, CustomScorerError, Scorer
+from .scorers import (
+    CommandScorer,
+    CustomScorerError,
+    Scorer,
+    resolve_registered_scorer,
+)
+from .webhooks import (
+    WebhookDestination,
+    WebhookError,
+    replay_webhook,
+)
 
 
-HOSTED_SDK_VERSION = "0.10.31"
+HOSTED_SDK_VERSION = "0.10.32"
 HOSTED_WHEEL_URL = (
     "https://evalt.onrender.com/python-sdk/dist/"
     f"evalt-{HOSTED_SDK_VERSION}-py3-none-any.whl"
@@ -132,6 +142,92 @@ def _custom_scorer_registry(args: argparse.Namespace) -> dict[str, Scorer]:
         max_output_bytes=int(args.custom_scorer_max_output_bytes),
     )
     return {scorer.scorer_id: scorer}
+
+
+def _validate_custom_scorer_registration(
+    evaluator: dict[str, object] | None,
+    registry: dict[str, Scorer],
+) -> None:
+    """Resolve suite-selected scorer identity before provider setup or activity."""
+
+    if evaluator and str(evaluator.get("type") or "").casefold() == "custom":
+        resolve_registered_scorer(evaluator, registry)
+
+
+def _add_webhook_arguments(
+    parser: argparse.ArgumentParser,
+    *,
+    include_required: bool = True,
+) -> None:
+    parser.add_argument(
+        "--webhook-url",
+        help=(
+            "Explicit HTTPS destination. The URL is runtime-only and is never "
+            "written to the result or delivery audit."
+        ),
+    )
+    parser.add_argument(
+        "--webhook-secret-env",
+        default="EVALT_WEBHOOK_SECRET",
+        help=(
+            "Environment variable containing the signing secret "
+            "(default EVALT_WEBHOOK_SECRET)."
+        ),
+    )
+    parser.add_argument(
+        "--webhook-destination-id",
+        default="default",
+        help="Opaque local destination label stored in the audit (default: default).",
+    )
+    parser.add_argument(
+        "--webhook-audit",
+        default=".evalt/webhook-deliveries.jsonl",
+        help="Local aggregate delivery audit JSONL.",
+    )
+    parser.add_argument(
+        "--webhook-timeout",
+        type=float,
+        default=5.0,
+        help="Per-attempt HTTPS timeout in seconds (default 5; maximum 30).",
+    )
+    parser.add_argument(
+        "--webhook-max-attempts",
+        type=int,
+        default=3,
+        help="Maximum delivery attempts (default 3; maximum 5).",
+    )
+    parser.add_argument(
+        "--webhook-include-route-name",
+        action="store_true",
+        help="Include the local route name. The default event contains only an opaque route reference.",
+    )
+    parser.add_argument(
+        "--webhook-allow-private-network",
+        action="store_true",
+        help="Explicitly allow private/local destination addresses. Disabled by default.",
+    )
+    if include_required:
+        parser.add_argument(
+            "--webhook-required",
+            action="store_true",
+            help="Return exit 2 when the aggregate event is not delivered.",
+        )
+
+
+def _webhook_destination(args: argparse.Namespace) -> WebhookDestination | None:
+    url = str(getattr(args, "webhook_url", "") or "").strip()
+    if not url:
+        return None
+    return WebhookDestination.from_secret_environment(
+        url=url,
+        secret_env=str(args.webhook_secret_env),
+        destination_id=str(args.webhook_destination_id),
+        audit_path=str(args.webhook_audit),
+        timeout_seconds=float(args.webhook_timeout),
+        max_attempts=int(args.webhook_max_attempts),
+        include_route_name=bool(args.webhook_include_route_name),
+        allow_private_network=bool(args.webhook_allow_private_network),
+    )
 
 
 def _runtime_identity() -> dict[str, object]:
@@ -551,6 +647,22 @@ def parser() -> argparse.ArgumentParser:
         help="Per-response timeout in seconds (default: 600; maximum: 7200).",
     )
     _add_custom_scorer_arguments(monitor)
+    _add_webhook_arguments(monitor)
+
+    webhook = commands.add_parser(
+        "webhook",
+        help="Replay an audited aggregate event without a provider call.",
+    )
+    webhook_commands = webhook.add_subparsers(
+        dest="webhook_command", required=True
+    )
+    webhook_replay = webhook_commands.add_parser(
+        "replay",
+        help="Replay the exact event and preserve its idempotency key.",
+    )
+    webhook_replay.add_argument("event_id", help="Audited evt_<32 hex> event ID.")
+    _add_webhook_arguments(webhook_replay, include_required=False)
+    webhook_replay.set_defaults(webhook_required=False)
 
     report = commands.add_parser("report", help="Render saved JSON as HTML and/or JUnit; no provider call.")
     report.add_argument("result", help="Saved Evalt result JSON.")
@@ -1078,6 +1190,18 @@ def main(argv: list[str] | None = None) -> int:
             }
             print(json.dumps(payload, indent=2, ensure_ascii=False))
             return 0
+        if args.command == "webhook":
+            if args.webhook_command != "replay":
+                raise ValueError("Choose a webhook command.")
+            destination = _webhook_destination(args)
+            if destination is None:
+                raise ValueError("webhook replay requires --webhook-url.")
+            delivery = replay_webhook(
+                destination,
+                event_id=args.event_id,
+            )
+            print(json.dumps(delivery.summary(), indent=2, ensure_ascii=False))
+            return 0 if delivery.delivered else 2
         if args.command == "monitor":
             if not 0 < float(args.request_timeout) <= 7200:
                 raise ValueError(
@@ -1115,10 +1239,16 @@ def main(argv: list[str] | None = None) -> int:
                     "monitoring stopped before any provider call."
                 )
             output_path = Path(args.output)
+            webhook_destination = _webhook_destination(args)
+            custom_scorers = _custom_scorer_registry(args)
+            _validate_custom_scorer_registration(
+                frozen_suite.get("evaluator"), custom_scorers
+            )
             monitor_client = Evalt(
                 request_timeout_seconds=float(args.request_timeout),
                 show_progress=False,
-                custom_scorers=_custom_scorer_registry(args),
+                custom_scorers=custom_scorers,
+                webhook=webhook_destination,
             )
             try:
                 monitored = monitor_client.monitor(
@@ -1205,6 +1335,11 @@ def main(argv: list[str] | None = None) -> int:
                 "route_mutated": False,
                 "dashboard_sync_started": monitored.dashboard_sync_started,
                 "dashboard_sync_succeeded": monitored.dashboard_sync_succeeded,
+                "webhook_delivery": (
+                    dict(monitored.webhook_delivery)
+                    if monitored.webhook_delivery
+                    else None
+                ),
                 "next": (
                     "No regression detected."
                     if monitored.passed
@@ -1212,6 +1347,14 @@ def main(argv: list[str] | None = None) -> int:
                     "and compare the regressed final-test cases."
                 ),
             }, indent=2))
+            if (
+                args.webhook_required
+                and (
+                    not monitored.webhook_delivery
+                    or not monitored.webhook_delivery.get("delivered")
+                )
+            ):
+                return 2
             return 0 if monitored.passed else 1
         if args.command == "optimize":
             suite_path = _evidence_path(args.suite, args, expected_kind="suite")
@@ -1230,11 +1373,15 @@ def main(argv: list[str] | None = None) -> int:
             if args.fixed_prompt:
                 suite = replace(suite, optimize_prompt=False)
             progress = _CliProgress(len(suite.models))
+            custom_scorers = _custom_scorer_registry(args)
+            _validate_custom_scorer_registration(
+                dict(suite.evaluator), custom_scorers
+            )
             client = Evalt(
                 request_timeout_seconds=request_timeout_seconds,
                 progress_callback=progress,
                 show_progress=False,
-                custom_scorers=_custom_scorer_registry(args),
+                custom_scorers=custom_scorers,
             )
             try:
                 result = client.run(suite)
@@ -1346,6 +1493,7 @@ def main(argv: list[str] | None = None) -> int:
         BudgetExceeded,
         ProviderError,
         CustomScorerError,
+        WebhookError,
         ValueError,
         KeyError,
         OSError,

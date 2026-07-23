@@ -412,6 +412,26 @@ class CustomScorerCliTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "requires"):
             _custom_scorer_registry(args)
 
+    def test_cli_resolves_custom_registration_before_provider_setup(self):
+        class UnexpectedEvalt:
+            def __init__(self, **_kwargs):
+                raise AssertionError("provider setup must not begin")
+
+        with TemporaryDirectory() as directory:
+            suite_path = Path(directory) / "suite.json"
+            custom_suite().save(suite_path)
+            stderr = StringIO()
+            with mock.patch("evalt.cli.Evalt", UnexpectedEvalt), redirect_stderr(stderr):
+                code = cli_main([
+                    "optimize",
+                    str(suite_path),
+                    "--output",
+                    str(Path(directory) / "must-not-exist.json"),
+                ])
+
+            self.assertEqual(code, 2)
+            self.assertIn("not registered locally", stderr.getvalue())
+
     def test_cli_writes_a_typed_failure_without_a_traceback(self):
         class FailingEvalt:
             def __init__(self, **_kwargs):

@@ -3,6 +3,8 @@
 from last_good_prompt.scorers import (
     CommandScorer,
     CustomScorerError,
+    normalize_scorer_registry,
+    resolve_registered_scorer,
     ScoreRequest,
     ScoreResult,
     Scorer,
@@ -11,6 +13,8 @@ from last_good_prompt.scorers import (
 __all__ = [
     "CommandScorer",
     "CustomScorerError",
+    "normalize_scorer_registry",
+    "resolve_registered_scorer",
     "ScoreRequest",
     "ScoreResult",
     "Scorer",

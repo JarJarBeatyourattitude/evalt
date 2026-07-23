@@ -74,6 +74,12 @@ def _evaluator_contract_hash(
     ).hexdigest()
 from .dashboard import DEFAULT_DASHBOARD_API_URL, WorkspaceSync, load_dashboard_config
 from .scorers import Scorer
+from .webhooks import (
+    WebhookDestination,
+    WebhookError,
+    deliver_webhook,
+    route_health_event,
+)
 
 
 _NUMBER_WORDS = {
@@ -693,6 +699,7 @@ class MonitorResult:
     route: str | None = None
     dashboard_sync_started: bool = False
     dashboard_sync_succeeded: bool | None = None
+    webhook_delivery: Mapping[str, Any] | None = None
 
     @property
     def passed(self) -> bool:
@@ -722,9 +729,17 @@ class MonitorResult:
             "route_mutated": False,
             "dashboard_sync_started": self.dashboard_sync_started,
             "dashboard_sync_succeeded": self.dashboard_sync_succeeded,
+            "webhook_delivery": (
+                dict(self.webhook_delivery) if self.webhook_delivery else None
+            ),
             "privacy": {
                 "full_result": "local only",
                 "history": "aggregate metrics only",
+                "webhook": (
+                    "aggregate decision only; URL and secret omitted"
+                    if self.webhook_delivery
+                    else "not configured"
+                ),
             },
         })
         return payload
@@ -783,6 +798,7 @@ class Evalt:
         dashboard_token: str | None = None,
         dashboard_api_url: str | None = None,
         custom_scorers: Mapping[str, Scorer] | None = None,
+        webhook: WebhookDestination | None = None,
     ) -> None:
         if transport is not None and request_timeout_seconds != 600:
             raise ValueError("request_timeout_seconds cannot be combined with a custom transport.")
@@ -816,6 +832,9 @@ class Evalt:
             if resolved_dashboard_token and resolved_dashboard_url
             else None
         )
+        if webhook is not None:
+            webhook.validate()
+        self._webhook = webhook
         self._dashboard_run_local = threading.local()
         self._maintenance_guard = threading.Lock()
         self._maintenance_routes: set[str] = set()
@@ -3164,7 +3183,7 @@ class Evalt:
             dashboard_sync_succeeded = self._dashboard_sync.flush(
                 timeout_seconds=8.0
             )
-        return MonitorResult(
+        result = MonitorResult(
             status=status,
             candidate=candidate,
             absolute_gate=absolute_gate,
@@ -3176,6 +3195,26 @@ class Evalt:
             dashboard_sync_started=dashboard_sync_started,
             dashboard_sync_succeeded=dashboard_sync_succeeded,
         )
+        if self._webhook is not None:
+            try:
+                delivery = deliver_webhook(
+                    self._webhook,
+                    route_health_event(result, self._webhook),
+                )
+                result = replace(result, webhook_delivery=delivery.summary())
+            except WebhookError as error:
+                result = replace(result, webhook_delivery={
+                    "schema": "evalt-webhook-delivery-summary-v1",
+                    "destination_id": self._webhook.destination_id,
+                    "delivered": False,
+                    "attempts": 0,
+                    "status_code": None,
+                    "result": "configuration_or_audit_error",
+                    "error": str(error)[:180],
+                    "audit_path": str(self._webhook.audit_path),
+                    "replay": False,
+                })
+        return result
 
     def draft(
         self,

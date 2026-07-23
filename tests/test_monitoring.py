@@ -18,6 +18,7 @@ from evalt import (
     ImageInput,
     ProviderError,
     Suite,
+    WebhookDestination,
     multimodal_input,
 )
 from last_good_prompt.core import Completion
@@ -366,6 +367,50 @@ class MonitorTests(unittest.TestCase):
             "image_url",
         ):
             self.assertNotIn(forbidden, serialized)
+
+    def test_sdk_webhook_emits_only_the_aggregate_monitor_decision(self):
+        transport = LabelTransport()
+        with tempfile.TemporaryDirectory() as directory:
+            destination = WebhookDestination(
+                url="https://hooks.example.test/evalt",
+                secret="fixture-secret-at-least-16-bytes",
+                audit_path=Path(directory) / "audit.jsonl",
+            )
+            delivery = mock.Mock()
+            delivery.summary.return_value = {
+                "schema": "evalt-webhook-delivery-summary-v1",
+                "event_id": "evt_" + "a" * 32,
+                "destination_id": "default",
+                "delivered": True,
+                "attempts": 1,
+            }
+            with mock.patch(
+                "evalt.core.deliver_webhook", return_value=delivery
+            ) as send:
+                result = Evalt(
+                    transport=transport,
+                    show_progress=False,
+                    webhook=destination,
+                ).monitor(
+                    self.baseline,
+                    route="support-routing",
+                    max_cost_usd=0.10,
+                )
+
+            self.assertTrue(result.webhook_delivery["delivered"])
+            event = send.call_args.args[1].to_dict()
+            serialized = json.dumps(event).casefold()
+            self.assertEqual(event["type"], "route.health.checked")
+            self.assertNotIn("support-routing", serialized)
+            for forbidden in (
+                "winning_prompt",
+                "approved_output",
+                "input",
+                "output",
+                "reason",
+                "image_url",
+            ):
+                self.assertNotIn(forbidden, serialized)
 
     def test_saved_monitor_result_remains_check_and_compare_compatible(self):
         from evalt.reporting import check_regression, compare_results

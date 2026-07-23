@@ -40,6 +40,18 @@ from .scorers import (
     ScoreResult,
     Scorer,
 )
+from .webhooks import (
+    WebhookConfigurationError,
+    WebhookDelivery,
+    WebhookDeliveryError,
+    WebhookDestination,
+    WebhookError,
+    WebhookEvent,
+    ci_gate_event,
+    deliver_webhook,
+    replay_webhook,
+    route_health_event,
+)
 
 __all__ = [
     "BudgetExceeded",
@@ -78,6 +90,16 @@ __all__ = [
     "ScoreRequest",
     "ScoreResult",
     "Scorer",
+    "WebhookConfigurationError",
+    "WebhookDelivery",
+    "WebhookDeliveryError",
+    "WebhookDestination",
+    "WebhookError",
+    "WebhookEvent",
+    "ci_gate_event",
+    "deliver_webhook",
+    "replay_webhook",
+    "route_health_event",
 ]
 
-__version__ = "0.10.31"
+__version__ = "0.10.32"
