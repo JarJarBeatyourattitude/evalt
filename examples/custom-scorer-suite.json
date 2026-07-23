@@ -1,0 +1,26 @@
+{
+  "schema": "evalt-suite-v2",
+  "name": "custom-scorer-labels",
+  "prompt": "Return exactly one label: billing, account, or technical.",
+  "examples": [
+    {"id": "billing-1", "input": "I was charged twice", "approved_output": "billing"},
+    {"id": "billing-2", "input": "Where is my invoice?", "approved_output": "billing"},
+    {"id": "account-1", "input": "My reset link expired", "approved_output": "account"},
+    {"id": "account-2", "input": "I cannot sign in", "approved_output": "account"},
+    {"id": "technical-1", "input": "The app freezes", "approved_output": "technical"},
+    {"id": "technical-2", "input": "Sync keeps failing", "approved_output": "technical"}
+  ],
+  "models": ["google/gemini-3-flash-preview", "qwen/qwen3.5-9b"],
+  "optimizer_model": "openai/gpt-5.6-luna",
+  "evaluator_model": "unused/custom",
+  "evaluator": {
+    "type": "custom",
+    "scorer_id": "casefold-exact",
+    "scorer_version": "1.0"
+  },
+  "quality_threshold": 0.95,
+  "max_optimization_cost_usd": 0.25,
+  "rounds": 1,
+  "optimize_prompt": false,
+  "holdout_repeats": 1
+}

@@ -73,6 +73,7 @@ def _evaluator_contract_hash(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
 from .dashboard import DEFAULT_DASHBOARD_API_URL, WorkspaceSync, load_dashboard_config
+from .scorers import Scorer
 
 
 _NUMBER_WORDS = {
@@ -398,6 +399,17 @@ class Suite:
         }:
             raise ValueError("evidence_provenance is not a supported trust level.")
 
+    def resolved_evaluator_model(self) -> str:
+        """Return the truthful, stable evaluator label for the frozen contract."""
+
+        evaluator_type = str(self.evaluator.get("type") or "semantic")
+        if evaluator_type == "custom":
+            return (
+                f"custom/{self.evaluator.get('scorer_id')}@"
+                f"{self.evaluator.get('scorer_version')}"
+            )
+        return self.evaluator_model
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "schema": "evalt-suite-v2",
@@ -406,7 +418,7 @@ class Suite:
             "examples": [asdict(example) for example in self.examples],
             "models": list(self.models),
             "optimizer_model": self.optimizer_model,
-            "evaluator_model": self.evaluator_model,
+            "evaluator_model": self.resolved_evaluator_model(),
             "evaluator": dict(self.evaluator),
             "difficulty_thresholds": dict(self.difficulty_thresholds),
             "objective": self.objective,
@@ -443,7 +455,7 @@ class Suite:
             "examples": self.examples,
             "models": self.models,
             "optimizer_model": self.optimizer_model,
-            "evaluator_model": self.evaluator_model,
+            "evaluator_model": self.resolved_evaluator_model(),
             "evaluator": dict(self.evaluator),
             "difficulty_thresholds": dict(self.difficulty_thresholds),
             "objective": self.objective,
@@ -770,13 +782,18 @@ class Evalt:
         progress_callback: Callable[[dict[str, Any]], None] | None = None,
         dashboard_token: str | None = None,
         dashboard_api_url: str | None = None,
+        custom_scorers: Mapping[str, Scorer] | None = None,
     ) -> None:
         if transport is not None and request_timeout_seconds != 600:
             raise ValueError("request_timeout_seconds cannot be combined with a custom transport.")
         resolved_transport = transport or OpenRouterTransport(
             api_key=api_key, timeout_seconds=request_timeout_seconds
         )
-        self.client = Client(api_key=api_key, transport=resolved_transport)
+        self.client = Client(
+            api_key=api_key,
+            transport=resolved_transport,
+            custom_scorers=custom_scorers,
+        )
         self._state_path = Path(state_path)
         self._router: DurableRouter | None = None
         self._show_progress = (
@@ -2121,7 +2138,7 @@ class Evalt:
                             suite_or_prompt.evaluator,
                             getattr(
                                 result, "evaluator_model",
-                                suite_or_prompt.evaluator_model,
+                                suite_or_prompt.resolved_evaluator_model(),
                             ),
                         ),
                         "evaluator_type": str(
@@ -2541,7 +2558,8 @@ class Evalt:
             raise ValueError("route must be a stable non-empty name.")
         result = self.run(suite)
         evaluator_model = str(
-            getattr(result, "evaluator_model", "") or suite.evaluator_model
+            getattr(result, "evaluator_model", "")
+            or suite.resolved_evaluator_model()
         )
         catalog_revision = "explicit-suite-" + hashlib.sha256(json.dumps(
             list(suite.models), sort_keys=True, separators=(",", ":")
@@ -2759,7 +2777,7 @@ class Evalt:
                     "The frozen selected model is absent from the supplied source suite."
                 )
             source_contract_fields = {
-                "evaluator_model": reviewed_suite.evaluator_model,
+                "evaluator_model": reviewed_suite.resolved_evaluator_model(),
                 "evaluator": dict(reviewed_suite.evaluator),
                 "difficulty_thresholds": dict(reviewed_suite.difficulty_thresholds),
                 "quality_threshold": reviewed_suite.quality_threshold,
@@ -2899,7 +2917,9 @@ class Evalt:
                 "The baseline winner few-shot package does not match the frozen contract."
             )
 
-        evaluator = _validate_evaluator_policy(dict(suite["evaluator"]))
+        evaluator = self.client.validate_evaluator_runtime(
+            dict(suite["evaluator"])
+        )
         difficulty_thresholds = _validate_difficulty_thresholds(
             suite.get("difficulty_thresholds")
         )

@@ -33,6 +33,13 @@ from .reporting import (
     write_reports,
 )
 from .library import EvidenceLibrary, LibraryEntry, resolve_evidence_reference
+from .scorers import (
+    CommandScorer,
+    CustomScorerError,
+    ScoreRequest,
+    ScoreResult,
+    Scorer,
+)
 
 __all__ = [
     "BudgetExceeded",
@@ -66,6 +73,11 @@ __all__ = [
     "EvidenceLibrary",
     "LibraryEntry",
     "resolve_evidence_reference",
+    "CommandScorer",
+    "CustomScorerError",
+    "ScoreRequest",
+    "ScoreResult",
+    "Scorer",
 ]
 
-__version__ = "0.10.30"
+__version__ = "0.10.31"

@@ -41,9 +41,10 @@ from .dashboard import (
     save_dashboard_config,
     workspace_fingerprint,
 )
+from .scorers import CommandScorer, CustomScorerError, Scorer
 
 
-HOSTED_SDK_VERSION = "0.10.30"
+HOSTED_SDK_VERSION = "0.10.31"
 HOSTED_WHEEL_URL = (
     "https://evalt.onrender.com/python-sdk/dist/"
     f"evalt-{HOSTED_SDK_VERSION}-py3-none-any.whl"
@@ -54,6 +55,83 @@ HOSTED_RELEASE_REQUIREMENTS_URL = "https://evalt.onrender.com/python-sdk/latest.
 def _sdk_version() -> str:
     from . import __version__
     return __version__
+
+
+def _add_custom_scorer_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--custom-scorer-id",
+        help=(
+            "Explicitly register one trusted local scorer ID. Suite files cannot "
+            "supply an executable."
+        ),
+    )
+    parser.add_argument(
+        "--custom-scorer-version",
+        help="Version of the explicitly registered local scorer.",
+    )
+    parser.add_argument(
+        "--custom-scorer-executable",
+        help=(
+            "Executable for the trusted local scorer; launched directly, never "
+            "through a shell."
+        ),
+    )
+    parser.add_argument(
+        "--custom-scorer-arg",
+        action="append",
+        default=[],
+        help=(
+            "One scorer argv item; repeat as needed. Use "
+            "--custom-scorer-arg=--flag when an item begins with a dash."
+        ),
+    )
+    parser.add_argument(
+        "--custom-scorer-timeout",
+        type=float,
+        default=10.0,
+        help="Per-case local scorer timeout in seconds (default 10; maximum 300).",
+    )
+    parser.add_argument(
+        "--custom-scorer-max-input-bytes",
+        type=int,
+        default=8 * 1024 * 1024,
+        help="Maximum serialized scorer request size per case (default 8 MiB).",
+    )
+    parser.add_argument(
+        "--custom-scorer-max-output-bytes",
+        type=int,
+        default=65_536,
+        help="Maximum retained scorer stdout or stderr per case (default 65536).",
+    )
+
+
+def _custom_scorer_registry(args: argparse.Namespace) -> dict[str, Scorer]:
+    values = (
+        getattr(args, "custom_scorer_id", None),
+        getattr(args, "custom_scorer_version", None),
+        getattr(args, "custom_scorer_executable", None),
+    )
+    if not any(values):
+        if getattr(args, "custom_scorer_arg", None):
+            raise ValueError(
+                "--custom-scorer-arg requires --custom-scorer-id, "
+                "--custom-scorer-version, and --custom-scorer-executable."
+            )
+        return {}
+    if not all(values):
+        raise ValueError(
+            "A CLI custom scorer requires --custom-scorer-id, "
+            "--custom-scorer-version, and --custom-scorer-executable together."
+        )
+    scorer = CommandScorer(
+        str(values[0]),
+        str(values[1]),
+        [str(values[2]), *list(getattr(args, "custom_scorer_arg", []) or [])],
+        timeout_seconds=float(args.custom_scorer_timeout),
+        max_input_bytes=int(args.custom_scorer_max_input_bytes),
+        max_output_bytes=int(args.custom_scorer_max_output_bytes),
+    )
+    return {scorer.scorer_id: scorer}
 
 
 def _runtime_identity() -> dict[str, object]:
@@ -419,6 +497,7 @@ def parser() -> argparse.ArgumentParser:
     optimize.add_argument("--fixed-prompt", action="store_true", help="Override the suite and compare routes without modifying its prompt.")
     optimize.add_argument("--html-report", help="Also write a self-contained offline HTML report.")
     optimize.add_argument("--junit-report", help="Also write case-level JUnit XML for CI.")
+    _add_custom_scorer_arguments(optimize)
 
     monitor = commands.add_parser(
         "monitor",
@@ -471,6 +550,7 @@ def parser() -> argparse.ArgumentParser:
         default=600,
         help="Per-response timeout in seconds (default: 600; maximum: 7200).",
     )
+    _add_custom_scorer_arguments(monitor)
 
     report = commands.add_parser("report", help="Render saved JSON as HTML and/or JUnit; no provider call.")
     report.add_argument("result", help="Saved Evalt result JSON.")
@@ -1038,6 +1118,7 @@ def main(argv: list[str] | None = None) -> int:
             monitor_client = Evalt(
                 request_timeout_seconds=float(args.request_timeout),
                 show_progress=False,
+                custom_scorers=_custom_scorer_registry(args),
             )
             try:
                 monitored = monitor_client.monitor(
@@ -1051,7 +1132,7 @@ def main(argv: list[str] | None = None) -> int:
                     max_p90_increase_ms=args.max_p90_increase_ms,
                     max_parallel_scenarios=args.max_parallel_scenarios,
                 )
-            except (BudgetExceeded, ProviderError) as error:
+            except (BudgetExceeded, ProviderError, CustomScorerError) as error:
                 failure = {
                     "schema": "evalt-monitor-failure-v1",
                     "status": "ERROR",
@@ -1153,10 +1234,11 @@ def main(argv: list[str] | None = None) -> int:
                 request_timeout_seconds=request_timeout_seconds,
                 progress_callback=progress,
                 show_progress=False,
+                custom_scorers=_custom_scorer_registry(args),
             )
             try:
                 result = client.run(suite)
-            except (BudgetExceeded, ProviderError) as error:
+            except (BudgetExceeded, ProviderError, CustomScorerError) as error:
                 failure = {
                     "schema": "evalt-run-failure-v1",
                     "status": "INCOMPLETE",
@@ -1260,7 +1342,15 @@ def main(argv: list[str] | None = None) -> int:
         else:
             print("FAIL: " + "; ".join(failures), file=sys.stderr)
         return 0 if passed else 1
-    except (BudgetExceeded, ProviderError, ValueError, KeyError, OSError, json.JSONDecodeError) as error:
+    except (
+        BudgetExceeded,
+        ProviderError,
+        CustomScorerError,
+        ValueError,
+        KeyError,
+        OSError,
+        json.JSONDecodeError,
+    ) as error:
         print(f"evalt: {error}", file=sys.stderr)
         return 2
 

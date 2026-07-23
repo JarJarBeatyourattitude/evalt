@@ -128,7 +128,7 @@ repository checkout:
 
 ```bash
 python -m venv .venv
-python -m pip install dist/evalt-0.10.30-py3-none-any.whl
+python -m pip install dist/evalt-0.10.31-py3-none-any.whl
 python -m evalt --version
 ```
 
@@ -740,6 +740,11 @@ health = Evalt().monitor(
 print(health.status)  # HEALTHY or REGRESSION
 ```
 
+Custom-scorer baselines require the same explicit scorer ID, version, and local
+registration for every recheck. Evalt resolves that registration before the first target
+model request. A missing or changed scorer therefore cannot spend against the monitor
+cap or silently change the frozen measurement contract.
+
 ## Explicit suite API
 
 ```python
@@ -808,9 +813,65 @@ For exact outputs, replace the semantic evaluator with a deterministic contract:
 ```
 
 This makes no evaluator-model call. `exact_text` is also available for strict labels.
-Independent model lanes run concurrently (eight by default) and each lane evaluates up
-to sixteen independent case executions concurrently. Model lanes are configurable up to
-16 and case execution concurrency up to 64. Repeated executions are parallel work units;
+
+For domain rules that do not fit a built-in evaluator, identify a versioned custom
+scorer in the suite:
+
+```json
+"evaluator": {
+  "type": "custom",
+  "scorer_id": "domain-rubric",
+  "scorer_version": "1.0"
+}
+```
+
+That JSON cannot contain a command, module, executable, or path. Register trusted local
+code explicitly:
+
+```python
+from evalt import CommandScorer, Evalt, Suite
+import sys
+
+suite = Suite.load("evalt.json")
+scorer = CommandScorer(
+    "domain-rubric",
+    "1.0",
+    [sys.executable, "tools/score.py"],
+    timeout_seconds=5,
+)
+result = Evalt(custom_scorers={scorer.scorer_id: scorer}).run(suite)
+```
+
+The command receives one `evalt-custom-score-request-v1` JSON object on stdin and must
+return exactly `{"passed": true|false, "score": 0..1, "reason": "optional"}` on
+stdout. It is launched directly without a shell, under a per-case timeout and bounded
+input/output. Its default environment keeps only basic process variables such as
+`PATH`, temp directories, and Windows runtime paths; provider credentials are excluded.
+Nonzero exit, timeout, malformed or oversized output, missing registration, and version
+drift fail closed. Custom scoring has zero provider cost.
+
+The equivalent CLI registration is explicit and separate from the suite:
+
+```bash
+python3 -m evalt optimize evalt.json \
+  --custom-scorer-id domain-rubric \
+  --custom-scorer-version 1.0 \
+  --custom-scorer-executable python3 \
+  --custom-scorer-arg tools/score.py
+```
+
+Use the same registration options with `evalt monitor`; saved results retain the scorer
+ID/version in the frozen suite hash, while `report`, `compare`, and `check` remain
+provider-free and do not execute scorer code. See
+`examples/custom_scorer_sdk.py`, `examples/custom_scorer.py`, and
+`examples/custom-scorer-suite.json`. A zero-provider-cost protocol command also ships
+inside every wheel. Register `python -m evalt.examples.custom_scorer` as the executable
+plus arguments for `CommandScorer`; invoking it without a JSON request prints concise
+protocol guidance instead of running an evaluation.
+
+Independent model lanes run concurrently (sixteen by default) and each lane evaluates
+up to thirty-two independent case executions concurrently. Model lanes are configurable
+up to 32 and case execution concurrency up to 128. Repeated executions are parallel work units;
 turns inside one multi-turn scenario remain ordered. Every in-flight estimate is reserved
 against the one hard suite budget. Evalt measures both training evidence and validation
 before skipping prompt learning; a perfect score on a small validation slice alone does

@@ -27,6 +27,16 @@ import zlib
 import certifi
 from dotenv import load_dotenv
 
+from .scorers import (
+    CustomScorerError,
+    ScoreRequest,
+    ScoreResult,
+    Scorer,
+    normalize_scorer_registry,
+    resolve_registered_scorer,
+    validate_scorer_identity,
+)
+
 
 def _submit_with_context(
     pool: ThreadPoolExecutor, function: Callable[..., Any], *args: Any
@@ -2007,8 +2017,23 @@ class Client:
         api_key: str | None = None,
         *,
         transport: ChatTransport | None = None,
+        custom_scorers: Mapping[str, Scorer] | None = None,
     ) -> None:
         self.transport = transport or OpenRouterTransport(api_key)
+        self.custom_scorers = normalize_scorer_registry(custom_scorers)
+        self._custom_scorer_locks = {
+            scorer_id: threading.Lock() for scorer_id in self.custom_scorers
+        }
+
+    def validate_evaluator_runtime(
+        self, evaluator: Mapping[str, Any] | None
+    ) -> dict[str, Any]:
+        """Validate an evaluator and resolve local code before provider activity."""
+
+        policy = _validate_evaluator_policy(dict(evaluator) if evaluator else None)
+        if policy["type"] == "custom":
+            resolve_registered_scorer(policy, self.custom_scorers)
+        return policy
 
     def _call(
         self,
@@ -2168,7 +2193,12 @@ class Client:
         if target_max_tokens is not None and not 1 <= int(target_max_tokens) <= 131072:
             raise ValueError("target_max_tokens must be between one and 131072.")
         target_request_options = normalize_request_options(request_options)
-        evaluator_policy = _validate_evaluator_policy(evaluator)
+        evaluator_policy = self.validate_evaluator_runtime(evaluator)
+        if evaluator_policy["type"] == "custom":
+            evaluator_model = (
+                f"custom/{evaluator_policy['scorer_id']}@"
+                f"{evaluator_policy['scorer_version']}"
+            )
         difficulty_floor_policy = _validate_difficulty_thresholds(difficulty_thresholds)
         performance_setter = getattr(self.transport, "set_performance_policy", None)
         if callable(performance_setter):
@@ -2218,6 +2248,7 @@ class Client:
             "exact_text": 64,
             "exact_json": 1024,
             "numeric_tolerance": 64,
+            "custom": 8192,
             "semantic": 8192,
         }[evaluator_policy["type"]]
         # A recurring label/score route is not viable when one provider call can
@@ -3812,6 +3843,7 @@ class Client:
             "exact_text": 64,
             "exact_json": 1024,
             "numeric_tolerance": 64,
+            "custom": 8192,
             "semantic": 8192,
         }[evaluator_policy["type"]]
 
@@ -3886,6 +3918,44 @@ class Client:
         evaluator: dict[str, Any] | None = None,
     ) -> tuple[Judgment, Completion]:
         evaluator = evaluator or {"type": "semantic"}
+        if evaluator["type"] == "custom":
+            scorer = resolve_registered_scorer(evaluator, self.custom_scorers)
+            request = ScoreRequest(
+                scenario_id=example.id,
+                turn=turn_index + 1,
+                input=turn.input,
+                transcript=tuple(dict(message) for message in transcript),
+                approved_output=turn.approved_output,
+                actual_output=output,
+                group=example.group,
+                difficulty=example.difficulty,
+            )
+            try:
+                if bool(getattr(scorer, "thread_safe", False)):
+                    raw_result = scorer.score(request)
+                else:
+                    with self._custom_scorer_locks[str(evaluator["scorer_id"])]:
+                        raw_result = scorer.score(request)
+                score_result = ScoreResult.from_value(raw_result)
+            except CustomScorerError:
+                raise
+            except Exception as error:
+                raise CustomScorerError(
+                    f"Custom scorer {evaluator['scorer_id']!r} raised "
+                    f"{type(error).__name__}; its message was omitted."
+                ) from error
+            judgment = Judgment(
+                score_result.passed, score_result.score, score_result.reason
+            )
+            scorer_label = (
+                f"{evaluator['scorer_id']}@{evaluator['scorer_version']}"
+            )
+            return judgment, Completion(
+                content=json.dumps(asdict(judgment), separators=(",", ":")),
+                model=f"custom/{scorer_label}",
+                generation_id=f"custom:{scorer_label}",
+                cost_usd=0.0,
+            )
         if evaluator["type"] != "semantic":
             judgment = _deterministic_judgment(output, turn.approved_output, evaluator)
             return judgment, Completion(
@@ -4084,11 +4154,33 @@ def _exact_json_response_schema(
 def _validate_evaluator_policy(value: dict[str, Any] | None) -> dict[str, Any]:
     policy = dict(value or {"type": "semantic"})
     evaluator_type = str(policy.get("type", "")).strip().lower()
-    if evaluator_type not in {"semantic", "exact_text", "exact_json", "numeric_tolerance"}:
+    if evaluator_type not in {
+        "semantic", "exact_text", "exact_json", "numeric_tolerance", "custom"
+    }:
         raise ValueError(
-            "evaluator.type must be semantic, exact_text, exact_json, or numeric_tolerance."
+            "evaluator.type must be semantic, exact_text, exact_json, "
+            "numeric_tolerance, or custom."
         )
     policy["type"] = evaluator_type
+    if evaluator_type == "custom":
+        allowed_fields = {"type", "scorer_id", "scorer_version"}
+        unexpected = set(policy) - allowed_fields
+        if unexpected:
+            raise ValueError(
+                "A custom evaluator may contain only type, scorer_id, and "
+                "scorer_version. Suite files cannot select executable code "
+                f"(unexpected: {', '.join(sorted(unexpected))})."
+            )
+        try:
+            scorer_id, scorer_version = validate_scorer_identity(
+                policy["scorer_id"], policy["scorer_version"]
+            )
+        except KeyError as error:
+            raise ValueError(
+                "A custom evaluator requires scorer_id and scorer_version."
+            ) from error
+        policy["scorer_id"] = scorer_id
+        policy["scorer_version"] = scorer_version
     if evaluator_type == "exact_json":
         required_keys = policy.get("required_keys", [])
         if not isinstance(required_keys, list) or any(not str(key).strip() for key in required_keys):

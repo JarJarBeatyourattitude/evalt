@@ -376,9 +376,11 @@ def sanitize_route_snapshot(status: Mapping[str, Any]) -> dict[str, Any]:
             ):
                 safe_summary.pop(key, None)
         if safe_summary.get("evaluator_type") not in {
-            "semantic", "exact_text", "exact_json", "numeric_tolerance",
+            "semantic", "exact_text", "exact_json", "numeric_tolerance", "custom",
         }:
             safe_summary.pop("evaluator_type", None)
+        if safe_summary.get("evaluator_type") == "custom":
+            safe_summary.pop("evaluator_model", None)
         safe["last_test_summary"] = safe_summary
     safe["schema"] = "evalt-workspace-route-v1"
     safe["route"] = str(status.get("route") or "default")[:80]

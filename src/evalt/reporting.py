@@ -48,6 +48,26 @@ def _final_cases(winner: Mapping[str, Any]) -> dict[str, Mapping[str, Any]]:
     }
 
 
+def _evaluator_contract(result: Mapping[str, Any]) -> dict[str, str]:
+    raw = (result.get("regression_suite") or {}).get("evaluator") or {}
+    if not isinstance(raw, Mapping):
+        return {"type": "unknown", "label": "Unknown evaluator"}
+    evaluator_type = str(raw.get("type") or "semantic")
+    contract = {
+        "type": evaluator_type,
+        "label": evaluator_type.replace("_", " ").title(),
+    }
+    if evaluator_type == "custom":
+        scorer_id = str(raw.get("scorer_id") or "")
+        scorer_version = str(raw.get("scorer_version") or "")
+        contract.update({
+            "scorer_id": scorer_id,
+            "scorer_version": scorer_version,
+            "label": f"Custom / {scorer_id} @ {scorer_version}",
+        })
+    return contract
+
+
 def compare_results(
     baseline: Mapping[str, Any], candidate: Mapping[str, Any]
 ) -> dict[str, Any]:
@@ -119,12 +139,16 @@ def compare_results(
     candidate_cost = candidate_winner.get("estimated_cost_per_successful_call_usd")
     baseline_p90 = _optional_number(baseline_winner.get("target_latency_p90_ms"))
     candidate_p90 = _optional_number(candidate_winner.get("target_latency_p90_ms"))
+    baseline_evaluator = _evaluator_contract(baseline)
+    candidate_evaluator = _evaluator_contract(candidate)
     return {
         "schema": "evalt-comparison-v1",
         "comparable_contract": comparable_contract,
         "contract": {
             "baseline_suite_hash": baseline_hash or None,
             "candidate_suite_hash": candidate_hash or None,
+            "baseline_evaluator": baseline_evaluator,
+            "candidate_evaluator": candidate_evaluator,
             "warning": None if comparable_contract else (
                 "The suite hashes differ or are missing. Case deltas are descriptive and must not be used as a promotion gate."
             ),
@@ -353,6 +377,7 @@ def render_html_report(result: Mapping[str, Any], *, title: str = "Evalt evaluat
     status = str(result.get("quality_gate_status") or ("QUALIFIED" if quality >= threshold else "BELOW_GATE"))
     spend = _number(result.get("total_provider_spend_usd") or result.get("provider_spend_usd"))
     scope = str(result.get("winner_scope") or "")
+    evaluator = _evaluator_contract(result)
     rows = []
     for item in sorted(_models(result), key=lambda entry: _number(entry.get("estimated_cost_per_successful_call_usd"), float("inf"))):
         item_quality = _number(item.get("holdout_pass_rate") or item.get("pass_rate"))
@@ -386,7 +411,7 @@ def render_html_report(result: Mapping[str, Any], *, title: str = "Evalt evaluat
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{escape(title)}</title><style>
 :root{{--ink:#18151e;--muted:#706a76;--line:#ddd8d0;--paper:#f5f2ec;--card:#fff;--violet:#6756d2;--green:#23885b;--red:#b65546}}*{{box-sizing:border-box}}body{{margin:0;background:var(--paper);color:var(--ink);font:14px/1.55 Inter,ui-sans-serif,system-ui,sans-serif}}main{{width:min(1040px,calc(100% - 32px));margin:0 auto;padding:56px 0 80px}}.kicker{{color:var(--violet);font-size:10px;font-weight:800;letter-spacing:.12em;text-transform:uppercase}}h1{{margin:8px 0 10px;font-size:clamp(36px,6vw,68px);letter-spacing:-.06em;line-height:.98}}.lead{{max-width:720px;color:var(--muted)}}.metrics{{margin:34px 0 20px;display:grid;grid-template-columns:repeat(4,1fr);overflow:hidden;border:1px solid var(--line);border-radius:14px;background:var(--card)}}.metrics div{{padding:20px;border-right:1px solid var(--line)}}.metrics div:last-child{{border:0}}small{{display:block;color:var(--muted);font-size:9px;font-weight:750;letter-spacing:.08em;text-transform:uppercase}}.metrics strong{{display:block;margin-top:7px;font-size:16px}}section{{margin-top:28px}}h2{{font-size:24px;letter-spacing:-.035em}}table{{width:100%;border-collapse:collapse;overflow:hidden;border:1px solid var(--line);border-radius:12px;background:var(--card)}}th,td{{padding:13px 16px;border-bottom:1px solid var(--line);text-align:left}}th{{color:var(--muted);font-size:9px;letter-spacing:.08em;text-transform:uppercase}}tr:last-child td{{border:0}}.decision{{font-size:10px;font-weight:800}}.decision.pass{{color:var(--green)}}.decision.fail{{color:var(--red)}}.case{{margin:9px 0;padding:16px;border:1px solid var(--line);border-left:4px solid var(--green);border-radius:10px;background:var(--card)}}.case.fail{{border-left-color:var(--red)}}.case header{{display:flex;justify-content:space-between}}.case header span{{font-size:10px;font-weight:800;color:var(--green)}}.case.fail header span{{color:var(--red)}}.case p,.empty{{color:var(--muted)}}details summary{{cursor:pointer;color:var(--violet);font-size:11px;font-weight:750}}pre{{overflow:auto;padding:12px;border-radius:8px;background:#1d1a22;color:#f3f0f6;font:11px/1.5 ui-monospace,monospace;white-space:pre-wrap}}.warnings{{padding:16px 20px;border:1px solid #e3c9a7;border-radius:10px;background:#fff9f0}}footer{{margin-top:36px;padding-top:16px;border-top:1px solid var(--line);color:var(--muted);font-size:10px}}@media(max-width:700px){{.metrics{{grid-template-columns:repeat(2,1fr)}}.metrics div:nth-child(2){{border-right:0}}th:nth-child(3),td:nth-child(3){{display:none}}}}
-</style></head><body><main><span class="kicker">Portable Evalt result</span><h1>{escape(model)}</h1><p class="lead">{escape(status.replace('_', ' ').title())}. This report describes one frozen evaluation result; it is not a general claim about the model.</p>
+</style></head><body><main><span class="kicker">Portable Evalt result</span><h1>{escape(model)}</h1><p class="lead">{escape(status.replace('_', ' ').title())}. Evaluator: {escape(evaluator['label'])}. This report describes one frozen evaluation result; it is not a general claim about the model.</p>
 <div class="metrics"><div><small>Final-test quality</small><strong>{quality:.1%}</strong></div><div><small>Required</small><strong>{threshold:.1%}</strong></div><div><small>Production cost</small><strong>{escape(cost_label)}</strong></div><div><small>Test spend</small><strong>${spend:.4f}</strong></div></div>
 <section><span class="kicker">Measured frontier</span><h2>Configurations</h2><table><thead><tr><th>Configuration</th><th>Final test</th><th>Cost / 1K</th><th>Decision</th></tr></thead><tbody>{model_table}</tbody></table></section>
 <section><span class="kicker">Frozen evidence</span><h2>Final-test cases</h2>{case_cards}</section>
@@ -411,12 +436,16 @@ def render_junit_report(result: Mapping[str, Any], *, suite_name: str = "evalt")
         "time": str(_number(result.get("elapsed_seconds"))),
     })
     properties = ET.SubElement(testsuite, "properties")
+    evaluator = _evaluator_contract(result)
     for name, value in {
         "winner_model": winner.get("model", ""),
         "quality_threshold": result.get("quality_threshold", ""),
         "winner_scope": result.get("winner_scope", ""),
         "provider_spend_usd": result.get("total_provider_spend_usd", ""),
         "suite_hash": (result.get("regression_suite") or {}).get("suite_hash", ""),
+        "evaluator_type": evaluator.get("type", ""),
+        "custom_scorer_id": evaluator.get("scorer_id", ""),
+        "custom_scorer_version": evaluator.get("scorer_version", ""),
     }.items():
         ET.SubElement(properties, "property", {"name": name, "value": str(value)})
     if not final_cases:

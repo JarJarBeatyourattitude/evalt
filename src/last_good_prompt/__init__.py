@@ -10,6 +10,13 @@ from .core import (
     ProviderError,
     Turn,
 )
+from .scorers import (
+    CommandScorer,
+    CustomScorerError,
+    ScoreRequest,
+    ScoreResult,
+    Scorer,
+)
 
 __all__ = [
     "BudgetExceeded",
@@ -20,6 +27,11 @@ __all__ = [
     "OptimizationResult",
     "ProviderError",
     "Turn",
+    "CommandScorer",
+    "CustomScorerError",
+    "ScoreRequest",
+    "ScoreResult",
+    "Scorer",
 ]
 
-__version__ = "0.10.30"
+__version__ = "0.10.31"
