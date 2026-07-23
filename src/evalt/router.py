@@ -15,6 +15,7 @@ import hashlib
 import json
 import math
 from pathlib import Path
+import re
 import sqlite3
 import threading
 import uuid
@@ -23,7 +24,9 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from last_good_prompt.core import (
     BudgetExceeded, Client, Completion, Example, OptimizationResult, _Budget,
-    normalize_request_options, request_options_fingerprint,
+    normalize_message_content, normalize_request_options,
+    request_options_fingerprint, required_input_modalities,
+    safe_input_descriptor,
 )
 
 
@@ -38,8 +41,49 @@ class RequestEnvelopeDriftWarning(UserWarning):
     """A production call changed settings that were part of route qualification."""
 
 
+class RouteVersionMismatch(RuntimeError):
+    """A production call cannot serve the exact qualified package it requested."""
+
+    def __init__(
+        self,
+        *,
+        route: str,
+        expected_package_id: str,
+        current_package_id: str | None,
+        reason: str,
+    ) -> None:
+        self.route = route
+        self.expected_package_id = expected_package_id
+        self.current_package_id = current_package_id
+        self.reason = reason
+        self.provider_call_started = False
+        current = current_package_id or "none"
+        super().__init__(
+            f"Route {route!r} cannot serve requested version "
+            f"{expected_package_id!r}; current version is {current!r} ({reason}). "
+            "No provider call was started. Inspect qualified versions with "
+            f"'python3 -m evalt versions --route {json.dumps(route)}' and deliberately update "
+            "the deployment pin or roll back the route."
+        )
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _percentile(values: Sequence[int], percentile: float) -> int | None:
+    ordered = sorted(int(value) for value in values if int(value) > 0)
+    if not ordered:
+        return None
+    position = (len(ordered) - 1) * percentile
+    lower = math.floor(position)
+    upper = math.ceil(position)
+    if lower == upper:
+        return ordered[lower]
+    return round(
+        ordered[lower] * (upper - position)
+        + ordered[upper] * (position - lower)
+    )
 
 
 def _hash(value: str) -> str:
@@ -47,9 +91,40 @@ def _hash(value: str) -> str:
 
 
 def _content(value: Any) -> str:
-    if isinstance(value, str):
-        return value
-    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    descriptor = safe_input_descriptor(value)
+    if isinstance(descriptor, str):
+        return descriptor
+    return json.dumps(
+        descriptor, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+
+
+def _input_messages(value: Any) -> list[dict[str, Any]]:
+    """Normalize one production input without permitting prompt replacement."""
+
+    if isinstance(value, Mapping) and value.get("role"):
+        candidates = [value]
+    elif (
+        isinstance(value, (list, tuple))
+        and value
+        and all(isinstance(item, Mapping) and item.get("role") for item in value)
+    ):
+        candidates = list(value)
+    else:
+        return [{"role": "user", "content": normalize_message_content(value)}]
+    messages: list[dict[str, Any]] = []
+    for raw in candidates:
+        role = str(raw.get("role") or "").strip()
+        if role not in {"user", "assistant", "tool"}:
+            raise ValueError(
+                "Production input messages may use user, assistant, or tool roles; "
+                "the route's tested system prompt remains Evalt-owned."
+            )
+        message = dict(raw)
+        message["role"] = role
+        message["content"] = normalize_message_content(raw.get("content"))
+        messages.append(message)
+    return messages
 
 
 def _percentile(values: Sequence[int], fraction: float) -> int:
@@ -67,9 +142,46 @@ def _route_phase(row: Mapping[str, Any]) -> str:
         return "human_calibrated"
     if provenance == "AI_GENERATED_AI_JUDGED":
         return "ai_tested"
+    if provenance in {"HUMAN_APPROVED", "HUMAN_APPROVED_AI_DRAFT"}:
+        return "human_approved"
     if provenance == "LEGACY_UNKNOWN":
         return "legacy_unknown"
     return "untested_bootstrap"
+
+
+_QUALIFIED_EVIDENCE = {
+    "AI_GENERATED_AI_JUDGED",
+    "HUMAN_FEEDBACK_CALIBRATED",
+    "HUMAN_APPROVED",
+    "HUMAN_APPROVED_AI_DRAFT",
+}
+
+_PACKAGE_ID_RE = re.compile(r"^rv_[0-9a-f]{20}$")
+_PACKAGE_ALIAS_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,47}$")
+_PACKAGE_NOTE_MAX_LENGTH = 240
+
+_PACKAGE_FIELDS = (
+    "prompt",
+    "source_prompt_version",
+    "prompt_version",
+    "candidates_json",
+    "selected_model",
+    "selected_prompt",
+    "selected_few_shot_json",
+    "decision_reason",
+    "quality_threshold",
+    "tested_catalog_revision",
+    "objective",
+    "max_p90_latency_seconds",
+    "latency_value_usd_per_second",
+    "optimize_prompt",
+    "evidence_provenance",
+    "last_test_summary_json",
+    "target_max_tokens",
+    "tested_request_options_json",
+    "tested_request_options_sha256",
+    "tested_input_modalities_json",
+)
 
 
 @dataclass(frozen=True)
@@ -377,6 +489,7 @@ class RoutedAnswer:
     prompt_version: str
     decision_reason: str
     maintenance_due: tuple[str, ...]
+    route_version: str = ""
     route_phase: str = "untested_bootstrap"
     evidence_provenance: str = "UNTESTED_BOOTSTRAP"
     initial_test_summary: dict[str, Any] | None = None
@@ -429,6 +542,7 @@ class RoutedAnswer:
             "prompt_version": self.prompt_version,
             "decision_reason": self.decision_reason,
             "maintenance_due": list(self.maintenance_due),
+            "route_version": self.route_version,
             "route_phase": self.route_phase,
             "evidence_provenance": self.evidence_provenance,
             "initial_test_summary": self.initial_test_summary,
@@ -521,6 +635,19 @@ class DurableRouter:
                     event_type TEXT NOT NULL,
                     detail_json TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS route_packages (
+                    package_id TEXT PRIMARY KEY,
+                    route TEXT NOT NULL REFERENCES routes(route),
+                    created_at TEXT NOT NULL,
+                    activation_reason TEXT NOT NULL,
+                    rollback_of_package_id TEXT,
+                    alias TEXT NOT NULL DEFAULT '',
+                    note TEXT NOT NULL DEFAULT '',
+                    annotation_updated_at TEXT,
+                    snapshot_json TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS route_packages_route_created
+                    ON route_packages(route, created_at DESC);
                 """
             )
             columns = {row["name"] for row in db.execute("PRAGMA table_info(routes)")}
@@ -542,6 +669,8 @@ class DurableRouter:
                 ("target_max_tokens", "INTEGER NOT NULL DEFAULT 600"),
                 ("tested_request_options_json", "TEXT NOT NULL DEFAULT '{}'"),
                 ("tested_request_options_sha256", "TEXT NOT NULL DEFAULT ''"),
+                ("tested_input_modalities_json", "TEXT NOT NULL DEFAULT '[\"text\"]'"),
+                ("current_package_id", "TEXT NOT NULL DEFAULT ''"),
             ):
                 if name not in columns:
                     db.execute(f"ALTER TABLE routes ADD COLUMN {name} {declaration}")
@@ -555,9 +684,100 @@ class DurableRouter:
             for name, declaration in (
                 ("request_options_sha256", "TEXT NOT NULL DEFAULT ''"),
                 ("request_envelope_validated", "INTEGER NOT NULL DEFAULT 1"),
+                ("input_replayable", "INTEGER NOT NULL DEFAULT 1"),
+                ("latency_ms", "INTEGER NOT NULL DEFAULT 0"),
             ):
                 if name not in call_columns:
                     db.execute(f"ALTER TABLE calls ADD COLUMN {name} {declaration}")
+            package_columns = {
+                row["name"] for row in db.execute("PRAGMA table_info(route_packages)")
+            }
+            for name, declaration in (
+                ("alias", "TEXT NOT NULL DEFAULT ''"),
+                ("note", "TEXT NOT NULL DEFAULT ''"),
+                ("annotation_updated_at", "TEXT DEFAULT NULL"),
+            ):
+                if name not in package_columns:
+                    db.execute(
+                        f"ALTER TABLE route_packages ADD COLUMN {name} {declaration}"
+                    )
+            db.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS route_packages_route_alias "
+                "ON route_packages(route,alias) WHERE alias<>''"
+            )
+            self._backfill_qualified_packages(db)
+
+    @staticmethod
+    def _package_snapshot(row: Mapping[str, Any]) -> dict[str, Any]:
+        """Capture the complete locally serving, tested package without call data."""
+
+        return {field: row[field] for field in _PACKAGE_FIELDS}
+
+    @staticmethod
+    def _qualified_snapshot(snapshot: Mapping[str, Any]) -> bool:
+        provenance = str(snapshot.get("evidence_provenance") or "")
+        try:
+            summary = json.loads(str(snapshot.get("last_test_summary_json") or "{}"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return False
+        return (
+            provenance in _QUALIFIED_EVIDENCE
+            and isinstance(summary, Mapping)
+            and summary.get("quality_gate_status") == "QUALIFIED_ROUTE_SELECTED"
+        )
+
+    def _capture_package(
+        self,
+        db: sqlite3.Connection,
+        route: str,
+        *,
+        activation_reason: str,
+        rollback_of_package_id: str | None = None,
+    ) -> str:
+        row = db.execute("SELECT * FROM routes WHERE route=?", (route,)).fetchone()
+        if row is None:
+            raise KeyError(f"Unknown Evalt route {route!r}.")
+        snapshot = self._package_snapshot(row)
+        if not self._qualified_snapshot(snapshot):
+            raise ValueError("Only a qualified route package can be saved or restored.")
+        package_id = f"rv_{uuid.uuid4().hex[:20]}"
+        created_at = _now()
+        db.execute(
+            "INSERT INTO route_packages(package_id,route,created_at,activation_reason,"
+            "rollback_of_package_id,snapshot_json) VALUES (?,?,?,?,?,?)",
+            (
+                package_id,
+                route,
+                created_at,
+                activation_reason,
+                rollback_of_package_id,
+                json.dumps(snapshot, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+            ),
+        )
+        db.execute(
+            "UPDATE routes SET current_package_id=?,updated_at=? WHERE route=?",
+            (package_id, created_at, route),
+        )
+        return package_id
+
+    def _backfill_qualified_packages(self, db: sqlite3.Connection) -> None:
+        """Give qualified pre-versioning routes one immutable, idempotent package."""
+
+        for row in db.execute(
+            "SELECT * FROM routes WHERE current_package_id='' ORDER BY created_at,route"
+        ).fetchall():
+            snapshot = self._package_snapshot(row)
+            if not self._qualified_snapshot(snapshot):
+                continue
+            package_id = self._capture_package(
+                db, str(row["route"]), activation_reason="legacy_backfill"
+            )
+            self._event(
+                db,
+                str(row["route"]),
+                "qualified_package_backfilled",
+                {"package_id": package_id},
+            )
 
     def _event(self, db: sqlite3.Connection, route: str, event_type: str, detail: Mapping[str, Any]) -> None:
         db.execute(
@@ -575,6 +795,7 @@ class DurableRouter:
         catalog_revision: str,
         target_max_tokens: int | None = None,
         request_options: Mapping[str, Any] | None = None,
+        input_modalities: Sequence[str] = ("text",),
     ) -> sqlite3.Row:
         if not route.strip():
             raise ValueError("route must be a stable non-empty name so Evalt can remember decisions.")
@@ -593,6 +814,8 @@ class DurableRouter:
             normalized_options, ensure_ascii=False, sort_keys=True, separators=(",", ":")
         )
         options_hash = request_options_fingerprint(normalized_options)
+        modalities = tuple(dict.fromkeys(str(item) for item in input_modalities))
+        modalities_json = json.dumps(modalities, separators=(",", ":"))
         now = _now()
         with self._db() as db:
             current = db.execute("SELECT * FROM routes WHERE route = ?", (route,)).fetchone()
@@ -603,8 +826,11 @@ class DurableRouter:
                 )
                 db.execute(
                     "UPDATE routes SET target_max_tokens=?,tested_request_options_json=?,"
-                    "tested_request_options_sha256=? WHERE route=?",
-                    (resolved_target_max_tokens, options_json, options_hash, route),
+                    "tested_request_options_sha256=?,tested_input_modalities_json=? WHERE route=?",
+                    (
+                        resolved_target_max_tokens, options_json, options_hash,
+                        modalities_json, route,
+                    ),
                 )
                 self._event(db, route, "route_created", {"prompt_version": version, "bootstrap_model": candidates[0], "candidates": candidates})
             else:
@@ -612,8 +838,13 @@ class DurableRouter:
                 candidates_changed = json.loads(current["candidates_json"]) != list(candidates)
                 if changed:
                     db.execute(
-                        "UPDATE routes SET prompt=?,source_prompt_version=?,prompt_version=?,candidates_json=?,selected_model=?,selected_prompt=?,selected_few_shot_json='[]',evidence_provenance='UNTESTED_BOOTSTRAP',last_test_summary_json='{}',decision_reason='prompt_changed_unqualified',feedback_count=0,last_optimized_feedback=0,last_optimized_calls=total_calls,tested_catalog_revision='',catalog_revision=?,target_max_tokens=?,tested_request_options_json=?,tested_request_options_sha256=?,updated_at=? WHERE route=?",
-                        (prompt.strip(), version, version, json.dumps(candidates), candidates[0], prompt.strip(), catalog_revision, resolved_target_max_tokens, options_json, options_hash, now, route),
+                        "UPDATE routes SET prompt=?,source_prompt_version=?,prompt_version=?,candidates_json=?,selected_model=?,selected_prompt=?,selected_few_shot_json='[]',evidence_provenance='UNTESTED_BOOTSTRAP',last_test_summary_json='{}',decision_reason='prompt_changed_unqualified',current_package_id='',feedback_count=0,last_optimized_feedback=0,last_optimized_calls=total_calls,tested_catalog_revision='',catalog_revision=?,target_max_tokens=?,tested_request_options_json=?,tested_request_options_sha256=?,tested_input_modalities_json=?,updated_at=? WHERE route=?",
+                        (
+                            prompt.strip(), version, version, json.dumps(candidates),
+                            candidates[0], prompt.strip(), catalog_revision,
+                            resolved_target_max_tokens, options_json, options_hash,
+                            modalities_json, now, route,
+                        ),
                     )
                     self._event(db, route, "prompt_changed", {
                         "prompt_version": version,
@@ -636,12 +867,19 @@ class DurableRouter:
                         if options_were_provided
                         else str(current["tested_request_options_sha256"])
                     )
+                    retained_modalities_json = (
+                        modalities_json
+                        if input_modalities
+                        else str(current["tested_input_modalities_json"] or '["text"]')
+                    )
                     db.execute(
                         "UPDATE routes SET candidates_json=?,catalog_revision=?,target_max_tokens=?,"
-                        "tested_request_options_json=?,tested_request_options_sha256=?,updated_at=? WHERE route=?",
+                        "tested_request_options_json=?,tested_request_options_sha256=?,"
+                        "tested_input_modalities_json=?,updated_at=? WHERE route=?",
                         (
                             json.dumps(candidates), catalog_revision, retained_target_max_tokens,
-                            retained_options_json, retained_options_hash, now, route,
+                            retained_options_json, retained_options_hash,
+                            retained_modalities_json, now, route,
                         ),
                     )
                 elif candidates_changed or current["catalog_revision"] != catalog_revision:
@@ -663,6 +901,111 @@ class DurableRouter:
             return True
         return str(row["decision_reason"]).startswith(("bootstrap_", "prompt_changed_"))
 
+    @staticmethod
+    def _route_version_error(
+        route: str,
+        expected_package_id: str,
+        current_package_id: str | None,
+        reason: str,
+    ) -> RouteVersionMismatch:
+        return RouteVersionMismatch(
+            route=route,
+            expected_package_id=expected_package_id,
+            current_package_id=current_package_id,
+            reason=reason,
+        )
+
+    def require_version(
+        self,
+        route: str,
+        expected_package_id: str,
+        *,
+        prompt: str | None = None,
+    ) -> dict[str, Any]:
+        """Load one exact current qualified package without a provider call.
+
+        The returned mapping is the immutable package snapshot plus bounded dynamic
+        route counters. Production callers use this snapshot directly, so a
+        concurrent later activation cannot switch the model or prompt mid-call.
+        """
+
+        expected = str(expected_package_id or "").strip()
+        if re.fullmatch(r"rv_[0-9a-f]{20}", expected) is None:
+            raise self._route_version_error(
+                route, expected, None, "invalid route-version format"
+            )
+        with self._db() as db:
+            current = db.execute(
+                "SELECT * FROM routes WHERE route=?", (route,)
+            ).fetchone()
+            current_package_id = (
+                str(current["current_package_id"] or "") if current is not None else ""
+            )
+            package = db.execute(
+                "SELECT * FROM route_packages WHERE package_id=?", (expected,)
+            ).fetchone()
+            if current is None:
+                raise self._route_version_error(
+                    route, expected, None, "route does not exist"
+                )
+            if package is not None and str(package["route"]) != route:
+                raise self._route_version_error(
+                    route, expected, current_package_id or None,
+                    f"version belongs to route {str(package['route'])!r}",
+                )
+            if not current_package_id:
+                raise self._route_version_error(
+                    route, expected, None,
+                    "route has no qualified serving version",
+                )
+            if current_package_id != expected:
+                raise self._route_version_error(
+                    route, expected, current_package_id,
+                    "serving version changed",
+                )
+            if package is None:
+                raise self._route_version_error(
+                    route, expected, current_package_id,
+                    "serving package metadata is missing",
+                )
+            try:
+                snapshot = json.loads(str(package["snapshot_json"]))
+            except (TypeError, json.JSONDecodeError) as error:
+                raise self._route_version_error(
+                    route, expected, current_package_id,
+                    "stored package metadata is damaged",
+                ) from error
+            if (
+                not isinstance(snapshot, Mapping)
+                or any(field not in snapshot for field in _PACKAGE_FIELDS)
+                or not self._qualified_snapshot(snapshot)
+            ):
+                raise self._route_version_error(
+                    route, expected, current_package_id,
+                    "stored package is incomplete or not qualified",
+                )
+            if prompt is not None and str(snapshot["source_prompt_version"]) != _hash(
+                prompt.strip()
+            )[:16]:
+                raise self._route_version_error(
+                    route, expected, current_package_id,
+                    "source prompt does not match the qualified version",
+                )
+            serving = dict(snapshot)
+            for field in (
+                "route",
+                "total_calls",
+                "feedback_count",
+                "last_optimized_calls",
+                "last_optimized_feedback",
+                "catalog_revision",
+                "created_at",
+                "updated_at",
+            ):
+                serving[field] = current[field]
+            serving["current_package_id"] = current_package_id
+            return serving
+
     def install_initial_result(
         self,
         *,
@@ -680,8 +1023,18 @@ class DurableRouter:
         judge_calibration_checks: int,
         target_max_tokens: int,
         request_options: Mapping[str, Any] | None,
+        objective: str = "lowest_cost_at_accuracy",
+        max_p90_latency_seconds: float | None = None,
+        latency_value_usd_per_second: float = 0.0,
+        optimize_prompt: bool = True,
     ) -> dict[str, Any]:
         """Durably install one split-tested first-route package or fail closed."""
+        suite_modalities = tuple(sorted({
+            modality
+            for example in examples
+            for turn in example.conversation()
+            for modality in required_input_modalities(turn.input)
+        })) or ("text",)
         winner = result.winner
         passed = (
             result.quality_gate_status == "QUALIFIED_ROUTE_SELECTED"
@@ -704,6 +1057,7 @@ class DurableRouter:
             catalog_revision=catalog_revision,
             target_max_tokens=target_max_tokens,
             request_options=request_options,
+            input_modalities=suite_modalities,
         )
         normalized_options = normalize_request_options(request_options)
         options_json = json.dumps(
@@ -712,10 +1066,21 @@ class DurableRouter:
         options_hash = request_options_fingerprint(normalized_options)
         selected_ids = set(winner.few_shot_example_ids)
         few_shot_messages: list[dict[str, str]] = []
+        persisted_few_shot_examples = 0
         for example in examples:
             if example.id not in selected_ids:
                 continue
-            for turn in example.conversation():
+            turns = example.conversation()
+            if any(
+                "image" in required_input_modalities(turn.input)
+                for turn in turns
+            ):
+                # Route state and version history must never become an image
+                # store. The evaluated package remains valid without persisting
+                # private visual exemplars as production few-shot messages.
+                continue
+            persisted_few_shot_examples += 1
+            for turn in turns:
                 few_shot_messages.extend((
                     {"role": "user", "content": turn.input},
                     {"role": "assistant", "content": turn.approved_output},
@@ -740,7 +1105,7 @@ class DurableRouter:
                 item.prompt_rewrites_tested for item in result.models
             ),
             "winner_prompt_changed": winner.selected_prompt_changed,
-            "few_shot_examples": len(winner.few_shot_example_ids),
+            "few_shot_examples": persisted_few_shot_examples,
             "workflow_spend_usd": round(float(total_workflow_spend_usd), 10),
             "evidence_provenance": evidence_provenance,
             "designer_model": designer_model,
@@ -749,11 +1114,28 @@ class DurableRouter:
             "judge_calibration_checks": int(judge_calibration_checks),
             "target_max_tokens": int(target_max_tokens),
             "request_options_sha256": options_hash,
+            "input_modalities": list(suite_modalities),
+            "suite_hash": result.regression_suite.get("suite_hash"),
+            "evaluator_contract_hash": _hash(json.dumps(
+                {
+                    "evaluator": result.regression_suite.get("evaluator") or {
+                        "type": "semantic"
+                    },
+                    "evaluator_model": evaluator_model,
+                    "contract_version": 1,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )),
+            "evaluator_type": str(
+                (result.regression_suite.get("evaluator") or {}).get("type")
+                or "semantic"
+            ),
         }
         with self._db() as db:
             current = db.execute("SELECT * FROM routes WHERE route=?", (route,)).fetchone()
             db.execute(
-                "UPDATE routes SET selected_model=?,selected_prompt=?,selected_few_shot_json=?,prompt_version=?,decision_reason='provisional_ai_qualified',evidence_provenance=?,last_test_summary_json=?,last_optimized_calls=?,last_optimized_feedback=?,tested_catalog_revision=?,target_max_tokens=?,tested_request_options_json=?,tested_request_options_sha256=?,updated_at=? WHERE route=?",
+                "UPDATE routes SET selected_model=?,selected_prompt=?,selected_few_shot_json=?,prompt_version=?,decision_reason='provisional_ai_qualified',evidence_provenance=?,last_test_summary_json=?,last_optimized_calls=?,last_optimized_feedback=?,tested_catalog_revision=?,objective=?,max_p90_latency_seconds=?,latency_value_usd_per_second=?,optimize_prompt=?,target_max_tokens=?,tested_request_options_json=?,tested_request_options_sha256=?,tested_input_modalities_json=?,updated_at=? WHERE route=?",
                 (
                     winner.model,
                     winner.selected_prompt,
@@ -764,13 +1146,22 @@ class DurableRouter:
                     current["total_calls"],
                     current["feedback_count"],
                     catalog_revision,
+                    objective,
+                    max_p90_latency_seconds,
+                    float(latency_value_usd_per_second),
+                    int(bool(optimize_prompt)),
                     int(target_max_tokens),
                     options_json,
                     options_hash,
+                    json.dumps(suite_modalities, separators=(",", ":")),
                     _now(),
                     route,
                 ),
             )
+            package_id = self._capture_package(
+                db, route, activation_reason="initial_qualification"
+            )
+            summary["package_id"] = package_id
             self._event(db, route, "initial_ai_route_promoted", summary)
         return summary
 
@@ -790,6 +1181,7 @@ class DurableRouter:
         route: str,
         prompt: str,
         input: Any,
+        route_version: str | None = None,
         max_cost_per_run_usd: float | None,
         models: Sequence[str] = DEFAULT_TARGETS,
         max_tokens: int | None = None,
@@ -814,22 +1206,29 @@ class DurableRouter:
             raise ValueError("max_p90_latency_seconds must be positive when provided.")
         if latency_value_usd_per_second < 0:
             raise ValueError("latency_value_usd_per_second cannot be negative.")
-        row = self._ensure_route(
-            route=route,
-            prompt=prompt,
-            models=models,
-            quality_threshold=target_accuracy,
-            catalog_revision=catalog_revision,
-            target_max_tokens=max_tokens,
-            request_options=request_options,
-        )
+        input_messages = _input_messages(input)
+        active_modalities = tuple(sorted(required_input_modalities(input_messages)))
+        row: Mapping[str, Any]
+        if route_version is not None:
+            row = self.require_version(route, route_version, prompt=prompt)
+        else:
+            row = self._ensure_route(
+                route=route,
+                prompt=prompt,
+                models=models,
+                quality_threshold=target_accuracy,
+                catalog_revision=catalog_revision,
+                target_max_tokens=max_tokens,
+                request_options=request_options,
+                input_modalities=active_modalities,
+            )
         set_performance_policy = getattr(self.client.transport, "set_performance_policy", None)
         if callable(set_performance_policy):
             set_performance_policy(
                 preferred_max_latency_seconds=max_p90_latency_seconds,
                 provider_sort=("latency" if latency_value_usd_per_second > 0 else "price"),
             )
-        input_text = _content(input)
+        input_text = _content(input_messages)
         tested_options = normalize_request_options(
             json.loads(row["tested_request_options_json"] or "{}")
         )
@@ -843,6 +1242,9 @@ class DurableRouter:
             or request_options_fingerprint(tested_options)
         )
         active_options_hash = request_options_fingerprint(active_options)
+        tested_modalities = tuple(
+            json.loads(row["tested_input_modalities_json"] or '["text"]')
+        )
         tested_max_tokens = int(row["target_max_tokens"] or 600)
         active_max_tokens = (
             tested_max_tokens if max_tokens is None else int(max_tokens)
@@ -852,9 +1254,10 @@ class DurableRouter:
         envelope_drift = (
             active_options_hash != tested_options_hash
             or active_max_tokens != tested_max_tokens
+            or set(active_modalities) != set(tested_modalities)
         )
         drift_message = (
-            "This Evalt call overrides the OpenRouter request settings used to "
+            "This Evalt call changes the request settings or input modalities used to "
             "qualify the route; the saved accuracy result does not validate this response."
         )
         if envelope_drift and strict_request_options:
@@ -871,19 +1274,11 @@ class DurableRouter:
                     "request_options_sha256": active_options_hash,
                     "tested_max_tokens": tested_max_tokens,
                     "requested_max_tokens": active_max_tokens,
+                    "tested_input_modalities": list(tested_modalities),
+                    "input_modalities": list(active_modalities),
                     "quality_claim_applies": False,
                 })
         few_shot_messages = json.loads(row["selected_few_shot_json"] or "[]")
-        if isinstance(input, Mapping) and input.get("role"):
-            input_messages = [dict(input)]
-        elif (
-            isinstance(input, (list, tuple))
-            and input
-            and all(isinstance(item, Mapping) and item.get("role") for item in input)
-        ):
-            input_messages = [dict(item) for item in input]
-        else:
-            input_messages = [{"role": "user", "content": input}]
         messages = [
             {"role": "system", "content": row["selected_prompt"]},
             *few_shot_messages,
@@ -898,6 +1293,21 @@ class DurableRouter:
         )
         with self._db() as db:
             current = db.execute("SELECT * FROM routes WHERE route=?", (route,)).fetchone()
+            if route_version is not None and (
+                current is None
+                or str(current["current_package_id"] or "") != route_version
+            ):
+                current_package_id = (
+                    str(current["current_package_id"] or "")
+                    if current is not None
+                    else ""
+                )
+                raise self._route_version_error(
+                    route,
+                    route_version,
+                    current_package_id or None,
+                    "serving version changed before the provider call",
+                )
             controls = (
                 effective_price_ceiling_usd, price_policy, float(test_budget_usd),
                 objective, test_budget_policy, max_p90_latency_seconds,
@@ -909,11 +1319,25 @@ class DurableRouter:
                 current["test_budget_policy"], current["max_p90_latency_seconds"],
                 current["latency_value_usd_per_second"], current["optimize_prompt"],
             )
-            db.execute(
-                "UPDATE routes SET quality_threshold=?,max_cost_per_run_usd=?,price_policy=?,test_budget_usd=?,objective=?,test_budget_policy=?,max_p90_latency_seconds=?,latency_value_usd_per_second=?,optimize_prompt=?,updated_at=? WHERE route=?",
-                (float(target_accuracy), *controls, _now(), route),
-            )
-            if previous != controls:
+            if route_version is None:
+                db.execute(
+                    "UPDATE routes SET quality_threshold=?,max_cost_per_run_usd=?,price_policy=?,test_budget_usd=?,objective=?,test_budget_policy=?,max_p90_latency_seconds=?,latency_value_usd_per_second=?,optimize_prompt=?,updated_at=? WHERE route=?",
+                    (float(target_accuracy), *controls, _now(), route),
+                )
+            else:
+                db.execute(
+                    "UPDATE routes SET max_cost_per_run_usd=?,price_policy=?,"
+                    "test_budget_usd=?,test_budget_policy=?,updated_at=? WHERE route=?",
+                    (
+                        effective_price_ceiling_usd,
+                        price_policy,
+                        float(test_budget_usd),
+                        test_budget_policy,
+                        _now(),
+                        route,
+                    ),
+                )
+            if route_version is None and previous != controls:
                 self._event(db, route, "routing_policy_configured", {
                     "price_usd": max_cost_per_run_usd,
                     "effective_price_ceiling_usd": effective_price_ceiling_usd,
@@ -926,7 +1350,10 @@ class DurableRouter:
                     "latency_value_usd_per_second": latency_value_usd_per_second,
                     "optimize_prompt": bool(optimize_prompt),
                 })
-            row = db.execute("SELECT * FROM routes WHERE route=?", (route,)).fetchone()
+            if route_version is None:
+                row = db.execute(
+                    "SELECT * FROM routes WHERE route=?", (route,)
+                ).fetchone()
         if estimate > effective_price_ceiling_usd + 1e-12:
             raise BudgetExceeded(
                 f"The selected route estimates ${estimate:.6f}, above this call's ${effective_price_ceiling_usd:.6f} price ceiling."
@@ -949,8 +1376,15 @@ class DurableRouter:
         call_id = f"call-{uuid.uuid4().hex}"
         with self._db() as db:
             db.execute(
-                "INSERT INTO calls(call_id,route,created_at,input_text,output_text,model,prompt_version,provider_cost_usd,budget_usd,decision_reason,request_options_sha256,request_envelope_validated) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-                (call_id, route, _now(), input_text, completion.content, completion.model, row["prompt_version"], completion.cost_usd, effective_price_ceiling_usd, row["decision_reason"], active_options_hash, int(not envelope_drift)),
+                "INSERT INTO calls(call_id,route,created_at,input_text,output_text,model,prompt_version,provider_cost_usd,budget_usd,decision_reason,request_options_sha256,request_envelope_validated,input_replayable,latency_ms) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    call_id, route, _now(), input_text, completion.content,
+                    completion.model, row["prompt_version"], completion.cost_usd,
+                    effective_price_ceiling_usd, row["decision_reason"],
+                    active_options_hash, int(not envelope_drift),
+                    int("image" not in active_modalities),
+                    max(0, int(completion.latency_ms or 0)),
+                ),
             )
             db.execute("UPDATE routes SET total_calls=total_calls+1,updated_at=? WHERE route=?", (_now(), route))
             current = db.execute("SELECT * FROM routes WHERE route=?", (route,)).fetchone()
@@ -964,6 +1398,7 @@ class DurableRouter:
             prompt_version=row["prompt_version"],
             decision_reason=row["decision_reason"],
             maintenance_due=due,
+            route_version=str(route_version or row["current_package_id"] or ""),
             route_phase=(
                 _route_phase(row)
             ),
@@ -1002,15 +1437,21 @@ class DurableRouter:
                 "INSERT OR REPLACE INTO feedback(call_id,route,verdict,approved_output,created_at) VALUES (?,?,?,?,?)",
                 (call_id, call["route"], verdict, approved_output, _now()),
             )
-            if existed is None:
+            replayable = bool(call["input_replayable"])
+            if existed is None and replayable:
                 db.execute("UPDATE routes SET feedback_count=feedback_count+1,updated_at=? WHERE route=?", (_now(), call["route"]))
-            self._event(db, call["route"], "feedback_recorded", {"call_id": call_id, "verdict": verdict})
+            self._event(db, call["route"], "feedback_recorded", {
+                "call_id": call_id,
+                "verdict": verdict,
+                "replayable_for_maintenance": replayable,
+            })
             row = db.execute("SELECT * FROM routes WHERE route=?", (call["route"],)).fetchone()
             return {
                 "event": "feedback_recorded",
                 "route": call["route"],
                 "verdict": verdict,
                 "is_new": existed is None,
+                "replayable_for_maintenance": replayable,
                 "feedback_count": int(row["feedback_count"]),
                 "min_feedback": int(min_feedback),
                 "maintenance_due": list(
@@ -1043,7 +1484,7 @@ class DurableRouter:
                 if row is None:
                     raise KeyError(f"Unknown Evalt route {route!r}.")
                 feedback = db.execute(
-                    "SELECT calls.input_text,calls.output_text,feedback.approved_output,feedback.verdict FROM feedback JOIN calls USING(call_id) WHERE feedback.route=? AND calls.prompt_version=? ORDER BY feedback.created_at",
+                    "SELECT calls.input_text,calls.output_text,feedback.approved_output,feedback.verdict FROM feedback JOIN calls USING(call_id) WHERE feedback.route=? AND calls.prompt_version=? AND calls.input_replayable=1 ORDER BY feedback.created_at",
                     (route, row["source_prompt_version"]),
                 ).fetchall()
             if len(feedback) < min_feedback:
@@ -1127,6 +1568,9 @@ class DurableRouter:
             with self._db() as db:
                 current = db.execute("SELECT * FROM routes WHERE route=?", (route,)).fetchone()
                 detail = {
+                    "quality_gate_status": (
+                        "QUALIFIED_ROUTE_SELECTED" if promoted else "NO_QUALIFIED_ROUTE"
+                    ),
                     "role_plan": role_plan.to_dict(),
                     "judge_calibration_spend_usd": maintenance_budget.spent_usd,
                     "optimization_spend_usd": result.total_provider_spend_usd,
@@ -1145,6 +1589,22 @@ class DurableRouter:
                     "latency_value_usd_per_second": row["latency_value_usd_per_second"],
                     "representative_input_chars_p90": representative_input_chars,
                     "representative_output_tokens_p90": representative_output_tokens,
+                    "suite_hash": result.regression_suite.get("suite_hash"),
+                    "evaluator_contract_hash": _hash(json.dumps(
+                        {
+                            "evaluator": result.regression_suite.get("evaluator") or {
+                                "type": "semantic"
+                            },
+                            "evaluator_model": role_plan.judge_model,
+                            "contract_version": 1,
+                        },
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )),
+                    "evaluator_type": str(
+                        (result.regression_suite.get("evaluator") or {}).get("type")
+                        or "semantic"
+                    ),
                 }
                 if promoted:
                     selected_ids = set(winner.few_shot_example_ids)
@@ -1173,6 +1633,10 @@ class DurableRouter:
                             route,
                         ),
                     )
+                    package_id = self._capture_package(
+                        db, route, activation_reason="maintenance_promotion"
+                    )
+                    detail["package_id"] = package_id
                     self._event(db, route, "route_promoted", detail)
                 else:
                     db.execute(
@@ -1193,6 +1657,16 @@ class DurableRouter:
                 {"created_at": item["created_at"], "event_type": item["event_type"], "detail": json.loads(item["detail_json"])}
                 for item in db.execute("SELECT * FROM decisions WHERE route=? ORDER BY created_at", (route,))
             ]
+            call_metrics = list(db.execute(
+                "SELECT provider_cost_usd,latency_ms FROM calls WHERE route=? ORDER BY created_at",
+                (route,),
+            ))
+            packages = self._list_versions(db, route)
+        last_test_summary = json.loads(row["last_test_summary_json"] or "{}")
+        production_latencies = [int(item["latency_ms"] or 0) for item in call_metrics]
+        candidate_models = list(last_test_summary.get("candidate_models") or [])
+        if not candidate_models:
+            candidate_models = list(json.loads(row["candidates_json"] or "[]"))
         return {
             "schema": "evalt-route-audit-v1",
             "route": route,
@@ -1207,7 +1681,7 @@ class DurableRouter:
                     "few_shot_examples", 0
                 )
             ),
-            "last_test_summary": json.loads(row["last_test_summary_json"] or "{}"),
+            "last_test_summary": last_test_summary,
             "price_usd": (
                 row["max_cost_per_run_usd"]
                 if row["price_policy"] == "explicit" else None
@@ -1224,7 +1698,24 @@ class DurableRouter:
             "target_max_tokens": int(row["target_max_tokens"] or 600),
             "tested_request_options": json.loads(row["tested_request_options_json"] or "{}"),
             "tested_request_options_sha256": row["tested_request_options_sha256"],
+            "tested_input_modalities": json.loads(
+                row["tested_input_modalities_json"] or '["text"]'
+            ),
+            "input_modalities": json.loads(
+                row["tested_input_modalities_json"] or '["text"]'
+            ),
+            "case_count": int(
+                last_test_summary.get("case_count")
+                or last_test_summary.get("final_test_scenarios")
+                or 0
+            ),
+            "candidate_models": candidate_models,
             "total_calls": row["total_calls"],
+            "production_cost_total_usd": round(sum(
+                float(item["provider_cost_usd"] or 0) for item in call_metrics
+            ), 10),
+            "production_latency_p50_ms": _percentile(production_latencies, 0.50),
+            "production_latency_p90_ms": _percentile(production_latencies, 0.90),
             "feedback_count": row["feedback_count"],
             "feedback_needed_for_first_test": max(
                 0, int(min_feedback) - int(row["feedback_count"])
@@ -1232,8 +1723,300 @@ class DurableRouter:
             "maintenance_due": list(self._due(row, retest_after_calls=retest_after_calls, min_feedback=min_feedback)),
             "catalog_revision": row["catalog_revision"],
             "tested_catalog_revision": row["tested_catalog_revision"],
+            "current_package_id": row["current_package_id"],
+            "qualified_package_count": len(packages),
+            "recent_route_versions": packages[:5],
             "decisions": decisions,
         }
+
+    @staticmethod
+    def _version_summary(
+        package: Mapping[str, Any], current_package_id: str
+    ) -> dict[str, Any]:
+        base = {
+            "package_id": str(package["package_id"]),
+            "alias": str(package["alias"] or ""),
+            "note": str(package["note"] or ""),
+            "annotation_updated_at": (
+                str(package["annotation_updated_at"])
+                if package["annotation_updated_at"] else None
+            ),
+            "activated_at": str(package["created_at"]),
+            "activation_reason": str(package["activation_reason"]),
+            "rollback_of_package_id": (
+                str(package["rollback_of_package_id"])
+                if package["rollback_of_package_id"] else None
+            ),
+            "current": str(package["package_id"]) == current_package_id,
+        }
+        try:
+            snapshot = json.loads(str(package["snapshot_json"]))
+        except (TypeError, json.JSONDecodeError):
+            return {
+                **base,
+                "restorable": False,
+                "problem": "Stored package metadata is damaged.",
+            }
+        if (
+            not isinstance(snapshot, Mapping)
+            or any(field not in snapshot for field in _PACKAGE_FIELDS)
+            or not DurableRouter._qualified_snapshot(snapshot)
+        ):
+            return {
+                **base,
+                "restorable": False,
+                "problem": "Stored package is incomplete or not qualified.",
+            }
+        summary = json.loads(str(snapshot.get("last_test_summary_json") or "{}"))
+        return {
+            **base,
+            "restorable": True,
+            "selected_model": str(snapshot.get("selected_model") or ""),
+            "prompt_version": str(snapshot.get("prompt_version") or ""),
+            "evidence_provenance": str(snapshot.get("evidence_provenance") or ""),
+            "holdout_pass_rate": summary.get("holdout_pass_rate"),
+            "final_test_accuracy_lower_bound": summary.get(
+                "final_test_accuracy_lower_bound"
+            ),
+            "workflow_spend_usd": summary.get("workflow_spend_usd"),
+            "target_latency_p90_ms": summary.get("target_latency_p90_ms"),
+        }
+
+    def _list_versions(
+        self, db: sqlite3.Connection, route: str
+    ) -> list[dict[str, Any]]:
+        current = db.execute(
+            "SELECT current_package_id FROM routes WHERE route=?", (route,)
+        ).fetchone()
+        if current is None:
+            raise KeyError(f"Unknown Evalt route {route!r}.")
+        return [
+            self._version_summary(package, str(current["current_package_id"] or ""))
+            for package in db.execute(
+                "SELECT * FROM route_packages WHERE route=? "
+                "ORDER BY created_at DESC,package_id DESC",
+                (route,),
+            )
+        ]
+
+    def list_versions(self, route: str) -> list[dict[str, Any]]:
+        """List bounded metadata for immutable qualified packages; never provider calls."""
+
+        with self._db() as db:
+            return self._list_versions(db, route)
+
+    @staticmethod
+    def _validated_package_alias(alias: str) -> str:
+        value = str(alias).strip()
+        if not _PACKAGE_ALIAS_RE.fullmatch(value):
+            raise ValueError(
+                "alias must be 1-48 characters using lowercase letters, numbers, "
+                "'.', '_', or '-', and must start with a letter or number."
+            )
+        return value
+
+    @staticmethod
+    def _validated_package_note(note: str) -> str:
+        value = str(note).strip()
+        if len(value) > _PACKAGE_NOTE_MAX_LENGTH:
+            raise ValueError(
+                f"note must be {_PACKAGE_NOTE_MAX_LENGTH} characters or fewer."
+            )
+        if any(ord(character) < 32 for character in value):
+            raise ValueError("note cannot contain control characters.")
+        return value
+
+    def annotate_version(
+        self,
+        route: str,
+        package_id: str,
+        *,
+        alias: str | None = None,
+        note: str | None = None,
+        expected_alias: str | None = None,
+    ) -> dict[str, Any]:
+        """Set or clear private local annotations without changing a package."""
+
+        route_name = str(route).strip()
+        version_id = str(package_id).strip()
+        if not route_name:
+            raise ValueError("route must be a stable non-empty name.")
+        if not _PACKAGE_ID_RE.fullmatch(version_id):
+            raise ValueError("package_id must be an exact Evalt version such as rv_….")
+        if alias is None and note is None:
+            raise ValueError("Provide alias or note; use an empty value to clear it.")
+        new_alias = None if alias is None else (
+            "" if not str(alias).strip() else self._validated_package_alias(alias)
+        )
+        new_note = None if note is None else self._validated_package_note(note)
+        expected = None
+        if expected_alias is not None:
+            expected = (
+                ""
+                if not str(expected_alias).strip()
+                else self._validated_package_alias(expected_alias)
+            )
+
+        with self._db() as db:
+            current = db.execute(
+                "SELECT current_package_id FROM routes WHERE route=?", (route_name,)
+            ).fetchone()
+            if current is None:
+                raise KeyError(f"Unknown Evalt route {route_name!r}.")
+            package = db.execute(
+                "SELECT * FROM route_packages WHERE package_id=? AND route=?",
+                (version_id, route_name),
+            ).fetchone()
+            if package is None:
+                raise KeyError(
+                    f"Route {route_name!r} has no qualified package {version_id!r}."
+                )
+            summary = self._version_summary(
+                package, str(current["current_package_id"] or "")
+            )
+            if not summary.get("restorable"):
+                raise ValueError(
+                    "The stored route package is damaged or not qualified; "
+                    "annotations were not changed."
+                )
+            old_alias = str(package["alias"] or "")
+            old_note = str(package["note"] or "")
+            if expected is not None and expected != old_alias:
+                raise RuntimeError(
+                    "The version alias changed concurrently; reload the version list "
+                    "before retrying."
+                )
+            resolved_alias = old_alias if new_alias is None else new_alias
+            resolved_note = old_note if new_note is None else new_note
+            if resolved_alias == old_alias and resolved_note == old_note:
+                return summary
+            collision = db.execute(
+                "SELECT package_id FROM route_packages "
+                "WHERE route=? AND alias=? AND package_id<>?",
+                (route_name, resolved_alias, version_id),
+            ).fetchone() if resolved_alias else None
+            if collision is not None:
+                raise ValueError(
+                    f"Alias {resolved_alias!r} already names another version of "
+                    f"route {route_name!r}."
+                )
+            updated_at = _now()
+            try:
+                changed = db.execute(
+                    "UPDATE route_packages SET alias=?,note=?,annotation_updated_at=? "
+                    "WHERE package_id=? AND route=? AND alias=? AND note=?",
+                    (
+                        resolved_alias,
+                        resolved_note,
+                        updated_at,
+                        version_id,
+                        route_name,
+                        old_alias,
+                        old_note,
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise ValueError(
+                    f"Alias {resolved_alias!r} already names another version of "
+                    f"route {route_name!r}."
+                ) from exc
+            if changed.rowcount != 1:
+                raise RuntimeError(
+                    "The version annotation changed concurrently; reload the version "
+                    "list before retrying."
+                )
+            self._event(
+                db,
+                route_name,
+                "qualified_package_annotation_changed",
+                {
+                    "package_id": version_id,
+                    "alias_changed": resolved_alias != old_alias,
+                    "note_changed": resolved_note != old_note,
+                    "provider_call_started": False,
+                },
+            )
+            refreshed = db.execute(
+                "SELECT * FROM route_packages WHERE package_id=? AND route=?",
+                (version_id, route_name),
+            ).fetchone()
+            return self._version_summary(
+                refreshed, str(current["current_package_id"] or "")
+            )
+
+    def _resolve_version_reference(
+        self, db: sqlite3.Connection, route: str, reference: str
+    ) -> sqlite3.Row:
+        value = str(reference).strip()
+        if _PACKAGE_ID_RE.fullmatch(value):
+            package = db.execute(
+                "SELECT * FROM route_packages WHERE package_id=? AND route=?",
+                (value, route),
+            ).fetchone()
+            if package is None:
+                raise KeyError(
+                    f"Route {route!r} has no qualified package {value!r}."
+                )
+            return package
+        alias = self._validated_package_alias(value)
+        matches = db.execute(
+            "SELECT * FROM route_packages WHERE route=? AND alias=? "
+            "ORDER BY created_at DESC,package_id DESC",
+            (route, alias),
+        ).fetchall()
+        if not matches:
+            raise KeyError(
+                f"Route {route!r} has no qualified package or alias {alias!r}."
+            )
+        if len(matches) != 1:
+            raise ValueError(
+                f"Alias {alias!r} is ambiguous for route {route!r}; use an exact rv_ ID."
+            )
+        return matches[0]
+
+    def rollback(self, route: str, package_id: str) -> dict[str, Any]:
+        """Atomically restore one qualified local package without calling a provider."""
+
+        with self._db() as db:
+            current = db.execute(
+                "SELECT * FROM routes WHERE route=?", (route,)
+            ).fetchone()
+            if current is None:
+                raise KeyError(f"Unknown Evalt route {route!r}.")
+            package = self._resolve_version_reference(db, route, package_id)
+            resolved_package_id = str(package["package_id"])
+            if str(current["current_package_id"] or "") == resolved_package_id:
+                raise ValueError("That qualified package is already serving.")
+            try:
+                snapshot = json.loads(str(package["snapshot_json"]))
+            except json.JSONDecodeError as error:
+                raise ValueError("The stored route package is damaged; no changes were made.") from error
+            if not isinstance(snapshot, Mapping) or not self._qualified_snapshot(snapshot):
+                raise ValueError("The stored route package is not qualified; no changes were made.")
+            missing = [field for field in _PACKAGE_FIELDS if field not in snapshot]
+            if missing:
+                raise ValueError("The stored route package is incomplete; no changes were made.")
+            assignments = ",".join(f"{field}=?" for field in _PACKAGE_FIELDS)
+            db.execute(
+                f"UPDATE routes SET {assignments},updated_at=? WHERE route=?",
+                (*[snapshot[field] for field in _PACKAGE_FIELDS], _now(), route),
+            )
+            new_package_id = self._capture_package(
+                db,
+                route,
+                activation_reason="rollback",
+                rollback_of_package_id=resolved_package_id,
+            )
+            detail = {
+                "package_id": new_package_id,
+                "restored_package_id": resolved_package_id,
+                "previous_package_id": str(current["current_package_id"] or ""),
+                "selected_model": str(snapshot["selected_model"]),
+                "prompt_version": str(snapshot["prompt_version"]),
+                "provider_call_started": False,
+            }
+            self._event(db, route, "route_rolled_back", detail)
+            return detail
 
     def list_routes(self) -> tuple[str, ...]:
         """Return durable route names without reading prompts, calls, or outputs."""
@@ -1252,5 +2035,5 @@ class DurableRouter:
 
 __all__ = [
     "DEFAULT_TARGETS", "DurableRouter", "RequestEnvelopeDriftWarning",
-    "RolePlan", "RoutedAnswer", "select_role_plan",
+    "RouteVersionMismatch", "RolePlan", "RoutedAnswer", "select_role_plan",
 ]

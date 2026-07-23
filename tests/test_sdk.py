@@ -1,8 +1,10 @@
+import base64
 import hashlib
 from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 import json
 import os
+import ssl
 import sqlite3
 from contextlib import nullcontext, redirect_stderr, redirect_stdout
 from io import StringIO
@@ -14,7 +16,7 @@ import unittest
 from unittest import mock
 from urllib.error import HTTPError
 
-from evalt import BudgetExceeded, Client, Evalt, Example, ProviderError, RequestEnvelopeDriftWarning, Suite, check_result, compare_results, render_comparison_html, render_html_report, render_junit_report, select_role_plan
+from evalt import BudgetExceeded, Client, Evalt, Example, ImageInput, ProviderError, RequestEnvelopeDriftWarning, RouteVersionMismatch, Suite, check_regression, check_result, compare_results, multimodal_input, render_comparison_html, render_html_report, render_junit_report, select_role_plan
 from evalt.cli import STARTER_SUITE, main as cli_main, parser as cli_parser
 from evalt.acceptance import AcceptanceFailure, redact_trace, validate_auto_first_route_receipt
 from evalt.core import Completion, OpenRouterTransport, _automatic_target_max_tokens, _is_closed_label_contract, _safe_provider_error_detail
@@ -111,7 +113,7 @@ class DashboardBridgeTests(unittest.TestCase):
         self.assertNotIn(first, fingerprint)
 
     def test_connection_config_is_private_and_removable(self):
-        with TemporaryDirectory() as directory:
+        with TemporaryDirectory(ignore_cleanup_errors=True) as directory:
             state = Path(directory) / ".evalt" / "evalt.db"
             token = generate_workspace_token()
             with mock.patch.dict(os.environ, {"EVALT_CONFIG_HOME": str(Path(directory) / "global")}, clear=False):
@@ -138,6 +140,31 @@ class DashboardBridgeTests(unittest.TestCase):
         self.assertEqual(request.get_header("Authorization"), f"Bearer {token}")
         self.assertNotIn(token, json.dumps(result))
 
+    def test_workspace_https_uses_a_verified_certifi_context(self):
+        token = generate_workspace_token()
+        response = mock.MagicMock()
+        response.__enter__.return_value = response
+        response.read.return_value = b"[]"
+        opened = mock.Mock(return_value=response)
+        result = inspect_workspace(token, api_url="https://api.example", opener=opened)
+        self.assertTrue(result["hosted_reachable"])
+        context = opened.call_args.kwargs["context"]
+        self.assertEqual(context.verify_mode, ssl.CERT_REQUIRED)
+        self.assertTrue(context.check_hostname)
+
+    def test_workspace_sync_https_uses_the_same_verified_certifi_context(self):
+        token = generate_workspace_token()
+        response = mock.MagicMock()
+        response.__enter__.return_value = response
+        response.status = 200
+        opened = mock.Mock(return_value=response)
+        sync = WorkspaceSync(token)
+        with mock.patch("evalt.dashboard.urlopen", opened):
+            sync._send("POST", "/api/workspace/routes/example/sync", {"events": []})
+        context = opened.call_args.kwargs["context"]
+        self.assertEqual(context.verify_mode, ssl.CERT_REQUIRED)
+        self.assertTrue(context.check_hostname)
+
     def test_user_wide_connection_follows_scripts_across_project_folders(self):
         with TemporaryDirectory() as directory:
             token = generate_workspace_token()
@@ -156,16 +183,82 @@ class DashboardBridgeTests(unittest.TestCase):
             "prompt": "private prompt", "input": "private input", "output": "private output",
             "api_key": "secret", "validation_pass_rate": 1.0,
             "error": "provider echoed private prompt",
+            "route_version": "rv_" + "a" * 20,
         })
         self.assertEqual(event["validation_pass_rate"], 1.0)
+        self.assertEqual(event["route_version"], "rv_" + "a" * 20)
         self.assertFalse({"prompt", "input", "output", "api_key"} & set(event))
         self.assertNotIn("private prompt", event["error"])
         snapshot = sanitize_route_snapshot({
             "route": "support", "selected_model": "cheap", "target_accuracy": 0.95,
+            "input_modalities": ["text", "image"], "case_count": 6,
+            "candidate_models": ["vision-a", "vision-b"],
+            "production_cost_total_usd": 0.0123,
+            "production_latency_p50_ms": 420,
+            "production_latency_p90_ms": 780,
+            "current_package_id": "rv_" + "a" * 20,
+            "qualified_package_count": 2,
+            "recent_route_versions": [{
+                "package_id": "rv_" + "a" * 20,
+                "alias": "private-known-good",
+                "note": "private operator note",
+                "annotation_updated_at": "2026-07-23T12:01:00Z",
+                "activated_at": "2026-07-23T12:00:00Z",
+                "activation_reason": "initial_qualification",
+                "current": True,
+                "selected_model": "vision-a",
+                "prompt_version": "abc123",
+                "evidence_provenance": "AI_GENERATED_AI_JUDGED",
+                "holdout_pass_rate": 1.0,
+                "snapshot_json": '{"selected_prompt":"private"}',
+                "selected_prompt": "private",
+            }, {
+                "package_id": "not-a-package",
+                "selected_model": "must-not-survive",
+            }],
             "selected_prompt": "private", "tested_request_options": {"temperature": 0},
-            "last_test_summary": {"holdout_pass_rate": 1.0, "winner_prompt": "private"},
+            "last_test_summary": {
+                "holdout_pass_rate": 1.0,
+                "workflow_spend_usd": 0.004,
+                "tested_configurations": 2,
+                "prompt_candidates_tested": 4,
+                "prompt_rewrites_tested": 2,
+                "winner_prompt": "private",
+                "suite_hash": "a" * 64,
+                "evaluator_contract_hash": "b" * 64,
+                "evaluator_type": "semantic",
+            },
         })
-        self.assertEqual(snapshot["last_test_summary"], {"holdout_pass_rate": 1.0})
+        self.assertEqual(snapshot["last_test_summary"]["holdout_pass_rate"], 1.0)
+        self.assertNotIn("winner_prompt", snapshot["last_test_summary"])
+        self.assertEqual(snapshot["input_modalities"], ["text", "image"])
+        self.assertEqual(snapshot["case_count"], 6)
+        self.assertEqual(snapshot["candidate_models"], ["vision-a", "vision-b"])
+        self.assertEqual(snapshot["production_cost_total_usd"], 0.0123)
+        self.assertEqual(snapshot["production_latency_p50_ms"], 420)
+        self.assertEqual(snapshot["production_latency_p90_ms"], 780)
+        self.assertEqual(snapshot["current_package_id"], "rv_" + "a" * 20)
+        self.assertEqual(snapshot["qualified_package_count"], 2)
+        self.assertEqual(len(snapshot["recent_route_versions"]), 1)
+        self.assertEqual(
+            snapshot["recent_route_versions"][0]["selected_model"], "vision-a"
+        )
+        self.assertNotIn(
+            "snapshot_json", snapshot["recent_route_versions"][0]
+        )
+        self.assertNotIn(
+            "selected_prompt", snapshot["recent_route_versions"][0]
+        )
+        self.assertNotIn("alias", snapshot["recent_route_versions"][0])
+        self.assertNotIn("note", snapshot["recent_route_versions"][0])
+        self.assertNotIn(
+            "annotation_updated_at", snapshot["recent_route_versions"][0]
+        )
+        self.assertEqual(snapshot["last_test_summary"]["workflow_spend_usd"], 0.004)
+        self.assertEqual(snapshot["last_test_summary"]["tested_configurations"], 2)
+        self.assertEqual(snapshot["last_test_summary"]["evaluator_type"], "semantic")
+        self.assertNotIn("suite_hash", snapshot["last_test_summary"])
+        self.assertNotIn("evaluator_contract_hash", snapshot["last_test_summary"])
         self.assertNotIn("selected_prompt", snapshot)
         self.assertNotIn("tested_request_options", snapshot)
 
@@ -238,6 +331,53 @@ class DashboardBridgeTests(unittest.TestCase):
         self.assertEqual(payload["snapshot"]["selected_model"], "cheap")
         self.assertEqual(payload["events"][0]["event"], "production_call_completed")
 
+    def test_workspace_sync_keys_contract_lineage_without_uploading_local_hashes(self):
+        sent = []
+        token = generate_workspace_token()
+        sync = WorkspaceSync(
+            token, api_url="https://api.example",
+            sender=lambda method, path, payload: sent.append(payload),
+        )
+        sync.publish_route({
+            "route": "support",
+            "selected_model": "cheap",
+            "last_test_summary": {
+                "suite_hash": "a" * 64,
+                "evaluator_contract_hash": "b" * 64,
+                "evaluator_type": "semantic",
+            },
+        })
+        self.assertTrue(sync.flush())
+        summary = sent[0]["snapshot"]["last_test_summary"]
+        self.assertRegex(summary["suite_contract_id"], r"^suite_[0-9a-f]{24}$")
+        self.assertRegex(
+            summary["evaluator_contract_id"], r"^evaluator_[0-9a-f]{24}$"
+        )
+        self.assertEqual(summary["evaluator_type"], "semantic")
+        encoded = json.dumps(sent[0])
+        self.assertNotIn("a" * 64, encoded)
+        self.assertNotIn("b" * 64, encoded)
+        self.assertNotIn("suite_hash", encoded)
+        self.assertNotIn("evaluator_contract_hash", encoded)
+
+        other = []
+        other_sync = WorkspaceSync(
+            generate_workspace_token(), api_url="https://api.example",
+            sender=lambda method, path, payload: other.append(payload),
+        )
+        other_sync.publish_route({
+            "route": "support",
+            "last_test_summary": {
+                "suite_hash": "a" * 64,
+                "evaluator_contract_hash": "b" * 64,
+            },
+        })
+        self.assertTrue(other_sync.flush())
+        self.assertNotEqual(
+            summary["suite_contract_id"],
+            other[0]["snapshot"]["last_test_summary"]["suite_contract_id"],
+        )
+
     def test_one_burst_keeps_two_local_routes_isolated(self):
         sent = []
         sync = WorkspaceSync(
@@ -264,13 +404,21 @@ class DashboardBridgeTests(unittest.TestCase):
 
     def test_dashboard_only_connection_receives_detailed_optimizer_progress(self):
         class CapturingSync:
-            def __init__(self): self.events = []
+            def __init__(self): self.events = []; self.routes = []; self.flush_calls = 0
             def publish_event(self, value): self.events.append(dict(value))
-            def publish_route(self, _value): pass
-            def flush(self, _timeout_seconds): return True
+            def publish_route(self, value): self.routes.append(dict(value))
+            def flush(self, _timeout_seconds): self.flush_calls += 1; return True
 
         sync = CapturingSync()
-        result = mock.Mock(regression_suite={}, warnings=[])
+        winner = mock.Mock(
+            model="cheap", holdout_pass_rate=1.0, holdout_unique_scenarios=1,
+            holdout_executions=1, final_test_evidence_status="PROVISIONAL_SMALL_FINAL_TEST",
+            target_accuracy_statistically_supported=False,
+        )
+        result = mock.Mock(
+            regression_suite={}, warnings=[], winner=winner,
+            quality_gate_status="QUALIFIED_ROUTE_SELECTED", total_provider_spend_usd=0.001,
+        )
         suite = Suite(
             name="dashboard-deep-progress",
             prompt="Return the approved route label only.",
@@ -305,6 +453,10 @@ class DashboardBridgeTests(unittest.TestCase):
         self.assertEqual(sync.events[-1]["run_state"], "completed")
         self.assertTrue(sync.events[-1]["run_finished_at"])
         self.assertEqual(len({item["run_id"] for item in sync.events}), 1)
+        self.assertEqual(sync.routes[0]["input_modalities"], ["text"])
+        self.assertEqual(sync.routes[0]["case_count"], len(EXAMPLES))
+        self.assertEqual(sync.routes[0]["candidate_models"], ["cheap"])
+        self.assertEqual(sync.flush_calls, 1)
 
     def test_connect_cli_saves_the_capability_without_printing_it(self):
         with TemporaryDirectory() as directory:
@@ -409,6 +561,25 @@ class DashboardBridgeTests(unittest.TestCase):
             self.assertNotIn(token, output.getvalue())
             opened.assert_not_called()
 
+    def test_root_status_alias_is_safe_and_does_not_open_browser(self):
+        with TemporaryDirectory() as directory:
+            state = Path(directory) / ".evalt" / "evalt.db"
+            token = generate_workspace_token()
+            global_home = Path(directory) / "global"
+            with mock.patch.dict(os.environ, {"EVALT_CONFIG_HOME": str(global_home)}, clear=False):
+                save_dashboard_config(token, app_url="https://app.example")
+                output = StringIO()
+                with mock.patch("evalt.cli.webbrowser.open") as opened, mock.patch(
+                    "evalt.cli.inspect_workspace",
+                    return_value={"hosted_reachable": True, "remote_route_count": 0, "hosted_error": None},
+                ), redirect_stdout(output):
+                    self.assertEqual(cli_main(["--status"]), 0)
+            payload = json.loads(output.getvalue())
+            self.assertEqual(payload["workspace_id"], workspace_fingerprint(token))
+            self.assertFalse(payload["opened"])
+            self.assertNotIn(token, output.getvalue())
+            opened.assert_not_called()
+
     def test_doctor_explains_when_existing_local_routes_are_not_online(self):
         with TemporaryDirectory() as directory:
             state = Path(directory) / ".evalt" / "evalt.db"
@@ -428,7 +599,38 @@ class DashboardBridgeTests(unittest.TestCase):
             self.assertEqual(payload["local_route_count"], 1)
             self.assertEqual(payload["remote_route_count"], 0)
             self.assertIn("--sync-existing", payload["next"])
+            self.assertIn(str(state.resolve()), payload["next"])
             self.assertNotIn(token, output.getvalue())
+
+    def test_doctor_warns_when_path_entrypoint_is_an_older_installation(self):
+        completed = mock.Mock(returncode=0, stdout="evalt 0.10.6\n", stderr="")
+        output = StringIO()
+        with mock.patch("evalt.cli.shutil.which", return_value="/old/bin/evalt"), mock.patch(
+            "evalt.cli.subprocess.run", return_value=completed,
+        ), redirect_stdout(output):
+            self.assertEqual(cli_main(["doctor"]), 0)
+        payload = json.loads(output.getvalue())
+        self.assertEqual(payload["console_entrypoint_version"], "0.10.6")
+        self.assertFalse(payload["console_entrypoint_matches_sdk"])
+        self.assertIn("PATH evalt command reports 0.10.6", payload["installation_warning"])
+        self.assertIn("-m evalt doctor", payload["same_interpreter_command"])
+
+    def test_doctor_repairs_an_old_sdk_and_split_interpreter_with_the_current_hosted_wheel(self):
+        output = StringIO()
+        with mock.patch("evalt.cli._sdk_version", return_value="0.10.19"), mock.patch(
+            "evalt.cli.shutil.which", return_value=None,
+        ), redirect_stdout(output):
+            self.assertEqual(cli_main(["doctor"]), 0)
+        payload = json.loads(output.getvalue())
+        self.assertEqual(payload["installed_sdk_version"], "0.10.19")
+        self.assertEqual(payload["hosted_sdk_version"], "0.10.28")
+        self.assertEqual(payload["hosted_wheel_url"], "https://evalt.onrender.com/python-sdk/dist/evalt-0.10.28-py3-none-any.whl")
+        self.assertTrue(payload["upgrade_required"])
+        self.assertIn("-r https://evalt.onrender.com/python-sdk/latest.txt", payload["same_interpreter_install_command"])
+        self.assertTrue(payload["same_interpreter_install_command"].startswith(f'"{payload["python_executable"]}" -m pip'))
+        self.assertIn("another Python installation", payload["installation_channel_note"])
+        self.assertIn("does not go stale", payload["installation_channel_note"])
+        self.assertNotIn("evw_", output.getvalue())
 
     def test_visible_progress_names_workspace_and_reports_sync_failure(self):
         class FailedSync:
@@ -459,6 +661,7 @@ class DashboardBridgeTests(unittest.TestCase):
             evalt = Evalt(
                 transport=FakeTransport(), show_progress=True,
                 state_path=Path(directory) / ".evalt" / "evalt.db",
+                dashboard_token="",
             )
             with redirect_stderr(output):
                 evalt.run(
@@ -681,6 +884,109 @@ class PortableReportTests(unittest.TestCase):
         self.assertFalse(comparison["comparable_contract"])
         self.assertIn("must not be used as a promotion gate", comparison["contract"]["warning"])
 
+    def test_regression_gate_passes_same_contract_without_quality_or_case_loss(self):
+        baseline = self.fixture()
+        candidate = json.loads(json.dumps(baseline))
+        report = check_regression(baseline, candidate)
+        self.assertTrue(report.passed)
+        self.assertTrue(report.comparable_contract)
+        self.assertEqual(report.quality_delta_percentage_points, 0.0)
+        self.assertEqual(report.regressions, 0)
+        self.assertNotIn("output", json.dumps(report.to_dict()).lower())
+
+    def test_zero_quality_is_not_replaced_by_a_secondary_pass_rate(self):
+        baseline = self.fixture()
+        candidate = json.loads(json.dumps(baseline))
+        candidate["winner"]["holdout_pass_rate"] = 0.0
+        candidate["winner"]["pass_rate"] = 1.0
+        comparison = compare_results(baseline, candidate)
+        self.assertEqual(comparison["candidate"]["quality"], 0.0)
+        self.assertFalse(check_result(candidate, min_pass_rate=0.95).passed)
+
+    def test_regression_gate_rejects_case_loss_even_above_absolute_floor(self):
+        baseline = self.fixture()
+        baseline["winner"]["cases"][0]["passed"] = True
+        baseline["winner"]["holdout_pass_rate"] = 0.97
+        candidate = json.loads(json.dumps(baseline))
+        candidate["winner"]["cases"][0]["passed"] = False
+        candidate["winner"]["holdout_pass_rate"] = 0.95
+        self.assertTrue(check_result(candidate, min_pass_rate=0.95).passed)
+        report = check_regression(baseline, candidate)
+        self.assertFalse(report.passed)
+        self.assertEqual(report.regressed_case_ids, ("final-1",))
+        self.assertIn("1 frozen case regression", report.failures[0])
+        self.assertTrue(any("quality changed -2.000" in item for item in report.failures))
+
+    def test_regression_gate_fails_closed_on_incompatible_or_missing_contract(self):
+        baseline = self.fixture()
+        candidate = json.loads(json.dumps(baseline))
+        candidate["regression_suite"]["suite_hash"] = "other"
+        report = check_regression(baseline, candidate)
+        self.assertFalse(report.passed)
+        self.assertFalse(report.comparable_contract)
+        self.assertIn("identical non-empty suite hashes", report.failures[0])
+        self.assertEqual(report.regressions, 0)
+
+    def test_regression_gate_applies_explicit_cost_and_latency_tolerances(self):
+        baseline = self.fixture()
+        baseline["winner"]["target_latency_p90_ms"] = 1000
+        candidate = json.loads(json.dumps(baseline))
+        candidate["winner"]["estimated_cost_per_successful_call_usd"] = 0.00025
+        candidate["winner"]["target_latency_p90_ms"] = 1125
+        report = check_regression(
+            baseline,
+            candidate,
+            max_cost_increase_percent=20,
+            max_p90_increase_ms=100,
+        )
+        self.assertFalse(report.passed)
+        self.assertAlmostEqual(report.cost_increase_percent, 25)
+        self.assertAlmostEqual(report.p90_increase_ms, 125)
+        self.assertEqual(len(report.failures), 2)
+
+    def test_cli_check_combines_absolute_and_baseline_gates_in_stable_json(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            baseline_path = root / "baseline.json"
+            candidate_path = root / "candidate.json"
+            baseline = self.fixture()
+            baseline["winner"]["cases"][0]["passed"] = True
+            candidate = json.loads(json.dumps(baseline))
+            candidate["winner"]["cases"][0]["passed"] = False
+            baseline_path.write_text(json.dumps(baseline), encoding="utf-8")
+            candidate_path.write_text(json.dumps(candidate), encoding="utf-8")
+            output = StringIO()
+            with redirect_stdout(output):
+                code = cli_main([
+                    "check",
+                    str(candidate_path),
+                    "--baseline",
+                    str(baseline_path),
+                    "--json",
+                ])
+            payload = json.loads(output.getvalue())
+            self.assertEqual(code, 1)
+            self.assertEqual(payload["schema"], "evalt-ci-gate-v2")
+            self.assertFalse(payload["passed"])
+            self.assertTrue(payload["absolute_gate"]["passed"])
+            self.assertEqual(payload["baseline_gate"]["regressions"], 1)
+            self.assertFalse(payload["provider_call_started"])
+
+    def test_cli_rejects_baseline_tolerances_without_a_baseline(self):
+        with TemporaryDirectory() as directory:
+            result_path = Path(directory) / "result.json"
+            result_path.write_text(json.dumps(self.fixture()), encoding="utf-8")
+            errors = StringIO()
+            with redirect_stderr(errors):
+                code = cli_main([
+                    "check",
+                    str(result_path),
+                    "--max-regressions",
+                    "1",
+                ])
+            self.assertEqual(code, 2)
+            self.assertIn("require --baseline", errors.getvalue())
+
     def test_cli_compare_writes_offline_json_and_escaped_html(self):
         with TemporaryDirectory() as directory:
             root = Path(directory)
@@ -774,6 +1080,57 @@ class EnvelopeTransport(FakeTransport):
         })
         return super().complete(
             model, messages, max_tokens=max_tokens, response_schema=response_schema
+        )
+
+
+class VisionTransport(FakeTransport):
+    def __init__(self, labels=None):
+        super().__init__()
+        self.labels = dict(labels or {})
+
+    def model_catalog(self):
+        return [
+            {"id": "text-only", "input_modalities": ["text"], "intelligence": 1},
+            {"id": "vision-bad", "input_modalities": ["text", "image"], "intelligence": 2},
+            {"id": "vision-good", "input_modalities": ["text", "image"], "intelligence": 3},
+        ]
+
+    def configuration_support(self, model, required_modalities=()):
+        supported = {"text"} if model == "text-only" else {"text", "image"}
+        missing = set(required_modalities) - supported
+        return {
+            "supported": not missing,
+            "reason": "missing " + ",".join(sorted(missing)) if missing else "fixture supports request",
+        }
+
+    def complete(
+        self, model, messages, *, max_tokens, response_schema=None,
+        request_options=None,
+    ):
+        self.calls.append((model, messages, max_tokens, response_schema))
+        content = messages[-1].get("content")
+        image_url = ""
+        if isinstance(content, list):
+            image_part = next(
+                (part for part in content if part.get("type") == "image_url"), None
+            )
+            if image_part:
+                image_url = image_part["image_url"]["url"]
+        label = "intact"
+        if image_url.startswith("data:"):
+            encoded = image_url.split(";base64,", 1)[1]
+            digest = hashlib.sha256(base64.b64decode(encoded)).hexdigest()
+            label = self.labels.get(digest, "intact")
+        if model == "vision-bad":
+            label = "damaged" if label == "intact" else "intact"
+        return Completion(
+            content=label,
+            model=model,
+            generation_id=f"vision-{len(self.calls)}",
+            cost_usd=self.estimate_cost(model, messages, max_tokens=max_tokens),
+            prompt_tokens=12,
+            completion_tokens=1,
+            latency_ms=250,
         )
 
 
@@ -1114,6 +1471,504 @@ EXAMPLES = [
 
 
 class SdkTests(unittest.TestCase):
+    _PNG_A = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC"
+    )
+    _PNG_B = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGNgYPgPAAEDAQAIicLsAAAAAElFTkSuQmCC"
+    )
+
+    def test_image_input_validates_files_urls_and_multipart_contract(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "sample.png"
+            path.write_bytes(self._PNG_A)
+            image = ImageInput.from_path(path, detail="high")
+            content = multimodal_input("Inspect this image.", image)
+            self.assertEqual(content[0], {"type": "text", "text": "Inspect this image."})
+            self.assertEqual(content[1]["type"], "image_url")
+            self.assertEqual(content[1]["image_url"]["detail"], "high")
+            self.assertTrue(content[1]["image_url"]["url"].startswith("data:image/png;base64,"))
+
+            remote = ImageInput.from_url("https://images.example/item.webp?token=private")
+            self.assertEqual(
+                remote.to_content_part()["image_url"]["url"],
+                "https://images.example/item.webp?token=private",
+            )
+            for invalid in (
+                "http://images.example/item.png",
+                "https://user:secret@images.example/item.png",
+                "file:///tmp/item.png",
+                "https://images.example/item.svg",
+            ):
+                with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                    ImageInput.from_url(invalid)
+            corrupt = Path(directory) / "corrupt.png"
+            corrupt.write_bytes(b"not a png")
+            with self.assertRaisesRegex(ValueError, "valid PNG"):
+                ImageInput.from_path(corrupt)
+
+            truncated = Path(directory) / "truncated.png"
+            truncated.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 25)
+            with self.assertRaisesRegex(ValueError, "PNG"):
+                ImageInput.from_path(truncated)
+            for media_type, payload in (
+                ("image/jpeg", b"\xff\xd8\xff\xe0\x00\x02\xff\xd9"),
+                ("image/gif", b"GIF89a" + b"\x00" * 8),
+                ("image/webp", b"RIFF\x0c\x00\x00\x00WEBPVP8 "),
+            ):
+                encoded = base64.b64encode(payload).decode("ascii")
+                with self.subTest(media_type=media_type), self.assertRaises(ValueError):
+                    ImageInput.from_url(f"data:{media_type};base64,{encoded}")
+
+    def test_image_payload_caps_fail_before_provider_work(self):
+        image = ImageInput.from_url(
+            "data:image/png;base64," + base64.b64encode(self._PNG_A).decode("ascii")
+        )
+        with mock.patch(
+            "last_good_prompt.core._MAX_IMAGE_REQUEST_BYTES",
+            len(self._PNG_A) * 2,
+        ):
+            with self.assertRaisesRegex(ValueError, "40 MiB"):
+                multimodal_input("Inspect all images.", image, image, image)
+
+        examples = tuple(
+            Example(
+                multimodal_input("Return intact.", image),
+                "intact",
+                f"image-{index}",
+            )
+            for index in range(3)
+        )
+        with mock.patch("evalt.core._MAX_SUITE_IMAGE_BYTES", len(self._PNG_A) * 2):
+            with self.assertRaisesRegex(ValueError, "suite can contain at most 40 MiB"):
+                Suite(
+                    name="oversized-image-suite",
+                    prompt="Inspect the supplied image and return intact.",
+                    examples=examples,
+                    models=("vision-good", "vision-bad"),
+                    evaluator={"type": "exact_text"},
+                    optimize_prompt=False,
+                    max_optimization_cost_usd=0.1,
+                ).validate()
+
+    def test_multimodal_suite_qualifies_versions_and_rolls_back_without_persisting_images(self):
+        with TemporaryDirectory(ignore_cleanup_errors=True) as directory:
+            labels = {}
+            examples = []
+            for index in range(25):
+                payload = self._PNG_A if index % 2 == 0 else self._PNG_B
+                label = "damaged" if index % 2 == 0 else "intact"
+                path = Path(directory) / f"case-{index}.png"
+                path.write_bytes(payload)
+                labels[hashlib.sha256(payload).hexdigest()] = label
+                examples.append(Example(
+                    multimodal_input(
+                        "Return exactly one label: damaged or intact.",
+                        ImageInput.from_path(path),
+                    ),
+                    label,
+                    f"case-{index}",
+                ))
+            transport = VisionTransport(labels)
+            suite = Suite(
+                name="image-condition",
+                prompt="Inspect the image. Return exactly one label: damaged or intact.",
+                examples=tuple(examples),
+                models=("text-only", "vision-bad", "vision-good"),
+                evaluator={"type": "exact_text"},
+                optimize_prompt=False,
+                adaptive_search=False,
+                holdout_repeats=1,
+                max_parallel_models=1,
+                max_parallel_scenarios=1,
+                max_optimization_cost_usd=0.10,
+                target_max_tokens=16,
+            )
+            state = Path(directory) / "evalt.db"
+            evalt = Evalt(
+                transport=transport, state_path=state, show_progress=False
+            )
+            result = evalt.qualify_route(suite, route="image-condition")
+            self.assertEqual(result.winner.model, "vision-good")
+            self.assertEqual(result.winner.holdout_pass_rate, 1.0)
+            self.assertIn("text-only", [item["model"] for item in result.omitted_configurations])
+            called_models = {model for model, _messages, _tokens, _schema in transport.calls}
+            self.assertNotIn("text-only", called_models)
+            self.assertTrue(all(
+                any(
+                    part.get("type") == "image_url"
+                    for part in messages[-1]["content"]
+                )
+                for model, messages, _tokens, _schema in transport.calls
+                if model.startswith("vision-")
+            ))
+            serialized = json.dumps(result.to_dict())
+            self.assertNotIn("data:image", serialized)
+            self.assertNotIn(str(Path(directory)), serialized)
+            self.assertTrue(all(
+                item["input_replayable"] is False
+                for item in result.regression_suite["examples"]
+            ))
+            status = evalt.route_status("image-condition")
+            self.assertEqual(status["route_phase"], "human_approved")
+            self.assertEqual(status["input_modalities"], ["image", "text"])
+            self.assertEqual(status["selected_few_shot_examples"], 0)
+            self.assertEqual(status["selected_few_shot_messages"], 0)
+            self.assertEqual(status["qualified_package_count"], 1)
+            first_package = status["current_package_id"]
+            calls_before_pinned_image = len(transport.calls)
+            pinned_image = evalt.run(
+                suite.prompt,
+                multimodal_input(
+                    "Return exactly one label: damaged or intact.",
+                    ImageInput.from_path(Path(directory) / "case-0.png"),
+                ),
+                route="image-condition",
+                route_version=first_package,
+                first_run="bootstrap",
+                test_budget_usd=0,
+            )
+            self.assertEqual(pinned_image.route_version, first_package)
+            self.assertEqual(pinned_image.content, "damaged")
+            self.assertEqual(len(transport.calls), calls_before_pinned_image + 1)
+            calls_after_qualification = len(transport.calls)
+            evalt.router.install_initial_result(
+                route="image-condition",
+                prompt=suite.prompt,
+                models=suite.models,
+                quality_threshold=suite.quality_threshold,
+                catalog_revision=status["tested_catalog_revision"],
+                result=result,
+                examples=suite.examples,
+                evidence_provenance=suite.evidence_provenance,
+                total_workflow_spend_usd=result.total_provider_spend_usd,
+                designer_model=suite.optimizer_model,
+                evaluator_model=suite.evaluator_model,
+                judge_calibration_checks=0,
+                target_max_tokens=suite.target_max_tokens,
+                request_options=suite.request_options,
+            )
+            self.assertEqual(len(transport.calls), calls_after_qualification)
+            self.assertEqual(
+                evalt.route_status("image-condition")["qualified_package_count"], 2
+            )
+            rollback = evalt.rollback_route("image-condition", first_package)
+            self.assertFalse(rollback["provider_call_started"])
+            self.assertEqual(len(transport.calls), calls_after_qualification)
+            with sqlite3.connect(state) as db:
+                route_payload = "\n".join(str(value) for value in db.execute(
+                    "SELECT selected_few_shot_json FROM routes"
+                ).fetchone())
+                package_payload = "\n".join(
+                    row[0] for row in db.execute(
+                        "SELECT snapshot_json FROM route_packages"
+                    ).fetchall()
+                )
+            self.assertNotIn("data:image", route_payload + package_payload)
+            self.assertNotIn(str(Path(directory)), route_payload + package_payload)
+
+    def test_image_input_is_bound_to_route_envelope_and_not_persisted_raw(self):
+        transport = VisionTransport()
+        with TemporaryDirectory(ignore_cleanup_errors=True) as directory:
+            state = Path(directory) / "evalt.db"
+            evalt = Evalt(transport=transport, state_path=state, show_progress=False)
+            evalt.run(
+                "Return exactly one label: damaged or intact.",
+                "No image was supplied.",
+                route="condition",
+                models=["vision-good"],
+                first_run="bootstrap",
+                test_budget_usd=0,
+            )
+            db = sqlite3.connect(state)
+            try:
+                db.execute(
+                    "UPDATE routes SET evidence_provenance='HUMAN_APPROVED', "
+                    "decision_reason='qualified_fixture' WHERE route='condition'"
+                )
+                db.commit()
+            finally:
+                db.close()
+            secret_url = "https://images.example/receipt.png?token=do-not-store"
+            with self.assertWarns(RequestEnvelopeDriftWarning):
+                answer = evalt.run(
+                    "Return exactly one label: damaged or intact.",
+                    multimodal_input("Inspect this receipt.", ImageInput.from_url(secret_url)),
+                    route="condition",
+                    models=["vision-good"],
+                    first_run="bootstrap",
+                    test_budget_usd=0,
+                )
+            self.assertFalse(answer.request_envelope_validated)
+            feedback = evalt.router.record_feedback(
+                answer.call_id,
+                approved_output="intact",
+                verdict="corrected",
+            )
+            self.assertFalse(feedback["replayable_for_maintenance"])
+            db = sqlite3.connect(state)
+            try:
+                stored, replayable = db.execute(
+                    "SELECT input_text,input_replayable FROM calls WHERE call_id=?",
+                    (answer.call_id,),
+                ).fetchone()
+            finally:
+                db.close()
+            self.assertEqual(replayable, 0)
+            self.assertNotIn("do-not-store", stored)
+            self.assertNotIn("https://", stored)
+            self.assertNotIn("base64", stored)
+            status = evalt.route_status("condition")
+            self.assertEqual(status["feedback_count"], 0)
+            self.assertEqual(status["production_latency_p50_ms"], 250)
+            self.assertEqual(status["production_latency_p90_ms"], 250)
+            self.assertGreater(status["production_cost_total_usd"], 0)
+            self.assertEqual(status["input_modalities"], ["text"])
+            before = len(transport.calls)
+            with self.assertRaisesRegex(ValueError, "does not validate"):
+                evalt.run(
+                    "Return exactly one label: damaged or intact.",
+                    multimodal_input("Inspect this receipt.", ImageInput.from_url(secret_url)),
+                    route="condition",
+                    models=["vision-good"],
+                    first_run="bootstrap",
+                    test_budget_usd=0,
+                    strict_request_options=True,
+                )
+            self.assertEqual(len(transport.calls), before)
+
+    def test_automatic_image_case_design_fails_before_provider_call(self):
+        transport = VisionTransport()
+        evalt = Evalt(transport=transport, show_progress=False)
+        with self.assertRaisesRegex(ValueError, "cannot invent image evidence"):
+            evalt.run(
+                "Return exactly one label: damaged or intact.",
+                multimodal_input(
+                    "Inspect this image.",
+                    ImageInput.from_url("https://images.example/item.png"),
+                ),
+                models=["vision-good"],
+                test_budget_usd=0.10,
+            )
+        self.assertEqual(transport.calls, [])
+
+    def test_openrouter_forwards_image_parts_with_privacy_controls(self):
+        sent = []
+
+        def opener(request, timeout):
+            if request.data is not None:
+                body = json.loads(request.data)
+                sent.append(body)
+                return FakeResponse({
+                    "id": "vision-generation",
+                    "choices": [{
+                        "finish_reason": "stop",
+                        "message": {"role": "assistant", "content": "intact"},
+                    }],
+                    "usage": {"cost": 0.0004, "prompt_tokens": 20, "completion_tokens": 1},
+                })
+            if "endpoints/zdr" in request.full_url:
+                return FakeResponse({"data": [{
+                    "model_id": "vision-model",
+                    "tag": "fixture/vision",
+                    "provider_name": "Fixture",
+                    "context_length": 8192,
+                    "max_completion_tokens": 1024,
+                    "pricing": {"prompt": "0.000001", "completion": "0.000002", "image": "0.000003"},
+                    "input_modalities": ["text", "image"],
+                    "supported_parameters": ["max_tokens"],
+                }]})
+            return FakeResponse({"data": [{
+                "id": "vision-model",
+                "architecture": {
+                    "input_modalities": ["text", "image"],
+                    "output_modalities": ["text"],
+                },
+                "context_length": 8192,
+                "pricing": {"prompt": "0.000001", "completion": "0.000002", "image": "0.000003"},
+                "supported_parameters": ["max_tokens"],
+            }]})
+
+        image = ImageInput(
+            "data:image/png;base64," + base64.b64encode(self._PNG_A).decode("ascii")
+        )
+        content = multimodal_input("Inspect it.", image)
+        completion = OpenRouterTransport(
+            "sk-or-v1-test-key", opener=opener
+        ).complete(
+            "vision-model",
+            [{"role": "user", "content": content}],
+            max_tokens=16,
+        )
+        self.assertEqual(completion.content, "intact")
+        self.assertEqual(sent[-1]["messages"][-1]["content"], content)
+        self.assertTrue(sent[-1]["provider"]["zdr"])
+        self.assertEqual(sent[-1]["provider"]["data_collection"], "deny")
+        self.assertTrue(sent[-1]["provider"]["require_parameters"])
+
+    def test_image_requests_use_the_executable_vision_endpoint_and_its_price(self):
+        sent = []
+
+        def opener(request, timeout):
+            if request.data is not None:
+                body = json.loads(request.data)
+                sent.append(body)
+                return FakeResponse({
+                    "id": "vision-endpoint-generation",
+                    "choices": [{
+                        "finish_reason": "stop",
+                        "message": {"role": "assistant", "content": "ready"},
+                    }],
+                    "usage": {"cost": 0.0008, "prompt_tokens": 20, "completion_tokens": 1},
+                })
+            if "endpoints/zdr" in request.full_url:
+                return FakeResponse({"data": [
+                    {
+                        "model_id": "mixed-endpoint-model",
+                        "tag": "cheap-text/route",
+                        "provider_name": "Cheap Text",
+                        "context_length": 8192,
+                        "max_completion_tokens": 1024,
+                        "pricing": {"prompt": "0.00000001", "completion": "0.00000001", "image": "0"},
+                        "input_modalities": ["text"],
+                        "supported_parameters": ["max_tokens"],
+                    },
+                    {
+                        "model_id": "mixed-endpoint-model",
+                        "tag": "verified-vision/route",
+                        "provider_name": "Verified Vision",
+                        "context_length": 8192,
+                        "max_completion_tokens": 1024,
+                        "pricing": {"prompt": "0.00000002", "completion": "0.00000003", "image": "0.0007"},
+                        "input_modalities": ["text", "image"],
+                        "supported_parameters": ["max_tokens"],
+                    },
+                ]})
+            return FakeResponse({"data": [{
+                "id": "mixed-endpoint-model",
+                "architecture": {"input_modalities": ["text", "image"]},
+                "context_length": 8192,
+                "pricing": {"prompt": "0.00000001", "completion": "0.00000001", "image": "0"},
+                "supported_parameters": ["max_tokens"],
+            }]})
+
+        transport = OpenRouterTransport("sk-or-v1-test-key", opener=opener)
+        image = ImageInput(
+            "data:image/png;base64," + base64.b64encode(self._PNG_A).decode("ascii")
+        )
+        messages = [{"role": "user", "content": multimodal_input("Inspect it.", image)}]
+        catalog = transport.model_catalog()
+        self.assertIn("image", catalog[0]["input_modalities"])
+        estimate = transport.estimate_cost(
+            "mixed-endpoint-model", messages, max_tokens=16
+        )
+        self.assertGreaterEqual(estimate, 0.0007)
+        completion = transport.complete(
+            "mixed-endpoint-model", messages, max_tokens=16
+        )
+        self.assertEqual(completion.content, "ready")
+        self.assertEqual(sent[-1]["provider"]["only"], ["verified-vision"])
+
+        before_conflict = len(sent)
+        with self.assertRaisesRegex(ProviderError, "exclude every current ZDR endpoint"):
+            transport.complete(
+                "mixed-endpoint-model",
+                messages,
+                max_tokens=16,
+                request_options={"provider": {"only": ["cheap-text"]}},
+            )
+        self.assertEqual(len(sent), before_conflict)
+
+        compatible = transport.complete(
+            "mixed-endpoint-model",
+            messages,
+            max_tokens=16,
+            request_options={"provider": {"only": ["Verified Vision"]}},
+        )
+        self.assertEqual(compatible.content, "ready")
+        self.assertEqual(sent[-1]["provider"]["only"], ["verified-vision"])
+
+        before_ignore = len(sent)
+        with self.assertRaisesRegex(ProviderError, "exclude every current ZDR endpoint"):
+            transport.complete(
+                "mixed-endpoint-model",
+                messages,
+                max_tokens=16,
+                request_options={"provider": {"ignore": ["Verified Vision"]}},
+            )
+        self.assertEqual(len(sent), before_ignore)
+
+        no_vision_calls = []
+
+        def text_only_opener(request, timeout):
+            if request.data is not None:
+                no_vision_calls.append(json.loads(request.data))
+                raise AssertionError("An image request reached a text-only endpoint.")
+            if "endpoints/zdr" in request.full_url:
+                return FakeResponse({"data": [{
+                    "model_id": "model-level-vision-only",
+                    "tag": "text-only/route",
+                    "provider_name": "Text Only",
+                    "context_length": 8192,
+                    "max_completion_tokens": 1024,
+                    "pricing": {"prompt": "0.00000001", "completion": "0.00000001"},
+                    "input_modalities": ["text"],
+                    "supported_parameters": ["max_tokens"],
+                }]})
+            return FakeResponse({"data": [{
+                "id": "model-level-vision-only",
+                "architecture": {"input_modalities": ["text", "image"]},
+                "context_length": 8192,
+                "pricing": {"prompt": "0.00000001", "completion": "0.00000001"},
+                "supported_parameters": ["max_tokens"],
+            }]})
+
+        text_only = OpenRouterTransport("sk-or-v1-test-key", opener=text_only_opener)
+        with self.assertRaisesRegex(ProviderError, "image"):
+            text_only.complete("model-level-vision-only", messages, max_tokens=16)
+        self.assertEqual(no_vision_calls, [])
+
+    def test_current_zdr_feed_uses_model_modalities_when_endpoint_omits_them(self):
+        sent = []
+
+        def opener(request, timeout):
+            if request.data is not None:
+                sent.append(json.loads(request.data))
+                return FakeResponse({
+                    "id": "current-zdr-image",
+                    "choices": [{"finish_reason": "stop", "message": {"content": "mobile"}}],
+                    "usage": {"cost": 0.0002, "prompt_tokens": 20, "completion_tokens": 1},
+                })
+            if "endpoints/zdr" in request.full_url:
+                return FakeResponse({"data": [{
+                    "model_id": "current-vision-model",
+                    "tag": "current-provider/global",
+                    "provider_name": "Current Provider",
+                    "context_length": 8192,
+                    "max_completion_tokens": 1024,
+                    "pricing": {"prompt": "0.000001", "completion": "0.000002", "image": "0.000003"},
+                    "supported_parameters": ["max_tokens"],
+                }]})
+            return FakeResponse({"data": [{
+                "id": "current-vision-model",
+                "architecture": {"input_modalities": ["text", "image"]},
+                "context_length": 8192,
+                "pricing": {"prompt": "0.000001", "completion": "0.000002", "image": "0.000003"},
+                "supported_parameters": ["max_tokens"],
+            }]})
+
+        transport = OpenRouterTransport("sk-or-v1-test-key", opener=opener)
+        image = ImageInput(
+            "data:image/png;base64," + base64.b64encode(self._PNG_A).decode("ascii")
+        )
+        messages = [{"role": "user", "content": multimodal_input("Inspect it.", image)}]
+        self.assertIn("image", transport.model_catalog()[0]["input_modalities"])
+        self.assertEqual(
+            transport.complete("current-vision-model", messages, max_tokens=16).content,
+            "mobile",
+        )
+        self.assertEqual(sent[-1]["provider"]["only"], ["current-provider"])
+
     def test_target_request_envelope_never_leaks_into_optimizer_or_judge(self):
         transport = EnvelopeTransport()
         request_options = {
@@ -2144,8 +2999,43 @@ class SdkTests(unittest.TestCase):
             self.assertEqual(answer.evidence_provenance, "LEGACY_UNKNOWN")
             self.assertEqual(answer.route_phase, "legacy_unknown")
 
+    def test_qualified_legacy_route_package_backfill_is_idempotent(self):
+        with TemporaryDirectory(ignore_cleanup_errors=True) as directory:
+            state = Path(directory) / "evalt.db"
+            evalt = Evalt(transport=FakeTransport(), state_path=state)
+            evalt.run(
+                "Return the approved route label only.",
+                "charged twice",
+                route="qualified-legacy",
+                models=["cheap"],
+                first_run="bootstrap",
+            )
+            with sqlite3.connect(state) as db:
+                db.execute(
+                    "UPDATE routes SET evidence_provenance='AI_GENERATED_AI_JUDGED',"
+                    "decision_reason='provisional_ai_qualified',"
+                    "last_test_summary_json=? WHERE route='qualified-legacy'",
+                    (json.dumps({
+                        "quality_gate_status": "QUALIFIED_ROUTE_SELECTED",
+                        "holdout_pass_rate": 1.0,
+                    }),),
+                )
+                db.commit()
+            first = Evalt(
+                transport=FakeTransport(), state_path=state
+            ).route_status("qualified-legacy")
+            second = Evalt(
+                transport=FakeTransport(), state_path=state
+            ).route_status("qualified-legacy")
+            self.assertEqual(first["qualified_package_count"], 1)
+            self.assertEqual(second["qualified_package_count"], 1)
+            self.assertEqual(
+                second["recent_route_versions"][0]["activation_reason"],
+                "legacy_backfill",
+            )
+
     def test_first_run_automatically_designs_tests_promotes_and_reuses_a_route(self):
-        with TemporaryDirectory() as directory:
+        with TemporaryDirectory(ignore_cleanup_errors=True) as directory:
             transport = CaseDesignerFewShotTransport()
             events = []
             evalt = Evalt(
@@ -2176,6 +3066,22 @@ class SdkTests(unittest.TestCase):
             self.assertEqual(status["route_phase"], "ai_tested")
             self.assertEqual(status["selected_few_shot_messages"], 2)
             self.assertEqual(status["selected_few_shot_examples"], 1)
+            self.assertEqual(status["qualified_package_count"], 1)
+            self.assertRegex(status["current_package_id"], r"^rv_[0-9a-f]{20}$")
+            self.assertEqual(
+                status["recent_route_versions"][0]["activation_reason"],
+                "initial_qualification",
+            )
+            self.assertRegex(
+                status["last_test_summary"]["suite_hash"], r"^[0-9a-f]{64}$"
+            )
+            self.assertRegex(
+                status["last_test_summary"]["evaluator_contract_hash"],
+                r"^[0-9a-f]{64}$",
+            )
+            self.assertEqual(
+                status["last_test_summary"]["evaluator_type"], "exact_text"
+            )
             self.assertIn(
                 "initial_ai_route_promoted",
                 [item["event_type"] for item in status["decisions"]],
@@ -2211,6 +3117,99 @@ class SdkTests(unittest.TestCase):
             self.assertEqual(second.content, "billing")
             self.assertEqual(designed_after, designed_before)
             self.assertEqual(evalt.route_status("automatic-first-route")["total_calls"], 2)
+            third = evalt.run(
+                "Write a helpful classification for this message.",
+                "My account is locked.",
+                task="Route recurring support tickets to billing, account, or technical.",
+                route="automatic-first-route",
+                test_budget_usd=1,
+                models=["cheap"],
+                designer_model="designer",
+                evaluator_model="evaluator",
+                reoptimize=True,
+            )
+            designed_after_reoptimize = sum(
+                "Design a balanced evaluation suite" in messages[0]["content"]
+                for _model, messages, _tokens, _schema in transport.calls
+            )
+            self.assertTrue(third.content)
+            self.assertGreater(designed_after_reoptimize, designed_after)
+            self.assertEqual(evalt.route_status("automatic-first-route")["total_calls"], 3)
+            versions_output = StringIO()
+            with redirect_stdout(versions_output):
+                self.assertEqual(cli_main([
+                    "versions", "--route", "automatic-first-route",
+                    "--state", str(Path(directory) / "evalt.db"),
+                ]), 0)
+            versions_payload = json.loads(versions_output.getvalue())
+            self.assertEqual(versions_payload["qualified_package_count"], 2)
+            self.assertFalse(versions_payload["provider_call_started"])
+            restore_target = versions_payload["versions"][-1]
+            calls_before_rollback = len(transport.calls)
+            confirmation_error = StringIO()
+            with redirect_stderr(confirmation_error):
+                self.assertEqual(cli_main([
+                    "rollback", "--route", "automatic-first-route",
+                    "--version", restore_target["package_id"],
+                    "--state", str(Path(directory) / "evalt.db"),
+                ]), 2)
+            self.assertIn("repeat with --yes", confirmation_error.getvalue())
+            self.assertEqual(
+                evalt.route_status("automatic-first-route")[
+                    "qualified_package_count"
+                ],
+                2,
+            )
+            rollback_output = StringIO()
+            with redirect_stdout(rollback_output):
+                self.assertEqual(cli_main([
+                    "rollback", "--route", "automatic-first-route",
+                    "--version", restore_target["package_id"], "--yes",
+                    "--state", str(Path(directory) / "evalt.db"),
+                ]), 0)
+            rollback_payload = json.loads(rollback_output.getvalue())
+            self.assertTrue(rollback_payload["rolled_back"])
+            self.assertFalse(rollback_payload["provider_call_started"])
+            self.assertEqual(
+                rollback_payload["restored_package_id"],
+                restore_target["package_id"],
+            )
+            self.assertEqual(len(transport.calls), calls_before_rollback)
+            rolled_back = evalt.route_status("automatic-first-route")
+            self.assertEqual(rolled_back["qualified_package_count"], 3)
+            self.assertEqual(
+                rolled_back["recent_route_versions"][0]["activation_reason"],
+                "rollback",
+            )
+            self.assertEqual(
+                rolled_back["recent_route_versions"][0]["rollback_of_package_id"],
+                restore_target["package_id"],
+            )
+            with self.assertRaisesRegex(ValueError, "already serving"):
+                evalt.rollback_route(
+                    "automatic-first-route", rolled_back["current_package_id"]
+                )
+            with self.assertRaisesRegex(KeyError, "no qualified package"):
+                evalt.rollback_route(
+                    "automatic-first-route", "rv_" + "0" * 20
+                )
+            with sqlite3.connect(Path(directory) / "evalt.db") as db:
+                db.execute(
+                    "UPDATE route_packages SET snapshot_json='{' "
+                    "WHERE package_id=?",
+                    (restore_target["package_id"],),
+                )
+                db.commit()
+            damaged_status = evalt.route_status("automatic-first-route")
+            damaged = next(
+                version for version in damaged_status["recent_route_versions"]
+                if version["package_id"] == restore_target["package_id"]
+            )
+            self.assertFalse(damaged["restorable"])
+            with self.assertRaisesRegex(ValueError, "damaged"):
+                evalt.rollback_route(
+                    "automatic-first-route", restore_target["package_id"]
+                )
             event_names = [event["event"] for event in events]
             self.assertIn("initial_optimization_started", event_names)
             self.assertIn("initial_optimization_completed", event_names)
@@ -2219,7 +3218,7 @@ class SdkTests(unittest.TestCase):
                 event for event in events
                 if event["event"] == "first_route_timing_completed"
             ]
-            self.assertEqual(len(timing_events), 1)
+            self.assertEqual(len(timing_events), 2)
             timing = timing_events[0]
             timing_fields = (
                 "test_design_seconds", "tournament_seconds",
@@ -2232,6 +3231,498 @@ class SdkTests(unittest.TestCase):
                 timing["total_elapsed_seconds"] + 0.006,
                 sum(timing[field] for field in timing_fields[:-1]),
             )
+
+    def test_private_route_version_aliases_are_safe_persistent_and_offline(self):
+        with TemporaryDirectory(ignore_cleanup_errors=True) as directory:
+            state = Path(directory) / "evalt.db"
+            transport = FakeTransport()
+            prompt = "Return the approved route label only."
+            evalt = Evalt(
+                transport=transport, state_path=state, show_progress=False
+            )
+            evalt.run(
+                prompt,
+                "charged twice",
+                route="alias-support",
+                models=["cheap"],
+                first_run="bootstrap",
+                test_budget_usd=0,
+            )
+            with sqlite3.connect(state) as db:
+                db.execute(
+                    "UPDATE routes SET evidence_provenance='HUMAN_APPROVED',"
+                    "decision_reason='qualified_fixture',last_test_summary_json=? "
+                    "WHERE route='alias-support'",
+                    (json.dumps({
+                        "quality_gate_status": "QUALIFIED_ROUTE_SELECTED",
+                        "holdout_pass_rate": 1.0,
+                    }),),
+                )
+                db.commit()
+            evalt = Evalt(
+                transport=transport, state_path=state, show_progress=False
+            )
+            first_version = evalt.route_status("alias-support")[
+                "current_package_id"
+            ]
+            with evalt.router._db() as db:
+                second_version = evalt.router._capture_package(
+                    db,
+                    "alias-support",
+                    activation_reason="fixture_requalification",
+                )
+            evalt.run(
+                prompt,
+                "account locked",
+                route="other-alias-route",
+                models=["cheap"],
+                first_run="bootstrap",
+                test_budget_usd=0,
+            )
+            with sqlite3.connect(state) as db:
+                db.execute(
+                    "UPDATE routes SET evidence_provenance='HUMAN_APPROVED',"
+                    "decision_reason='qualified_fixture',last_test_summary_json=? "
+                    "WHERE route='other-alias-route'",
+                    (json.dumps({
+                        "quality_gate_status": "QUALIFIED_ROUTE_SELECTED",
+                        "holdout_pass_rate": 1.0,
+                    }),),
+                )
+                db.commit()
+            evalt = Evalt(
+                transport=transport, state_path=state, show_progress=False
+            )
+            other_version = evalt.route_status("other-alias-route")[
+                "current_package_id"
+            ]
+            calls_before = len(transport.calls)
+            with self.assertRaisesRegex(KeyError, "no qualified package"):
+                evalt.annotate_route_version(
+                    "alias-support", other_version, alias="cross-route"
+                )
+
+            annotated = evalt.annotate_route_version(
+                "alias-support",
+                first_version,
+                alias="known-good",
+                note="Approved before the July catalog refresh.",
+                expected_alias="",
+            )
+            self.assertEqual(annotated["alias"], "known-good")
+            self.assertEqual(
+                annotated["note"], "Approved before the July catalog refresh."
+            )
+            self.assertIsNotNone(annotated["annotation_updated_at"])
+            self.assertFalse(annotated["current"])
+            self.assertEqual(len(transport.calls), calls_before)
+
+            persisted = Evalt(
+                transport=transport, state_path=state, show_progress=False
+            )
+            persisted_versions = persisted.route_versions("alias-support")
+            persisted_first = next(
+                item for item in persisted_versions
+                if item["package_id"] == first_version
+            )
+            self.assertEqual(persisted_first["alias"], "known-good")
+            self.assertEqual(
+                persisted_first["note"],
+                "Approved before the July catalog refresh.",
+            )
+            status_first = next(
+                item
+                for item in persisted.route_status("alias-support")[
+                    "recent_route_versions"
+                ]
+                if item["package_id"] == first_version
+            )
+            self.assertEqual(status_first["alias"], "known-good")
+
+            with self.assertRaisesRegex(ValueError, "already names another"):
+                persisted.annotate_route_version(
+                    "alias-support", second_version, alias="known-good"
+                )
+            with self.assertRaisesRegex(RuntimeError, "changed concurrently"):
+                persisted.annotate_route_version(
+                    "alias-support",
+                    first_version,
+                    note="stale edit must not win",
+                    expected_alias="older-name",
+                )
+            self.assertEqual(
+                next(
+                    item for item in persisted.route_versions("alias-support")
+                    if item["package_id"] == first_version
+                )["note"],
+                "Approved before the July catalog refresh.",
+            )
+            for bad_alias in ("Known-Good", "-leading", "spaces fail", "a" * 49):
+                with self.assertRaisesRegex(ValueError, "alias must be"):
+                    persisted.annotate_route_version(
+                        "alias-support", second_version, alias=bad_alias
+                    )
+            with self.assertRaisesRegex(ValueError, "control characters"):
+                persisted.annotate_route_version(
+                    "alias-support", second_version, note="hidden\nline"
+                )
+            with self.assertRaisesRegex(ValueError, "240 characters"):
+                persisted.annotate_route_version(
+                    "alias-support", second_version, note="n" * 241
+                )
+            with self.assertRaisesRegex(ValueError, "Provide alias or note"):
+                persisted.annotate_route_version(
+                    "alias-support", second_version
+                )
+
+            annotate_output = StringIO()
+            with redirect_stdout(annotate_output):
+                self.assertEqual(cli_main([
+                    "annotate-version",
+                    "--route", "alias-support",
+                    "--version", second_version,
+                    "--alias", "candidate",
+                    "--note", "Cheaper qualified candidate.",
+                    "--state", str(state),
+                ]), 0)
+            annotate_payload = json.loads(annotate_output.getvalue())
+            self.assertTrue(annotate_payload["annotated"])
+            self.assertFalse(annotate_payload["provider_call_started"])
+            self.assertFalse(annotate_payload["dashboard_sync_started"])
+            self.assertEqual(
+                annotate_payload["version"]["alias"], "candidate"
+            )
+            self.assertEqual(len(transport.calls), calls_before)
+
+            no_action_error = StringIO()
+            with redirect_stderr(no_action_error):
+                self.assertEqual(cli_main([
+                    "annotate-version",
+                    "--route", "alias-support",
+                    "--version", second_version,
+                    "--state", str(state),
+                ]), 2)
+            self.assertIn(
+                "Choose --alias", no_action_error.getvalue()
+            )
+
+            rollback_output = StringIO()
+            with redirect_stdout(rollback_output):
+                self.assertEqual(cli_main([
+                    "rollback",
+                    "--route", "alias-support",
+                    "--version", "known-good",
+                    "--yes",
+                    "--state", str(state),
+                ]), 0)
+            rollback_payload = json.loads(rollback_output.getvalue())
+            self.assertEqual(
+                rollback_payload["restored_package_id"], first_version
+            )
+            self.assertRegex(
+                rollback_payload["package_id"], r"^rv_[0-9a-f]{20}$"
+            )
+            self.assertFalse(rollback_payload["provider_call_started"])
+            self.assertEqual(len(transport.calls), calls_before)
+
+            with persisted.router._db() as db:
+                other_package = persisted.router._capture_package(
+                    db,
+                    "alias-support",
+                    activation_reason="fixture_damage_target",
+                )
+                db.execute(
+                    "UPDATE route_packages SET snapshot_json='{' "
+                    "WHERE package_id=?",
+                    (other_package,),
+                )
+            with self.assertRaisesRegex(ValueError, "damaged"):
+                persisted.annotate_route_version(
+                    "alias-support", other_package, alias="damaged"
+                )
+            with self.assertRaisesRegex(KeyError, "no qualified package"):
+                persisted.annotate_route_version(
+                    "alias-support", "rv_" + "f" * 20, alias="missing"
+                )
+
+            private_snapshot = sanitize_route_snapshot(
+                persisted.route_status("alias-support")
+            )
+            serialized_snapshot = json.dumps(private_snapshot)
+            self.assertNotIn("known-good", serialized_snapshot)
+            self.assertNotIn("Approved before", serialized_snapshot)
+            with sqlite3.connect(state) as db:
+                event_details = "\n".join(
+                    row[0]
+                    for row in db.execute(
+                        "SELECT detail_json FROM decisions "
+                        "WHERE event_type='qualified_package_annotation_changed'"
+                    ).fetchall()
+                )
+            self.assertNotIn("known-good", event_details)
+            self.assertNotIn("Approved before", event_details)
+
+            clear_output = StringIO()
+            with redirect_stdout(clear_output):
+                self.assertEqual(cli_main([
+                    "annotate-version",
+                    "--route", "alias-support",
+                    "--version", first_version,
+                    "--clear-alias",
+                    "--clear-note",
+                    "--expected-alias", "known-good",
+                    "--state", str(state),
+                ]), 0)
+            cleared = json.loads(clear_output.getvalue())["version"]
+            self.assertEqual(cleared["alias"], "")
+            self.assertEqual(cleared["note"], "")
+            self.assertEqual(len(transport.calls), calls_before)
+
+    def test_route_package_annotation_schema_migrates_existing_database(self):
+        with TemporaryDirectory(ignore_cleanup_errors=True) as directory:
+            state = Path(directory) / "evalt.db"
+            with sqlite3.connect(state) as db:
+                db.execute(
+                    "CREATE TABLE route_packages ("
+                    "package_id TEXT PRIMARY KEY,route TEXT NOT NULL,"
+                    "created_at TEXT NOT NULL,activation_reason TEXT NOT NULL,"
+                    "rollback_of_package_id TEXT,snapshot_json TEXT NOT NULL)"
+                )
+                db.commit()
+            migrated = Evalt(
+                transport=FakeTransport(), state_path=state, show_progress=False
+            )
+            migrated.router
+            with sqlite3.connect(state) as db:
+                columns = {
+                    row[1] for row in db.execute(
+                        "PRAGMA table_info(route_packages)"
+                    ).fetchall()
+                }
+            self.assertTrue(
+                {"alias", "note", "annotation_updated_at"} <= columns
+            )
+
+    def test_production_route_version_pin_is_typed_exact_and_no_call_on_mismatch(self):
+        with TemporaryDirectory(ignore_cleanup_errors=True) as directory:
+            state = Path(directory) / "evalt.db"
+            transport = FakeTransport()
+            prompt = "Return the approved route label only."
+            evalt = Evalt(transport=transport, state_path=state, show_progress=False)
+            evalt.run(
+                prompt,
+                "charged twice",
+                route="pinned-support",
+                models=["cheap"],
+                first_run="bootstrap",
+                test_budget_usd=0,
+            )
+            with sqlite3.connect(state) as db:
+                db.execute(
+                    "UPDATE routes SET evidence_provenance='HUMAN_APPROVED',"
+                    "decision_reason='qualified_fixture',last_test_summary_json=? "
+                    "WHERE route='pinned-support'",
+                    (json.dumps({
+                        "quality_gate_status": "QUALIFIED_ROUTE_SELECTED",
+                        "holdout_pass_rate": 1.0,
+                    }),),
+                )
+                db.commit()
+            evalt = Evalt(transport=transport, state_path=state, show_progress=False)
+            status = evalt.route_status("pinned-support")
+            first_version = status["current_package_id"]
+            calls_before = len(transport.calls)
+
+            with mock.patch.object(
+                transport,
+                "model_catalog",
+                side_effect=AssertionError("a pinned call must not fetch the catalog"),
+                create=True,
+            ):
+                answer = evalt.run(
+                    prompt,
+                    "account locked",
+                    route="pinned-support",
+                    route_version=first_version,
+                    test_budget_usd=0,
+                )
+            self.assertEqual(answer.route_version, first_version)
+            self.assertEqual(answer.to_dict()["route_version"], first_version)
+            self.assertEqual(len(transport.calls), calls_before + 1)
+
+            evalt.run(
+                prompt,
+                "charged twice",
+                route="bootstrap-only",
+                models=["cheap"],
+                first_run="bootstrap",
+                test_budget_usd=0,
+            )
+            before_unqualified = len(transport.calls)
+            with self.assertRaises(RouteVersionMismatch) as unqualified:
+                evalt.run(
+                    prompt,
+                    "billing",
+                    route="bootstrap-only",
+                    route_version="rv_" + "f" * 20,
+                    test_budget_usd=1,
+                )
+            self.assertIn("no qualified serving version", unqualified.exception.reason)
+            self.assertEqual(len(transport.calls), before_unqualified)
+
+            for expected, route, supplied_prompt in (
+                ("rv_" + "0" * 20, "pinned-support", prompt),
+                ("bad-version", "pinned-support", prompt),
+                (first_version, "missing-route", prompt),
+                (first_version, "pinned-support", prompt + " changed"),
+            ):
+                before_failure = len(transport.calls)
+                with self.assertRaises(RouteVersionMismatch) as raised:
+                    evalt.run(
+                        supplied_prompt,
+                        "billing",
+                        route=route,
+                        route_version=expected,
+                        test_budget_usd=1,
+                    )
+                self.assertFalse(raised.exception.provider_call_started)
+                self.assertEqual(raised.exception.route, route)
+                self.assertEqual(
+                    raised.exception.expected_package_id, expected
+                )
+                self.assertIn("evalt versions", str(raised.exception))
+                self.assertEqual(len(transport.calls), before_failure)
+
+            evalt.run(
+                prompt,
+                "charged twice",
+                route="other-route",
+                models=["cheap"],
+                first_run="bootstrap",
+                test_budget_usd=0,
+            )
+            with sqlite3.connect(state) as db:
+                db.execute(
+                    "UPDATE routes SET evidence_provenance='HUMAN_APPROVED',"
+                    "decision_reason='qualified_fixture',last_test_summary_json=? "
+                    "WHERE route='other-route'",
+                    (json.dumps({
+                        "quality_gate_status": "QUALIFIED_ROUTE_SELECTED",
+                        "holdout_pass_rate": 1.0,
+                    }),),
+                )
+                db.commit()
+            other = Evalt(
+                transport=transport, state_path=state, show_progress=False
+            )
+            other_version = other.route_status("other-route")[
+                "current_package_id"
+            ]
+            before_cross_route = len(transport.calls)
+            with self.assertRaises(RouteVersionMismatch) as cross_route:
+                other.run(
+                    prompt,
+                    "billing",
+                    route="pinned-support",
+                    route_version=other_version,
+                    test_budget_usd=0,
+                )
+            self.assertIn("belongs to route", cross_route.exception.reason)
+            self.assertEqual(len(transport.calls), before_cross_route)
+
+            with other.router._db() as db:
+                second_version = other.router._capture_package(
+                    db, "pinned-support", activation_reason="fixture_requalification"
+                )
+            before_stale = len(transport.calls)
+            with self.assertRaises(RouteVersionMismatch) as stale:
+                other.run(
+                    prompt,
+                    "billing",
+                    route="pinned-support",
+                    route_version=first_version,
+                    test_budget_usd=0,
+                )
+            self.assertEqual(stale.exception.current_package_id, second_version)
+            self.assertEqual(len(transport.calls), before_stale)
+
+            rollback = other.rollback_route("pinned-support", first_version)
+            rollback_version = rollback["package_id"]
+            self.assertNotEqual(rollback_version, first_version)
+            self.assertNotEqual(rollback_version, second_version)
+            before_old_pin = len(transport.calls)
+            with self.assertRaises(RouteVersionMismatch):
+                other.run(
+                    prompt,
+                    "billing",
+                    route="pinned-support",
+                    route_version=second_version,
+                    test_budget_usd=0,
+                )
+            self.assertEqual(len(transport.calls), before_old_pin)
+            rolled_back_answer = other.run(
+                prompt,
+                "billing",
+                route="pinned-support",
+                route_version=rollback_version,
+                test_budget_usd=0,
+            )
+            self.assertEqual(rolled_back_answer.route_version, rollback_version)
+
+            original_estimate = transport.estimate_cost
+
+            def change_version_before_provider(*args, **kwargs):
+                with other.router._db() as db:
+                    other.router._capture_package(
+                        db,
+                        "pinned-support",
+                        activation_reason="fixture_concurrent_change",
+                    )
+                return original_estimate(*args, **kwargs)
+
+            transport.estimate_cost = change_version_before_provider
+            before_concurrent = len(transport.calls)
+            with self.assertRaises(RouteVersionMismatch) as concurrent:
+                other.run(
+                    prompt,
+                    "billing",
+                    route="pinned-support",
+                    route_version=rollback_version,
+                    test_budget_usd=0,
+                )
+            self.assertIn("before the provider call", concurrent.exception.reason)
+            self.assertEqual(len(transport.calls), before_concurrent)
+            transport.estimate_cost = original_estimate
+
+            damaged_version = other.route_status("pinned-support")[
+                "current_package_id"
+            ]
+            with sqlite3.connect(state) as db:
+                db.execute(
+                    "UPDATE route_packages SET snapshot_json='{' WHERE package_id=?",
+                    (damaged_version,),
+                )
+                db.commit()
+            before_damaged = len(transport.calls)
+            with self.assertRaises(RouteVersionMismatch) as damaged:
+                other.run(
+                    prompt,
+                    "billing",
+                    route="pinned-support",
+                    route_version=damaged_version,
+                    test_budget_usd=0,
+                )
+            self.assertIn("damaged", damaged.exception.reason)
+            self.assertEqual(len(transport.calls), before_damaged)
+
+            with self.assertRaisesRegex(ValueError, "cannot be combined"):
+                evalt.run(
+                    prompt,
+                    "billing",
+                    route="pinned-support",
+                    route_version=first_version,
+                    reoptimize=True,
+                )
 
     def test_bootstrap_only_is_an_explicit_escape_hatch(self):
         with TemporaryDirectory() as directory:
@@ -3222,6 +4713,9 @@ class SdkTests(unittest.TestCase):
         class FailedEvalt:
             def __init__(self, **_kwargs):
                 self.client = FailedClient()
+
+            def run(self, _suite):
+                raise ProviderError("provider timed out")
 
         with TemporaryDirectory() as directory:
             suite_path = Path(directory) / "suite.json"

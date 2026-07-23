@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import asdict, dataclass, field
 from html import escape
 import json
 from pathlib import Path
@@ -15,6 +16,15 @@ def _number(value: Any, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _optional_number(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _winner(result: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -96,15 +106,19 @@ def compare_results(
         })
 
     baseline_quality = _number(
-        baseline_winner.get("holdout_pass_rate") or baseline_winner.get("pass_rate")
+        baseline_winner.get("holdout_pass_rate")
+        if baseline_winner.get("holdout_pass_rate") is not None
+        else baseline_winner.get("pass_rate")
     )
     candidate_quality = _number(
-        candidate_winner.get("holdout_pass_rate") or candidate_winner.get("pass_rate")
+        candidate_winner.get("holdout_pass_rate")
+        if candidate_winner.get("holdout_pass_rate") is not None
+        else candidate_winner.get("pass_rate")
     )
     baseline_cost = baseline_winner.get("estimated_cost_per_successful_call_usd")
     candidate_cost = candidate_winner.get("estimated_cost_per_successful_call_usd")
-    baseline_p90 = _number(baseline_winner.get("target_latency_p90_ms"))
-    candidate_p90 = _number(candidate_winner.get("target_latency_p90_ms"))
+    baseline_p90 = _optional_number(baseline_winner.get("target_latency_p90_ms"))
+    candidate_p90 = _optional_number(candidate_winner.get("target_latency_p90_ms"))
     return {
         "schema": "evalt-comparison-v1",
         "comparable_contract": comparable_contract,
@@ -132,13 +146,171 @@ def compare_results(
         "delta": {
             "quality_percentage_points": (candidate_quality - baseline_quality) * 100,
             "cost_per_1k_successful_calls_usd": None if baseline_cost is None or candidate_cost is None else (_number(candidate_cost) - _number(baseline_cost)) * 1000,
-            "p90_latency_ms": candidate_p90 - baseline_p90,
+            "p90_latency_ms": (
+                None
+                if baseline_p90 is None or candidate_p90 is None
+                else candidate_p90 - baseline_p90
+            ),
             "prompt_changed": baseline_winner.get("selected_prompt") != candidate_winner.get("selected_prompt"),
             "model_changed": baseline_winner.get("model") != candidate_winner.get("model"),
         },
         "case_summary": summary,
         "cases": case_rows,
     }
+
+
+@dataclass(frozen=True)
+class RegressionGateReport:
+    """Privacy-safe decision over a frozen baseline and candidate result."""
+
+    passed: bool
+    failures: tuple[str, ...] = field(default_factory=tuple)
+    comparable_contract: bool = False
+    quality_delta_percentage_points: float | None = None
+    regressions: int = 0
+    missing_cases: int = 0
+    regressed_case_ids: tuple[str, ...] = field(default_factory=tuple)
+    missing_case_ids: tuple[str, ...] = field(default_factory=tuple)
+    cost_increase_percent: float | None = None
+    p90_increase_ms: float | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+def check_regression(
+    baseline: Mapping[str, Any],
+    candidate: Mapping[str, Any],
+    *,
+    max_regressions: int = 0,
+    max_quality_drop_percentage_points: float = 0.0,
+    max_cost_increase_percent: float | None = None,
+    max_p90_increase_ms: float | None = None,
+) -> RegressionGateReport:
+    """Gate a candidate against the exact frozen suite used by a baseline.
+
+    This function is offline and returns counts and case IDs only. Model outputs,
+    approved answers, prompts, and customer inputs never enter the gate report.
+    """
+
+    if (
+        isinstance(max_regressions, bool)
+        or not isinstance(max_regressions, int)
+        or max_regressions < 0
+    ):
+        raise ValueError("max_regressions must be a non-negative integer")
+    if max_quality_drop_percentage_points < 0:
+        raise ValueError(
+            "max_quality_drop_percentage_points must be zero or greater"
+        )
+    if max_cost_increase_percent is not None and max_cost_increase_percent < 0:
+        raise ValueError("max_cost_increase_percent must be zero or greater")
+    if max_p90_increase_ms is not None and max_p90_increase_ms < 0:
+        raise ValueError("max_p90_increase_ms must be zero or greater")
+
+    comparison = compare_results(baseline, candidate)
+    comparable = bool(comparison["comparable_contract"])
+    failures: list[str] = []
+    if not comparable:
+        contract = comparison["contract"]
+        baseline_hash = contract.get("baseline_suite_hash") or "missing"
+        candidate_hash = contract.get("candidate_suite_hash") or "missing"
+        failures.append(
+            "baseline comparison requires identical non-empty suite hashes "
+            f"(baseline={baseline_hash}, candidate={candidate_hash})"
+        )
+
+    case_rows = comparison["cases"] if comparable else []
+    regressed_ids = tuple(
+        str(item["example_id"])
+        for item in case_rows
+        if item.get("status") == "regression"
+    )
+    missing_ids = tuple(
+        str(item["example_id"])
+        for item in case_rows
+        if item.get("status") == "missing"
+    )
+    quality_delta = (
+        float(comparison["delta"]["quality_percentage_points"])
+        if comparable
+        else None
+    )
+    if comparable and len(regressed_ids) > max_regressions:
+        failures.append(
+            f"{len(regressed_ids)} frozen case regression(s) exceed allowed "
+            f"{max_regressions}: {', '.join(regressed_ids)}"
+        )
+    if comparable and missing_ids:
+        failures.append(
+            f"{len(missing_ids)} frozen case(s) are missing from the candidate: "
+            f"{', '.join(missing_ids)}"
+        )
+    if (
+        comparable
+        and quality_delta is not None
+        and quality_delta < -max_quality_drop_percentage_points - 1e-12
+    ):
+        failures.append(
+            f"quality changed {quality_delta:+.3f} percentage points; "
+            f"maximum allowed drop is {max_quality_drop_percentage_points:.3f}"
+        )
+
+    before = comparison["baseline"]
+    after = comparison["candidate"]
+    cost_increase_percent: float | None = None
+    if comparable and max_cost_increase_percent is not None:
+        baseline_cost = _optional_number(before.get("cost_per_1k_successful_calls_usd"))
+        candidate_cost = _optional_number(after.get("cost_per_1k_successful_calls_usd"))
+        if baseline_cost is None or candidate_cost is None:
+            failures.append(
+                "cost regression limit requires cost measurements in both results"
+            )
+        elif baseline_cost == 0:
+            cost_increase_percent = 0.0 if candidate_cost == 0 else None
+            if candidate_cost > 0:
+                failures.append(
+                    "production cost increased from zero; no finite percentage "
+                    "comparison is possible"
+                )
+        else:
+            cost_increase_percent = (
+                (candidate_cost - baseline_cost) / baseline_cost
+            ) * 100
+            if cost_increase_percent > max_cost_increase_percent + 1e-12:
+                failures.append(
+                    f"production cost increased {cost_increase_percent:.3f}%; "
+                    f"maximum allowed increase is {max_cost_increase_percent:.3f}%"
+                )
+
+    p90_increase_ms: float | None = None
+    if comparable and max_p90_increase_ms is not None:
+        baseline_p90 = _optional_number(before.get("p90_latency_ms"))
+        candidate_p90 = _optional_number(after.get("p90_latency_ms"))
+        if baseline_p90 is None or candidate_p90 is None:
+            failures.append(
+                "p90 regression limit requires p90 latency measurements in both results"
+            )
+        else:
+            p90_increase_ms = candidate_p90 - baseline_p90
+            if p90_increase_ms > max_p90_increase_ms + 1e-12:
+                failures.append(
+                    f"p90 latency increased {p90_increase_ms:.3f} ms; "
+                    f"maximum allowed increase is {max_p90_increase_ms:.3f} ms"
+                )
+
+    return RegressionGateReport(
+        passed=not failures,
+        failures=tuple(failures),
+        comparable_contract=comparable,
+        quality_delta_percentage_points=quality_delta,
+        regressions=len(regressed_ids),
+        missing_cases=len(missing_ids),
+        regressed_case_ids=regressed_ids,
+        missing_case_ids=missing_ids,
+        cost_increase_percent=cost_increase_percent,
+        p90_increase_ms=p90_increase_ms,
+    )
 
 
 def render_comparison_html(
@@ -284,6 +456,8 @@ def write_reports(result: Mapping[str, Any], *, html_path: str | None = None, ju
 
 
 __all__ = [
+    "RegressionGateReport",
+    "check_regression",
     "compare_results",
     "render_comparison_html",
     "render_html_report",

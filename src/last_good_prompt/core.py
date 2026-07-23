@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager, nullcontext
 import contextvars
@@ -19,7 +20,9 @@ import threading
 import time
 from typing import Any, Callable, Iterable, Mapping, Protocol
 from urllib.error import HTTPError, URLError
+from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
+import zlib
 
 import certifi
 from dotenv import load_dotenv
@@ -48,6 +51,518 @@ _RESERVED_OPENROUTER_REQUEST_FIELDS = {
 _SECRET_FIELD_NAMES = {
     "api_key", "apikey", "authorization", "openrouter_api_key",
 }
+
+_MAX_IMAGE_BYTES = 20 * 1024 * 1024
+_MAX_IMAGE_REQUEST_BYTES = 40 * 1024 * 1024
+_MAX_DECODED_IMAGE_BYTES = 128 * 1024 * 1024
+_IMAGE_MEDIA_TYPES = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+    ".gif": "image/gif",
+}
+_IMAGE_DETAILS = {"auto", "low", "high"}
+
+
+def _validate_png(data: bytes) -> None:
+    if len(data) < 33:
+        raise ValueError("PNG data is truncated.")
+    offset = 8
+    saw_header = False
+    saw_pixels = False
+    compressed = bytearray()
+    expected_decoded = 0
+    while offset < len(data):
+        if offset + 12 > len(data):
+            raise ValueError("PNG data is truncated.")
+        length = int.from_bytes(data[offset:offset + 4], "big")
+        kind = data[offset + 4:offset + 8]
+        end = offset + 12 + length
+        if end > len(data):
+            raise ValueError("PNG data is truncated.")
+        payload = data[offset + 8:offset + 8 + length]
+        expected_crc = int.from_bytes(data[offset + 8 + length:end], "big")
+        if zlib.crc32(kind + payload) & 0xFFFFFFFF != expected_crc:
+            raise ValueError("PNG data has an invalid checksum.")
+        if not saw_header:
+            if kind != b"IHDR" or length != 13:
+                raise ValueError("PNG data is missing its image header.")
+            width = int.from_bytes(payload[:4], "big")
+            height = int.from_bytes(payload[4:8], "big")
+            if not width or not height:
+                raise ValueError("PNG dimensions must be positive.")
+            bit_depth, color_type, compression, filtering, interlace = payload[8:13]
+            valid_depths = {
+                0: {1, 2, 4, 8, 16}, 2: {8, 16}, 3: {1, 2, 4, 8},
+                4: {8, 16}, 6: {8, 16},
+            }
+            if bit_depth not in valid_depths.get(color_type, set()):
+                raise ValueError("PNG color type and bit depth are invalid.")
+            if compression != 0 or filtering != 0 or interlace not in {0, 1}:
+                raise ValueError("PNG header methods are invalid.")
+            channels = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}[color_type]
+            bits_per_pixel = channels * bit_depth
+            if interlace == 0:
+                expected_decoded = height * (1 + ((width * bits_per_pixel + 7) // 8))
+            else:
+                passes = ((0, 0, 8, 8), (4, 0, 8, 8), (0, 4, 4, 8),
+                          (2, 0, 4, 4), (0, 2, 2, 4), (1, 0, 2, 2),
+                          (0, 1, 1, 2))
+                for x_start, y_start, x_step, y_step in passes:
+                    pass_width = max(0, (width - x_start + x_step - 1) // x_step)
+                    pass_height = max(0, (height - y_start + y_step - 1) // y_step)
+                    if pass_width and pass_height:
+                        expected_decoded += pass_height * (
+                            1 + ((pass_width * bits_per_pixel + 7) // 8)
+                        )
+            if expected_decoded > _MAX_DECODED_IMAGE_BYTES:
+                raise ValueError("PNG expands beyond the 128 MiB decoded safety limit.")
+            saw_header = True
+        elif kind == b"IDAT":
+            compressed.extend(payload)
+            saw_pixels = True
+        elif kind == b"IEND":
+            if length or end != len(data) or not saw_pixels:
+                raise ValueError("PNG data has an invalid image terminator.")
+            try:
+                decoder = zlib.decompressobj()
+                decoded = decoder.decompress(bytes(compressed), expected_decoded + 1)
+                if len(decoded) > expected_decoded or decoder.unconsumed_tail:
+                    raise ValueError("PNG decoded pixel data exceeds its dimensions.")
+                decoded += decoder.flush(expected_decoded + 1 - len(decoded))
+                if len(decoded) != expected_decoded or not decoder.eof or decoder.unused_data:
+                    raise ValueError("PNG pixel data cannot be decoded completely.")
+            except zlib.error as error:
+                raise ValueError("PNG pixel data cannot be decoded.") from error
+            return
+        offset = end
+    raise ValueError("PNG data is missing its image terminator.")
+
+
+def _validate_jpeg(data: bytes) -> None:
+    if len(data) < 12 or not data.startswith(b"\xff\xd8") or not data.endswith(b"\xff\xd9"):
+        raise ValueError("JPEG data is truncated.")
+    offset = 2
+    saw_dimensions = False
+    while offset < len(data) - 2:
+        if data[offset] != 0xFF:
+            raise ValueError("JPEG data has an invalid marker.")
+        while offset < len(data) and data[offset] == 0xFF:
+            offset += 1
+        if offset >= len(data):
+            raise ValueError("JPEG data is truncated.")
+        marker = data[offset]
+        offset += 1
+        if marker == 0xDA:
+            if not saw_dimensions or offset + 2 > len(data):
+                raise ValueError("JPEG data is missing dimensions or scan data.")
+            segment_length = int.from_bytes(data[offset:offset + 2], "big")
+            if segment_length < 2 or offset + segment_length >= len(data) - 1:
+                raise ValueError("JPEG scan data is truncated.")
+            return
+        if marker in {0x01, *range(0xD0, 0xD9)}:
+            continue
+        if offset + 2 > len(data):
+            raise ValueError("JPEG data is truncated.")
+        segment_length = int.from_bytes(data[offset:offset + 2], "big")
+        if segment_length < 2 or offset + segment_length > len(data) - 2:
+            raise ValueError("JPEG data is truncated.")
+        if marker in {
+            0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7,
+            0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF,
+        }:
+            if segment_length < 8:
+                raise ValueError("JPEG dimensions are truncated.")
+            height = int.from_bytes(data[offset + 3:offset + 5], "big")
+            width = int.from_bytes(data[offset + 5:offset + 7], "big")
+            if not width or not height:
+                raise ValueError("JPEG dimensions must be positive.")
+            saw_dimensions = True
+        offset += segment_length
+    raise ValueError("JPEG data is missing scan data.")
+
+
+def _skip_gif_sub_blocks(data: bytes, offset: int) -> int:
+    while True:
+        if offset >= len(data):
+            raise ValueError("GIF data is truncated.")
+        length = data[offset]
+        offset += 1
+        if not length:
+            return offset
+        if offset + length > len(data):
+            raise ValueError("GIF data is truncated.")
+        offset += length
+
+
+def _validate_gif(data: bytes) -> None:
+    if len(data) < 14:
+        raise ValueError("GIF data is truncated.")
+    width = int.from_bytes(data[6:8], "little")
+    height = int.from_bytes(data[8:10], "little")
+    if not width or not height:
+        raise ValueError("GIF dimensions must be positive.")
+    packed = data[10]
+    offset = 13 + (3 * (2 ** ((packed & 0x07) + 1)) if packed & 0x80 else 0)
+    saw_image = False
+    while offset < len(data):
+        marker = data[offset]
+        offset += 1
+        if marker == 0x3B:
+            if not saw_image or offset != len(data):
+                raise ValueError("GIF data has an invalid image terminator.")
+            return
+        if marker == 0x21:
+            if offset >= len(data):
+                raise ValueError("GIF extension data is truncated.")
+            offset = _skip_gif_sub_blocks(data, offset + 1)
+            continue
+        if marker != 0x2C or offset + 9 > len(data):
+            raise ValueError("GIF data has an invalid image block.")
+        descriptor = data[offset:offset + 9]
+        local_packed = descriptor[8]
+        offset += 9
+        if local_packed & 0x80:
+            offset += 3 * (2 ** ((local_packed & 0x07) + 1))
+        if offset >= len(data):
+            raise ValueError("GIF image data is truncated.")
+        offset = _skip_gif_sub_blocks(data, offset + 1)
+        saw_image = True
+    raise ValueError("GIF data is missing its image terminator.")
+
+
+def _validate_webp(data: bytes) -> None:
+    if len(data) < 20 or int.from_bytes(data[4:8], "little") + 8 != len(data):
+        raise ValueError("WebP data is truncated.")
+    offset = 12
+    saw_image = False
+    while offset < len(data):
+        if offset + 8 > len(data):
+            raise ValueError("WebP chunk data is truncated.")
+        kind = data[offset:offset + 4]
+        length = int.from_bytes(data[offset + 4:offset + 8], "little")
+        start = offset + 8
+        end = start + length
+        if end > len(data):
+            raise ValueError("WebP chunk data is truncated.")
+        payload = data[start:end]
+        if kind == b"VP8X":
+            if len(payload) < 10:
+                raise ValueError("WebP dimensions are truncated.")
+            width = 1 + int.from_bytes(payload[4:7], "little")
+            height = 1 + int.from_bytes(payload[7:10], "little")
+            saw_image = bool(width and height)
+        elif kind == b"VP8L":
+            if len(payload) < 5 or payload[0] != 0x2F:
+                raise ValueError("WebP lossless image data is invalid.")
+            bits = int.from_bytes(payload[1:5], "little")
+            saw_image = bool((bits & 0x3FFF) + 1 and ((bits >> 14) & 0x3FFF) + 1)
+        elif kind == b"VP8 ":
+            if len(payload) < 10 or payload[3:6] != b"\x9d\x01\x2a":
+                raise ValueError("WebP image data is invalid.")
+            width = int.from_bytes(payload[6:8], "little") & 0x3FFF
+            height = int.from_bytes(payload[8:10], "little") & 0x3FFF
+            saw_image = bool(width and height)
+        offset = end + (length & 1)
+    if offset != len(data) or not saw_image:
+        raise ValueError("WebP data contains no decodable image frame.")
+
+
+def _image_media_type(data: bytes, suffix: str = "") -> str:
+    """Structurally validate supported image bytes and return their media type."""
+    detected = ""
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        detected = "image/png"
+    elif data.startswith(b"\xff\xd8\xff"):
+        detected = "image/jpeg"
+    elif len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        detected = "image/webp"
+    elif data.startswith((b"GIF87a", b"GIF89a")):
+        detected = "image/gif"
+    expected = _IMAGE_MEDIA_TYPES.get(str(suffix).casefold())
+    if not detected or (expected and detected != expected):
+        raise ValueError("Images must be valid PNG, JPEG, WebP, or GIF files.")
+    validators = {
+        "image/png": _validate_png,
+        "image/jpeg": _validate_jpeg,
+        "image/webp": _validate_webp,
+        "image/gif": _validate_gif,
+    }
+    validators[detected](data)
+    return detected
+
+
+def _embedded_image_payload_bytes(value: Any) -> int:
+    url = str(value or "")
+    if not url.casefold().startswith("data:"):
+        return 0
+    separator = url.find(",")
+    if separator < 0:
+        return 0
+    encoded = "".join(url[separator + 1:].split())
+    padding = len(encoded) - len(encoded.rstrip("="))
+    return max(0, (len(encoded) * 3) // 4 - padding)
+
+
+def _normalize_image_url(value: Any) -> str:
+    url = str(value or "").strip()
+    if url.casefold().startswith("data:"):
+        match = re.fullmatch(
+            r"data:(image/(?:png|jpeg|webp|gif));base64,([A-Za-z0-9+/=\s]+)",
+            url,
+            flags=re.IGNORECASE,
+        )
+        if not match:
+            raise ValueError("Image data URLs must be base64 PNG, JPEG, WebP, or GIF data.")
+        try:
+            payload = base64.b64decode("".join(match.group(2).split()), validate=True)
+        except (ValueError, TypeError) as error:
+            raise ValueError("Image data URLs must contain valid base64 data.") from error
+        if not payload or len(payload) > _MAX_IMAGE_BYTES:
+            raise ValueError("Images must be non-empty and no larger than 20 MiB.")
+        media_type = _image_media_type(payload)
+        if media_type.casefold() != match.group(1).casefold():
+            raise ValueError("The image data URL media type does not match its bytes.")
+        return f"data:{media_type};base64,{base64.b64encode(payload).decode('ascii')}"
+    parsed = urlsplit(url)
+    if parsed.scheme != "https" or not parsed.netloc or parsed.username or parsed.password:
+        raise ValueError("Remote images must use an HTTPS URL without embedded credentials.")
+    if Path(parsed.path).suffix.casefold() not in _IMAGE_MEDIA_TYPES:
+        raise ValueError("HTTPS image URLs must end in .png, .jpg, .jpeg, .webp, or .gif.")
+    return url
+
+
+@dataclass(frozen=True)
+class ImageInput:
+    """A validated OpenRouter image input from HTTPS or a local image file."""
+
+    source: str | os.PathLike[str]
+    detail: str = "auto"
+
+    @classmethod
+    def from_path(
+        cls, path: str | os.PathLike[str], *, detail: str = "auto"
+    ) -> "ImageInput":
+        return cls(path, detail=detail)
+
+    @classmethod
+    def from_url(cls, url: str, *, detail: str = "auto") -> "ImageInput":
+        return cls(url, detail=detail)
+
+    def __post_init__(self) -> None:
+        detail = str(self.detail).strip().casefold()
+        if detail not in _IMAGE_DETAILS:
+            raise ValueError("image detail must be auto, low, or high.")
+        raw_source = os.fspath(self.source)
+        if str(raw_source).strip().casefold().startswith(("https://", "data:")):
+            normalized = _normalize_image_url(raw_source)
+        else:
+            path = Path(raw_source).expanduser()
+            if not path.is_file():
+                raise ValueError(f"Image file does not exist: {path}")
+            size = path.stat().st_size
+            if not 0 < size <= _MAX_IMAGE_BYTES:
+                raise ValueError("Images must be non-empty and no larger than 20 MiB.")
+            payload = path.read_bytes()
+            if not 0 < len(payload) <= _MAX_IMAGE_BYTES:
+                raise ValueError("Images must be non-empty and no larger than 20 MiB.")
+            media_type = _image_media_type(payload, path.suffix)
+            normalized = (
+                f"data:{media_type};base64,{base64.b64encode(payload).decode('ascii')}"
+            )
+        object.__setattr__(self, "source", normalized)
+        object.__setattr__(self, "detail", detail)
+
+    def to_content_part(self) -> dict[str, Any]:
+        return {
+            "type": "image_url",
+            "image_url": {"url": str(self.source), "detail": self.detail},
+        }
+
+
+def normalize_message_content(value: Any) -> Any:
+    """Normalize strings and multimodal parts to Chat Completions content."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, ImageInput):
+        return [value.to_content_part()]
+    if isinstance(value, Mapping):
+        parts = [value]
+    elif isinstance(value, (list, tuple)):
+        parts = list(value)
+    else:
+        raise TypeError("Message content must be text, ImageInput, or content parts.")
+    normalized: list[dict[str, Any]] = []
+    for part in parts:
+        if isinstance(part, ImageInput):
+            normalized.append(part.to_content_part())
+            continue
+        if isinstance(part, str):
+            text = part.strip()
+            if text:
+                normalized.append({"type": "text", "text": text})
+            continue
+        if not isinstance(part, Mapping):
+            raise TypeError("Every content part must be text, ImageInput, or a mapping.")
+        part_type = str(part.get("type") or "").strip()
+        if part_type == "text":
+            text = str(part.get("text") or "").strip()
+            if not text:
+                raise ValueError("Text content parts cannot be blank.")
+            normalized.append({"type": "text", "text": text})
+            continue
+        if part_type == "image_url":
+            image_value = part.get("image_url")
+            if isinstance(image_value, str):
+                image_value = {"url": image_value}
+            if not isinstance(image_value, Mapping):
+                raise ValueError("image_url content parts require a URL object.")
+            detail = str(image_value.get("detail") or "auto").strip().casefold()
+            if detail not in _IMAGE_DETAILS:
+                raise ValueError("image detail must be auto, low, or high.")
+            normalized.append({
+                "type": "image_url",
+                "image_url": {
+                    "url": _normalize_image_url(image_value.get("url")),
+                    "detail": detail,
+                },
+            })
+            continue
+        raise ValueError(f"Unsupported message content part type {part_type!r}.")
+    if not normalized:
+        raise ValueError("Message content cannot be blank.")
+    total_image_bytes = sum(
+        _embedded_image_payload_bytes(part.get("image_url", {}).get("url"))
+        for part in normalized
+        if part.get("type") == "image_url"
+    )
+    if total_image_bytes > _MAX_IMAGE_REQUEST_BYTES:
+        raise ValueError("One message can contain at most 40 MiB of embedded image data.")
+    return normalized
+
+
+def multimodal_input(text: str, *images: ImageInput | str | os.PathLike[str]) -> list[dict[str, Any]]:
+    """Build standard text/image_url parts from text and image sources."""
+    parts: list[Any] = []
+    if str(text).strip():
+        parts.append({"type": "text", "text": str(text).strip()})
+    parts.extend(image if isinstance(image, ImageInput) else ImageInput(image) for image in images)
+    normalized = normalize_message_content(parts)
+    if not isinstance(normalized, list):
+        raise AssertionError("multimodal input normalization returned an invalid value")
+    return normalized
+
+
+def required_input_modalities(value: Any) -> set[str]:
+    """Return the input modalities required by message content or a message list."""
+    modalities: set[str] = set()
+
+    def visit(item: Any) -> None:
+        if isinstance(item, ImageInput):
+            modalities.add("image")
+        elif isinstance(item, str):
+            if item.strip():
+                modalities.add("text")
+        elif isinstance(item, Mapping):
+            if item.get("type") == "image_url":
+                modalities.add("image")
+            elif item.get("type") == "text":
+                modalities.add("text")
+            elif "content" in item:
+                visit(item.get("content"))
+        elif isinstance(item, (list, tuple)):
+            for child in item:
+                visit(child)
+
+    visit(value)
+    return modalities
+
+
+def safe_input_descriptor(value: Any) -> Any:
+    """Describe multimodal content without copying image bytes or signed URLs."""
+    if isinstance(value, Mapping) and value.get("role"):
+        descriptor = {
+            "role": str(value.get("role")),
+            "content": safe_input_descriptor(value.get("content")),
+        }
+        if value.get("tool_call_id") is not None:
+            descriptor["tool_call_id"] = str(value.get("tool_call_id"))
+        return descriptor
+    if (
+        isinstance(value, (list, tuple))
+        and value
+        and all(isinstance(item, Mapping) and item.get("role") for item in value)
+    ):
+        return [safe_input_descriptor(item) for item in value]
+    normalized = normalize_message_content(value)
+    if isinstance(normalized, str) or normalized is None:
+        return normalized
+    result: list[dict[str, str]] = []
+    for part in normalized:
+        if part["type"] == "text":
+            result.append({"type": "text", "text": str(part["text"])})
+            continue
+        image_url = str(part["image_url"]["url"])
+        if image_url.startswith("data:"):
+            media_type, encoded = image_url[5:].split(";base64,", 1)
+            payload = base64.b64decode(encoded, validate=True)
+            digest = hashlib.sha256(payload).hexdigest()[:16]
+            descriptor = f"[{media_type} image, {len(payload)} bytes, sha256:{digest}]"
+        else:
+            parsed = urlsplit(image_url)
+            descriptor = f"[HTTPS image from {parsed.hostname or 'remote host'}]"
+        result.append({"type": "image_descriptor", "text": descriptor})
+    return result
+
+
+def _text_character_count(value: Any) -> int:
+    """Count only textual request data; image base64 is never treated as tokens."""
+    if value is None:
+        return 0
+    if isinstance(value, str):
+        return len(value)
+    if isinstance(value, ImageInput):
+        return 0
+    if isinstance(value, Mapping):
+        if value.get("type") == "image_url":
+            return 0
+        if value.get("type") == "text":
+            return len(str(value.get("text") or ""))
+        return sum(
+            _text_character_count(child)
+            for key, child in value.items()
+            if key not in {"image_url"}
+        )
+    if isinstance(value, (list, tuple)):
+        return sum(_text_character_count(child) for child in value)
+    return len(str(value))
+
+
+def _image_count(value: Any) -> int:
+    if isinstance(value, ImageInput):
+        return 1
+    if isinstance(value, Mapping):
+        if value.get("type") == "image_url":
+            return 1
+        return sum(_image_count(child) for child in value.values())
+    if isinstance(value, (list, tuple)):
+        return sum(_image_count(child) for child in value)
+    return 0
+
+
+def _normalize_messages(messages: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    for message in messages:
+        if not isinstance(message, Mapping):
+            raise TypeError("Every chat message must be a mapping.")
+        item = dict(message)
+        if "content" in item:
+            item["content"] = normalize_message_content(item.get("content"))
+        normalized.append(item)
+    return normalized
 
 
 def normalize_request_options(
@@ -128,13 +643,17 @@ class BudgetExceeded(RuntimeError):
 
 @dataclass(frozen=True)
 class Turn:
-    input: str
+    input: Any
     approved_output: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "input", normalize_message_content(self.input))
+        object.__setattr__(self, "approved_output", str(self.approved_output).strip())
 
 
 @dataclass(frozen=True)
 class Example:
-    input: str
+    input: Any
     approved_output: str
     id: str = ""
     turns: tuple[Turn, ...] = ()
@@ -151,10 +670,10 @@ class Example:
         if isinstance(value, cls):
             return value
         turns = tuple(
-            Turn(str(item.get("input", "")).strip(), str(item.get("approved_output", item.get("expected", ""))).strip())
+            Turn(item.get("input", ""), str(item.get("approved_output", item.get("expected", ""))).strip())
             for item in value.get("turns", [])
         )
-        first = turns[0] if turns else Turn(str(value.get("input", "")).strip(), str(value.get("approved_output", "")).strip())
+        first = turns[0] if turns else Turn(value.get("input", ""), str(value.get("approved_output", "")).strip())
         return cls(
             first.input,
             turns[-1].approved_output if turns else first.approved_output,
@@ -165,6 +684,25 @@ class Example:
             float(value.get("weight", 1.0)),
             bool(value.get("critical", False)),
         )
+
+
+def _safe_example_payload(example: Example) -> dict[str, Any]:
+    """Serialize a result receipt without embedding image bytes or source URLs."""
+    payload = asdict(example)
+    payload["input"] = safe_input_descriptor(example.input)
+    payload["turns"] = [
+        {
+            "input": safe_input_descriptor(turn.input),
+            "approved_output": turn.approved_output,
+        }
+        for turn in example.turns
+    ]
+    payload["input_replayable"] = "image" not in {
+        modality
+        for turn in example.conversation()
+        for modality in required_input_modalities(turn.input)
+    }
+    return payload
 
 
 @dataclass(frozen=True)
@@ -309,7 +847,7 @@ class ChatTransport(Protocol):
     def complete(
         self,
         model: str,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         *,
         max_tokens: int,
         response_schema: dict[str, Any] | None = None,
@@ -317,7 +855,7 @@ class ChatTransport(Protocol):
     ) -> Completion: ...
 
     def estimate_cost(
-        self, model: str, messages: list[dict[str, str]], *, max_tokens: int
+        self, model: str, messages: list[dict[str, Any]], *, max_tokens: int
     ) -> float: ...
 
 
@@ -350,6 +888,8 @@ class OpenRouterTransport:
         self._catalog_ttl_seconds = max(0.0, float(catalog_ttl_seconds))
         self._catalog_loaded_at = 0.0
         self._prices: dict[str, tuple[float, float]] | None = None
+        self._image_prices: dict[str, float] = {}
+        self._input_modalities: dict[str, set[str]] = {}
         self._supported_parameters: dict[str, set[str]] = {}
         self._reasoning: dict[str, dict[str, Any]] = {}
         self._limits: dict[str, tuple[int | None, int | None]] = {}
@@ -516,6 +1056,8 @@ class OpenRouterTransport:
         prices: dict[str, tuple[float, float]] = {}
         catalog_items: list[dict[str, Any]] = []
         self._supported_parameters = {}
+        self._image_prices = {}
+        self._input_modalities = {}
         self._reasoning = {}
         self._limits = {}
         self._providers = {}
@@ -530,6 +1072,21 @@ class OpenRouterTransport:
                     # A model-level listing is not an executable private route. Omit
                     # it before spend instead of launching a guaranteed ZDR 404.
                     continue
+                architecture = item.get("architecture") or {}
+                model_modalities = {
+                    str(value).strip().casefold()
+                    for value in architecture.get("input_modalities") or ["text"]
+                    if str(value).strip()
+                }
+                for route in endpoints:
+                    route_architecture = route.get("architecture") or {}
+                    if not route.get("input_modalities") and not route_architecture.get("input_modalities"):
+                        # OpenRouter's current flat /endpoints/zdr feed proves the
+                        # executable private route but omits modality fields. Its
+                        # documented model catalog remains the capability source in
+                        # that schema. An explicit endpoint declaration still wins,
+                        # so a text-only route is never upgraded by this fallback.
+                        route["input_modalities"] = sorted(model_modalities)
                 self._endpoint_routes[model_id] = [dict(value) for value in endpoints]
                 top_provider = item.get("top_provider") or {}
 
@@ -589,6 +1146,36 @@ class OpenRouterTransport:
                     float(route_pricing.get("prompt") or 0),
                     float(route_pricing.get("completion") or 0),
                 )
+                self._image_prices[model_id] = float(
+                    route_pricing.get("image") or pricing.get("image") or 0
+                )
+                if endpoint_catalog_available:
+                    executable_endpoints = [
+                        value for value in endpoints if value.get("status") in {None, 0}
+                    ]
+                    endpoint_modalities = [
+                        self._endpoint_input_modalities(value)
+                        for value in executable_endpoints
+                    ]
+                    self._input_modalities[model_id] = set().union(
+                        *endpoint_modalities
+                    ) if endpoint_modalities else {"text"}
+                    image_route_prices = []
+                    for value in executable_endpoints:
+                        if "image" not in self._endpoint_input_modalities(value):
+                            continue
+                        try:
+                            image_route_prices.append(float((value.get("pricing") or {}).get("image") or 0))
+                        except (TypeError, ValueError):
+                            pass
+                    if image_route_prices:
+                        self._image_prices[model_id] = max(image_route_prices)
+                else:
+                    modality_source = architecture.get("input_modalities") or ["text"]
+                    self._input_modalities[model_id] = {
+                        str(value).strip().casefold()
+                        for value in modality_source if str(value).strip()
+                    }
                 supported_source = (endpoint or {}).get("supported_parameters") or item.get("supported_parameters") or []
                 self._supported_parameters[model_id] = {str(value) for value in supported_source}
                 if not endpoint_catalog_available:
@@ -653,6 +1240,8 @@ class OpenRouterTransport:
                     "intelligence_rank": intelligence_rank,
                     "blended_price": prices[model_id][0] * 1_000_000 + prices[model_id][1] * 2_000_000,
                     "supported_parameters": sorted(self._supported_parameters[model_id]),
+                    "input_modalities": sorted(self._input_modalities[model_id]),
+                    "image_price": self._image_prices[model_id],
                     "reasoning": item.get("reasoning") or {},
                     "context_length": context_limit,
                     "max_completion_tokens": completion_limit,
@@ -688,6 +1277,23 @@ class OpenRouterTransport:
             return max(0, int(raw))
         except (TypeError, ValueError):
             return 0
+
+    @staticmethod
+    def _endpoint_input_modalities(endpoint: Mapping[str, Any]) -> set[str]:
+        """Return modalities explicitly executable on one provider endpoint.
+
+        Model-level vision metadata is not endpoint proof. When an endpoint omits
+        modality metadata, retain ordinary text routing but fail closed for images.
+        """
+        source = (
+            endpoint.get("input_modalities")
+            or (endpoint.get("architecture") or {}).get("input_modalities")
+            or ["text"]
+        )
+        return {
+            str(value).strip().casefold()
+            for value in source if str(value).strip()
+        }
 
     @staticmethod
     def _endpoint_latency(endpoint: Mapping[str, Any]) -> float:
@@ -743,7 +1349,8 @@ class OpenRouterTransport:
         max_tokens: int,
         response_schema: Mapping[str, Any] | None,
         reasoning_requested: bool,
-    ) -> tuple[list[str], dict[str, str], str | None, set[str]]:
+        required_modalities: Iterable[str] | None = None,
+    ) -> tuple[list[str], dict[str, str], str | None, set[str], list[Mapping[str, Any]]]:
         """Choose current endpoints for this request, not for the model's maximum size.
 
         The catalog's largest-context endpoint is often slower or less capable than a
@@ -751,10 +1358,15 @@ class OpenRouterTransport:
         former made suite design both slow and brittle.  This preflight uses the actual
         bounded request and only returns routes that can honor its envelope.
         """
+        required = {
+            str(value).strip().casefold()
+            for value in (required_modalities or ()) if str(value).strip()
+        }
         endpoints = [
             value for value in self._endpoint_routes.get(model, [])
             if value.get("status") in {None, 0}
             and self._endpoint_capacity(value) >= int(max_tokens)
+            and required.issubset(self._endpoint_input_modalities(value))
         ]
         if response_schema:
             exact = [
@@ -783,7 +1395,7 @@ class OpenRouterTransport:
                 }
             ]
         if not endpoints:
-            return [], {}, None, set()
+            return [], {}, None, set(), []
 
         token_fields = []
         for token_field in ("max_tokens", "max_completion_tokens"):
@@ -801,7 +1413,7 @@ class OpenRouterTransport:
                 }
                 token_fields.append((len(families), len(supporting), token_field, supporting))
         if not token_fields:
-            return [], {}, None, set()
+            return [], {}, None, set(), []
         _family_count, _route_count, token_field, endpoints = max(
             token_fields,
             key=lambda item: (item[0], item[1], item[2] == "max_tokens"),
@@ -849,9 +1461,13 @@ class OpenRouterTransport:
             }
             for value in selected
         ))
-        return tags, names, token_field, common_parameters
+        return tags, names, token_field, common_parameters, selected
 
-    def configuration_support(self, configuration: str) -> dict[str, Any]:
+    def configuration_support(
+        self,
+        configuration: str,
+        required_modalities: Iterable[str] | None = None,
+    ) -> dict[str, Any]:
         """Preflight a model/effort pair against current routed capabilities."""
         explicit_reasoning = "#reasoning=" in configuration
         model, effort = self._split_configuration(configuration)
@@ -861,7 +1477,32 @@ class OpenRouterTransport:
                 "supported": False,
                 "reason": f"OpenRouter did not return a current priced ZDR route for {model!r}.",
             }
-        supported = self._supported_parameters.get(model, set())
+        required = {
+            str(value).strip().casefold()
+            for value in (required_modalities or ()) if str(value).strip()
+        }
+        routed_endpoints = self._endpoint_routes.get(model, [])
+        modality_endpoints = [
+            value for value in routed_endpoints
+            if value.get("status") in {None, 0}
+            and required.issubset(self._endpoint_input_modalities(value))
+        ]
+        unsupported_modalities = required - self._input_modalities.get(model, {"text"})
+        if unsupported_modalities or (routed_endpoints and not modality_endpoints):
+            return {
+                "supported": False,
+                "reason": (
+                    f"The current OpenRouter catalog does not list {model!r} as accepting "
+                    f"required input modality/modalities: {', '.join(sorted(unsupported_modalities))}."
+                ),
+            }
+        supported = (
+            set().union(*(
+                {str(parameter) for parameter in value.get("supported_parameters") or []}
+                for value in modality_endpoints
+            ))
+            if modality_endpoints else self._supported_parameters.get(model, set())
+        )
         reasoning = self._reasoning.get(model, {})
         reasoning_supported = bool({"reasoning", "reasoning_effort"} & supported)
         if explicit_reasoning and effort == "none" and reasoning.get("mandatory"):
@@ -872,7 +1513,7 @@ class OpenRouterTransport:
         if explicit_reasoning and effort != "none" and not reasoning_supported:
             return {
                 "supported": False,
-                "reason": f"The current ZDR route for {model!r} does not support adjustable reasoning; this configuration was omitted before spend.",
+                "reason": f"The current ZDR endpoint for {model!r} does not support adjustable reasoning; this configuration was omitted before spend.",
             }
         supported_efforts = {
             str(value) for value in reasoning.get("supported_efforts") or []
@@ -888,8 +1529,14 @@ class OpenRouterTransport:
         }
 
     def estimate_cost(
-        self, model: str, messages: list[dict[str, str]], *, max_tokens: int
+        self, model: str, messages: list[dict[str, Any]], *, max_tokens: int
     ) -> float:
+        messages = _normalize_messages(messages)
+        support = self.configuration_support(
+            model, required_input_modalities(messages)
+        )
+        if not support.get("supported"):
+            raise ProviderError(str(support.get("reason") or "Unsupported model configuration."))
         explicit_reasoning = "#reasoning=" in model
         model, effort = self._split_configuration(model)
         prices = self._load_prices()
@@ -902,20 +1549,59 @@ class OpenRouterTransport:
                 f"OpenRouter did not return current pricing for model {model!r}; "
                 "the SDK will not start an unpriced call."
             )
-        prompt_price, completion_price = prices[model]
-        estimated_prompt_tokens = max(1, len(json.dumps(messages)) // 3)
-        return estimated_prompt_tokens * prompt_price + max_tokens * completion_price
+        required_modalities = required_input_modalities(messages)
+        reasoning_is_requested = bool(
+            explicit_reasoning or reasoning_metadata.get("mandatory")
+        )
+        _tags, _names, _token_field, _supported, selected_routes = self._routes_for_request(
+            model,
+            max_tokens=max_tokens,
+            response_schema=None,
+            reasoning_requested=reasoning_is_requested,
+            required_modalities=required_modalities,
+        )
+        if self._endpoint_routes.get(model) and not selected_routes:
+            raise ProviderError(
+                f"No current ZDR endpoint for {model!r} accepts the request modalities and output envelope."
+            )
+        if selected_routes:
+            route_prices = [value.get("pricing") or {} for value in selected_routes]
+            prompt_price = max(float(value.get("prompt") or 0) for value in route_prices)
+            completion_price = max(float(value.get("completion") or 0) for value in route_prices)
+            routed_image_price = max(float(value.get("image") or 0) for value in route_prices)
+        else:
+            prompt_price, completion_price = prices[model]
+            routed_image_price = self._image_prices.get(model, 0.0)
+        estimated_prompt_tokens = max(1, math.ceil(_text_character_count(messages) / 3))
+        images = _image_count(messages)
+        # Catalog image prices are charged directly when present. Some providers
+        # instead fold vision into prompt tokens, so reserve a deliberately large
+        # 8k-token image allowance (and a small absolute floor) before authorizing.
+        conservative_image_price = max(
+            routed_image_price, prompt_price * 8192, 0.001
+        )
+        return (
+            estimated_prompt_tokens * prompt_price
+            + max_tokens * completion_price
+            + images * conservative_image_price
+        )
 
     def complete(
         self,
         model: str,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         *,
         max_tokens: int,
         response_schema: dict[str, Any] | None = None,
         request_options: Mapping[str, Any] | None = None,
     ) -> Completion:
         configuration = model
+        messages = _normalize_messages(messages)
+        support = self.configuration_support(
+            configuration, required_input_modalities(messages)
+        )
+        if not support.get("supported"):
+            raise ProviderError(str(support.get("reason") or "Unsupported model configuration."))
         explicit_reasoning = "#reasoning=" in model
         model, reasoning_effort = self._split_configuration(model)
         self._load_prices()
@@ -931,14 +1617,22 @@ class OpenRouterTransport:
             or reasoning_metadata.get("mandatory")
             or requested_reasoning_option is not None
         )
-        route_tags, route_names, routed_token_field, routed_supported = (
+        required_modalities = required_input_modalities(messages)
+        route_tags, route_names, routed_token_field, routed_supported, selected_routes = (
             self._routes_for_request(
                 model,
                 max_tokens=max_tokens,
                 response_schema=response_schema,
                 reasoning_requested=reasoning_is_requested,
+                required_modalities=required_modalities,
             )
         )
+        if self._endpoint_routes.get(model) and (
+            not selected_routes or ("image" in required_modalities and not route_tags)
+        ):
+            raise ProviderError(
+                f"No current ZDR endpoint for {model!r} accepts the request modalities and output envelope."
+            )
         if route_tags:
             self._providers[model] = route_tags
             self._provider_route_names[model] = route_names
@@ -1011,6 +1705,49 @@ class OpenRouterTransport:
             if not isinstance(requested_provider, dict):
                 raise ValueError("request_options['provider'] must be a JSON object.")
             body["provider"].update(requested_provider)
+        if route_tags:
+            # Endpoint capability preflight owns the executable provider set.
+            # Customer routing preferences may narrow or order that safe set, but
+            # must never replace it with an endpoint that was not verified for the
+            # request's image/schema/reasoning/token envelope.
+            compatible = list(route_tags)
+            requested_only = (
+                requested_provider.get("only")
+                if isinstance(requested_provider, dict) else None
+            )
+            if requested_only is not None:
+                if not isinstance(requested_only, (list, tuple)):
+                    raise ValueError("request_options['provider']['only'] must be a list.")
+                allowed = {str(value).strip().casefold() for value in requested_only}
+                compatible = [
+                    tag for tag in compatible
+                    if tag.casefold() in allowed
+                    or str(route_names.get(tag) or "").casefold() in allowed
+                ]
+            requested_ignore = (
+                requested_provider.get("ignore")
+                if isinstance(requested_provider, dict) else None
+            )
+            if requested_ignore is not None:
+                if not isinstance(requested_ignore, (list, tuple)):
+                    raise ValueError("request_options['provider']['ignore'] must be a list.")
+                ignored = {str(value).strip().casefold() for value in requested_ignore}
+                compatible = [
+                    tag for tag in compatible
+                    if tag.casefold() not in ignored
+                    and str(route_names.get(tag) or "").casefold() not in ignored
+                ]
+            if not compatible:
+                modalities = ", ".join(sorted(required_modalities)) or "text"
+                raise ProviderError(
+                    "The requested provider controls exclude every current ZDR "
+                    f"endpoint verified for {model!r} and modalities: {modalities}."
+                )
+            body["provider"]["only"] = compatible
+            body["provider"]["allow_fallbacks"] = (
+                bool(body["provider"].get("allow_fallbacks", True))
+                and len(compatible) > 1
+            )
         # Privacy and parameter compatibility are Evalt safety invariants, not
         # tunable production behavior. All other OpenRouter provider-routing
         # controls remain available in the tested request envelope.
@@ -1182,7 +1919,7 @@ class OpenRouterTransport:
     def _bounded_output_tokens(
         self,
         model: str,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         requested_tokens: int,
         effort: str,
     ) -> int:
@@ -1190,7 +1927,7 @@ class OpenRouterTransport:
         context_limit, completion_limit = self._limits.get(model, (None, None))
         # Use a conservative character/token ratio and reserve framing overhead so
         # Evalt never asks for a full context window on top of a non-empty prompt.
-        estimated_prompt_tokens = max(1, math.ceil(len(json.dumps(messages)) / 3) + 128)
+        estimated_prompt_tokens = max(1, math.ceil(_text_character_count(messages) / 3) + 128)
         limits = [desired]
         if completion_limit:
             limits.append(max(1, completion_limit))
@@ -1277,7 +2014,7 @@ class Client:
         self,
         budget: _Budget,
         model: str,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         *,
         max_tokens: int,
         response_schema: dict[str, Any] | None = None,
@@ -1389,6 +2126,15 @@ class Client:
         prompt_text = str(prompt).strip()
         model_list = list(dict.fromkeys(str(model).strip() for model in models if str(model).strip()))
         example_list = [Example.from_value(value, index) for index, value in enumerate(examples)]
+        suite_required_modalities = {"text"}
+        for example in example_list:
+            for turn in example.conversation():
+                suite_required_modalities.update(required_input_modalities(turn.input))
+        if "image" in suite_required_modalities and optimize_prompt:
+            raise ValueError(
+                "Image suites require optimize_prompt=False because the prompt optimizer "
+                "does not inspect or rewrite against image pixels."
+            )
         self._validate(
             prompt_text,
             example_list,
@@ -1506,8 +2252,14 @@ class Client:
         if callable(catalog_loader) and model_list:
             catalog_snapshot = list(catalog_loader() or [])
         catalog_intelligence: dict[str, float] = {}
+        catalog_modalities: dict[str, set[str]] = {}
         for catalog_item in catalog_snapshot:
             try:
+                catalog_modalities[str(catalog_item["id"])] = {
+                    str(value).strip().casefold()
+                    for value in catalog_item.get("input_modalities") or ["text"]
+                    if str(value).strip()
+                }
                 intelligence = catalog_item.get("intelligence")
                 if intelligence is not None:
                     catalog_intelligence[str(catalog_item["id"])] = float(intelligence)
@@ -1517,7 +2269,27 @@ class Client:
         if callable(support_checker):
             eligible_models: list[str] = []
             for configuration in model_list:
-                support = support_checker(configuration)
+                base_model = configuration.split("#reasoning=", 1)[0]
+                listed_modalities = catalog_modalities.get(base_model)
+                if listed_modalities is not None and not suite_required_modalities.issubset(listed_modalities):
+                    support = {
+                        "supported": False,
+                        "reason": (
+                            f"The current model catalog does not list {base_model!r} as "
+                            "accepting all suite input modalities: "
+                            f"{', '.join(sorted(suite_required_modalities))}."
+                        ),
+                    }
+                else:
+                    try:
+                        support = support_checker(
+                            configuration,
+                            required_modalities=suite_required_modalities,
+                        )
+                    except TypeError:
+                        # Preserve compatibility with custom transports implementing
+                        # the original one-argument capability hook.
+                        support = support_checker(configuration)
                 if support.get("supported"):
                     eligible_models.append(configuration)
                     continue
@@ -1766,12 +2538,25 @@ class Client:
 
         if adaptive_search:
             sizing_input = representative_input_chars or max(
-                1, int(_percentile([len(item.input) for item in example_list], 0.90))
+                1, int(_percentile([
+                    _text_character_count(turn.input)
+                    for item in example_list for turn in item.conversation()
+                ], 0.90))
             )
             sizing_output = representative_output_tokens or 64
+            sizing_content: Any = "x" * sizing_input
+            if "image" in suite_required_modalities:
+                sizing_content = max(
+                    (
+                        turn.input
+                        for item in example_list for turn in item.conversation()
+                        if "image" in required_input_modalities(turn.input)
+                    ),
+                    key=lambda value: (_image_count(value), _text_character_count(value)),
+                )
             sizing_messages = [
                 {"role": "system", "content": prompt_text},
-                {"role": "user", "content": "x" * sizing_input},
+                {"role": "user", "content": sizing_content},
             ]
             broad_estimates: dict[str, float] = {}
             for model in broad_models:
@@ -2474,7 +3259,7 @@ class Client:
             "winning_prompt": winner.selected_prompt,
             "winning_few_shot_example_ids": winner.few_shot_example_ids,
             "winning_few_shot_provenance": winner.few_shot_provenance,
-            "examples": [asdict(item) for item in example_list],
+            "examples": [_safe_example_payload(item) for item in example_list],
             "selected_model": winner.model,
             "known_models": model_list,
             "optimizer_model": optimizer_model,
@@ -2912,11 +3697,24 @@ class Client:
             and holdout_by_difficulty[difficulty] >= floor
             for difficulty, floor in difficulty_thresholds.items()
         )
-        observed_inputs = [sum(len(turn.input) for turn in item.conversation()) for item in train + dev + holdout]
+        observed_inputs = [
+            sum(_text_character_count(turn.input) for turn in item.conversation())
+            for item in train + dev + holdout
+        ]
         observed_outputs = [sum(len(turn.approved_output) for turn in item.conversation()) for item in train + dev + holdout]
         typical_input = representative_input_chars or _percentile(observed_inputs, 0.90)
         typical_output_tokens = representative_output_tokens or max(32, int(_percentile(observed_outputs, 0.90) / 3) + 1)
-        production_messages = [{"role": "system", "content": selected_prompt}] + _few_shot_messages(train, selected_few_shot_ids) + [{"role": "user", "content": "x" * int(typical_input)}]
+        representative_content: Any = "x" * int(typical_input)
+        image_inputs = [
+            turn.input for item in train + dev + holdout for turn in item.conversation()
+            if "image" in required_input_modalities(turn.input)
+        ]
+        if image_inputs:
+            representative_content = max(
+                image_inputs,
+                key=lambda value: (_image_count(value), _text_character_count(value)),
+            )
+        production_messages = [{"role": "system", "content": selected_prompt}] + _few_shot_messages(train, selected_few_shot_ids) + [{"role": "user", "content": representative_content}]
         # A completion allowance is a safety ceiling, not an expected bill. Price
         # the promoted route from the measured 90th-percentile successful final-test
         # call so generous first-request headroom does not make a tiny JSON response
@@ -3019,7 +3817,7 @@ class Client:
 
         def run_execution(example: Example, repeat_index: int) -> list[CaseResult]:
             scenario_results: list[CaseResult] = []
-            transcript: list[dict[str, str]] = []
+            transcript: list[dict[str, Any]] = []
             demonstrations = _few_shot_messages(few_shot_source or [], few_shot_ids or [], exclude_id=example.id if split == "train" else "")
             for turn_index, turn in enumerate(example.conversation()):
                 target = self._call(
@@ -3081,7 +3879,7 @@ class Client:
         example: Example,
         turn: Turn,
         turn_index: int,
-        transcript: list[dict[str, str]],
+        transcript: list[dict[str, Any]],
         output: str,
         evaluator_model: str,
         budget: _Budget,
@@ -3124,8 +3922,14 @@ class Client:
                         {
                             "scenario_id": example.id,
                             "turn": turn_index + 1,
-                            "transcript": transcript,
-                            "input": turn.input,
+                            "transcript": [
+                                {
+                                    **message,
+                                    "content": safe_input_descriptor(message.get("content")),
+                                }
+                                for message in transcript
+                            ],
+                            "input": safe_input_descriptor(turn.input),
                             "approved_answer": turn.approved_output,
                             "actual_answer": output,
                         },
@@ -3167,7 +3971,20 @@ class Client:
         payload = {
             "target_model": target_model,
             "current_prompt": prompt,
-            "examples": [asdict(item) for item in train],
+            "examples": [
+                {
+                    **asdict(item),
+                    "input": safe_input_descriptor(item.input),
+                    "turns": [
+                        {
+                            "input": safe_input_descriptor(turn.input),
+                            "approved_output": turn.approved_output,
+                        }
+                        for turn in item.conversation()
+                    ],
+                }
+                for item in train
+            ],
             "baseline_results": [
                 {
                     "example_id": item.example_id,
@@ -3450,9 +4267,9 @@ def _split_examples(examples: list[Example], seed: str) -> tuple[list[Example], 
     return ranked[holdout_count + dev_count :], ranked[holdout_count : holdout_count + dev_count], ranked[:holdout_count]
 
 
-def _few_shot_messages(examples: list[Example], selected_ids: list[str], exclude_id: str = "") -> list[dict[str, str]]:
+def _few_shot_messages(examples: list[Example], selected_ids: list[str], exclude_id: str = "") -> list[dict[str, Any]]:
     selected = set(selected_ids)
-    messages: list[dict[str, str]] = []
+    messages: list[dict[str, Any]] = []
     for example in examples:
         if example.id not in selected or example.id == exclude_id:
             continue

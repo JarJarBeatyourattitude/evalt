@@ -4,16 +4,21 @@ from __future__ import annotations
 
 import json
 import hashlib
+import hmac
 import os
 from pathlib import Path
 import queue
+import re
 import secrets
+import ssl
 import threading
 import time
 from typing import Any, Callable, Mapping
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
+
+import certifi
 
 
 DEFAULT_DASHBOARD_API_URL = "https://evalt.onrender.com"
@@ -24,6 +29,32 @@ _SENSITIVE_KEYS = {
     "examples", "api_key", "openrouter_api_key", "authorization", "request_options",
     "tested_request_options", "tool_calls", "raw_response",
 }
+
+
+def _verified_urlopen(
+    request: Request,
+    *,
+    timeout_seconds: float,
+    opener: Callable[..., Any] | None = None,
+):
+    """Open HTTPS with the package CA bundle on Python installations lacking one.
+
+    The python.org macOS framework build can have no usable system trust store even
+    when ``certifi`` is installed. Provider calls already use this explicit bundle;
+    the optional dashboard bridge must use the same verified transport instead of
+    silently failing every workspace write.
+    """
+
+    resolved = opener or urlopen
+    context = ssl.create_default_context(cafile=certifi.where())
+    try:
+        return resolved(request, timeout=float(timeout_seconds), context=context)
+    except TypeError:
+        # Deterministic test/custom openers commonly expose urllib's two-argument
+        # shape. Production always uses the context-aware stdlib opener above.
+        if opener is None:
+            raise
+        return resolved(request, timeout=float(timeout_seconds))
 
 
 def generate_workspace_token() -> str:
@@ -142,7 +173,7 @@ def inspect_workspace(
     *,
     api_url: str = DEFAULT_DASHBOARD_API_URL,
     timeout_seconds: float = 8.0,
-    opener: Callable[..., Any] = urlopen,
+    opener: Callable[..., Any] | None = None,
 ) -> dict[str, Any]:
     """Check one hosted workspace without exposing its capability or route content."""
 
@@ -153,7 +184,9 @@ def inspect_workspace(
         headers={"Authorization": f"Bearer {validated}", "Accept": "application/json"},
     )
     try:
-        with opener(request, timeout=float(timeout_seconds)) as response:
+        with _verified_urlopen(
+            request, timeout_seconds=timeout_seconds, opener=opener
+        ) as response:
             payload = json.loads(response.read().decode("utf-8"))
             if not isinstance(payload, list):
                 raise ValueError("hosted workspace returned an invalid route index")
@@ -179,6 +212,20 @@ def _safe_scalar(value: Any, maximum: int = 240) -> Any:
     return str(value)[:maximum]
 
 
+def _workspace_contract_id(token: str, kind: str, local_hash: Any) -> str | None:
+    """Derive an equality-only identifier without publishing a content-derived hash."""
+
+    value = str(local_hash or "").strip().lower()
+    if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
+        return None
+    digest = hmac.new(
+        token.encode("utf-8"),
+        f"evalt-{kind}-contract:{value}".encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()[:24]
+    return f"{kind}_{digest}"
+
+
 def sanitize_progress_event(event: Mapping[str, Any]) -> dict[str, Any]:
     allowed = {
         "event", "route", "model", "designer_model", "evaluator_model", "winner_model",
@@ -187,7 +234,7 @@ def sanitize_progress_event(event: Mapping[str, Any]) -> dict[str, Any]:
         "provider_cost_usd", "workflow_spend_usd", "test_budget_spent_usd",
         "workflow_budget_usd", "remaining_budget_usd", "elapsed_seconds",
         "reasoning_effort", "to_effort", "phase", "error", "decision_reason",
-        "evidence_provenance", "request_envelope_validated",
+        "evidence_provenance", "request_envelope_validated", "route_version",
         "attempt", "max_attempts", "will_retry", "configurations",
         "completed_configurations", "parallel_models", "screening_scenarios",
         "validation_scenarios", "final_test_scenarios", "final_test_executions",
@@ -219,6 +266,10 @@ def sanitize_progress_event(event: Mapping[str, Any]) -> dict[str, Any]:
     }
     safe["event"] = str(safe.get("event") or "progress")[:80]
     safe["route"] = str(safe.get("route") or "default")[:80]
+    if "route_version" in safe and re.fullmatch(
+        r"rv_[0-9a-f]{20}", str(safe["route_version"])
+    ) is None:
+        safe.pop("route_version", None)
     safe["timestamp"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     return safe
 
@@ -231,31 +282,102 @@ def sanitize_route_snapshot(status: Mapping[str, Any]) -> dict[str, Any]:
         "effective_price_ceiling_usd", "test_budget_usd", "test_budget_policy",
         "target_accuracy", "objective", "max_p90_latency_seconds", "optimize_prompt",
         "target_max_tokens", "total_calls", "feedback_count", "maintenance_due",
+        "production_cost_total_usd", "production_latency_p50_ms",
+        "production_latency_p90_ms",
         "catalog_revision", "tested_catalog_revision",
         "latest_run_id", "latest_run_state", "latest_run_started_at",
         "latest_run_finished_at",
+        "input_modalities", "case_count", "candidate_models",
+        "current_package_id", "qualified_package_count", "recent_route_versions",
     }
     safe = {
         key: (
-            [str(item)[:120] for item in value[:20]]
-            if key == "maintenance_due" and isinstance(value, (list, tuple))
+            [str(item)[:120] for item in value[:25]]
+            if key in {"maintenance_due", "input_modalities", "candidate_models"}
+            and isinstance(value, (list, tuple))
             else _safe_scalar(value)
         )
         for key, value in status.items()
-        if key in allowed and key.lower() not in _SENSITIVE_KEYS
+        if key in allowed
+        and key != "recent_route_versions"
+        and key.lower() not in _SENSITIVE_KEYS
     }
+    package_pattern = re.compile(r"^rv_[0-9a-f]{20}$")
+    current_package_id = str(safe.get("current_package_id") or "")
+    if not package_pattern.fullmatch(current_package_id):
+        safe.pop("current_package_id", None)
+    versions: list[dict[str, Any]] = []
+    raw_versions = status.get("recent_route_versions")
+    if isinstance(raw_versions, (list, tuple)):
+        for raw in raw_versions[:5]:
+            if not isinstance(raw, Mapping):
+                continue
+            package_id = str(raw.get("package_id") or "")
+            if not package_pattern.fullmatch(package_id):
+                continue
+            rollback_of = str(raw.get("rollback_of_package_id") or "")
+            version = {
+                "package_id": package_id,
+                "activated_at": _safe_scalar(raw.get("activated_at"), 40),
+                "activation_reason": _safe_scalar(
+                    raw.get("activation_reason"), 40
+                ),
+                "current": bool(raw.get("current")),
+                "restorable": bool(raw.get("restorable")),
+                "selected_model": _safe_scalar(raw.get("selected_model"), 180),
+                "prompt_version": _safe_scalar(raw.get("prompt_version"), 32),
+                "evidence_provenance": _safe_scalar(
+                    raw.get("evidence_provenance"), 80
+                ),
+                "holdout_pass_rate": _safe_scalar(raw.get("holdout_pass_rate")),
+                "final_test_accuracy_lower_bound": _safe_scalar(
+                    raw.get("final_test_accuracy_lower_bound")
+                ),
+                "workflow_spend_usd": _safe_scalar(raw.get("workflow_spend_usd")),
+                "target_latency_p90_ms": _safe_scalar(
+                    raw.get("target_latency_p90_ms")
+                ),
+            }
+            if raw.get("problem"):
+                version["problem"] = _safe_scalar(raw.get("problem"), 100)
+            if package_pattern.fullmatch(rollback_of):
+                version["rollback_of_package_id"] = rollback_of
+            versions.append(version)
+    safe["recent_route_versions"] = versions
     summary = status.get("last_test_summary")
     if isinstance(summary, Mapping):
         summary_allowed = {
             "winner_model", "winner_prompt_version", "holdout_pass_rate", "final_test_pass_rate",
             "final_test_scenarios", "final_test_executions", "estimated_cost_per_successful_call_usd",
-            "optimization_spend_usd", "quality_gate_status", "few_shot_examples",
+            "optimization_spend_usd", "workflow_spend_usd", "quality_gate_status", "few_shot_examples",
+            "tested_configurations", "prompt_candidates_tested", "prompt_rewrites_tested",
             "designer_model", "evaluator_model", "judge_calibration_checks", "request_options_sha256",
             "final_test_evidence_status", "final_test_confidence_level",
             "final_test_accuracy_lower_bound", "target_accuracy_statistically_supported",
             "minimum_zero_failure_scenarios",
+            "input_modalities", "case_count", "candidate_models",
+            "suite_contract_id", "evaluator_contract_id", "evaluator_type",
         }
-        safe["last_test_summary"] = {key: _safe_scalar(value) for key, value in summary.items() if key in summary_allowed}
+        safe_summary = {
+            key: _safe_scalar(value)
+            for key, value in summary.items()
+            if key in summary_allowed
+        }
+        for key, prefix in (
+            ("suite_contract_id", "suite_"),
+            ("evaluator_contract_id", "evaluator_"),
+        ):
+            value = str(safe_summary.get(key) or "")
+            suffix = value[len(prefix):] if value.startswith(prefix) else ""
+            if len(suffix) != 24 or any(
+                character not in "0123456789abcdef" for character in suffix
+            ):
+                safe_summary.pop(key, None)
+        if safe_summary.get("evaluator_type") not in {
+            "semantic", "exact_text", "exact_json", "numeric_tolerance",
+        }:
+            safe_summary.pop("evaluator_type", None)
+        safe["last_test_summary"] = safe_summary
     safe["schema"] = "evalt-workspace-route-v1"
     safe["route"] = str(status.get("route") or "default")[:80]
     safe["synced_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -290,7 +412,9 @@ class WorkspaceSync:
             method=method,
             headers={"Authorization": f"Bearer {self.token}", "Content-Type": "application/json"},
         )
-        with urlopen(request, timeout=self.timeout_seconds) as response:
+        with _verified_urlopen(
+            request, timeout_seconds=self.timeout_seconds
+        ) as response:
             if response.status >= 300:
                 raise OSError(f"dashboard returned HTTP {response.status}")
 
@@ -340,7 +464,22 @@ class WorkspaceSync:
         self._publish("POST", f"/api/workspace/routes/{quote(safe['route'], safe='')}/events", safe)
 
     def publish_route(self, status: Mapping[str, Any]) -> None:
-        safe = sanitize_route_snapshot(status)
+        prepared = dict(status)
+        raw_summary = status.get("last_test_summary")
+        if isinstance(raw_summary, Mapping):
+            summary = dict(raw_summary)
+            suite_contract_id = _workspace_contract_id(
+                self.token, "suite", summary.pop("suite_hash", None)
+            )
+            evaluator_contract_id = _workspace_contract_id(
+                self.token, "evaluator", summary.pop("evaluator_contract_hash", None)
+            )
+            if suite_contract_id:
+                summary["suite_contract_id"] = suite_contract_id
+            if evaluator_contract_id:
+                summary["evaluator_contract_id"] = evaluator_contract_id
+            prepared["last_test_summary"] = summary
+        safe = sanitize_route_snapshot(prepared)
         self._publish("PUT", f"/api/workspace/routes/{quote(safe['route'], safe='')}", safe)
 
     def flush(self, timeout_seconds: float = 10.0) -> bool:

@@ -10,6 +10,7 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from dataclasses import asdict, dataclass, field, replace
 from functools import wraps
 import copy
+import hashlib
 import json
 from pathlib import Path
 import re
@@ -27,6 +28,7 @@ from last_good_prompt.core import (
     Completion,
     DraftAnswer,
     Example,
+    ImageInput,
     Judgment,
     ModelResult,
     OpenRouterTransport,
@@ -34,16 +36,32 @@ from last_good_prompt.core import (
     ProviderError,
     Turn,
     _Budget,
+    _embedded_image_payload_bytes,
     _extract_single_numeric_scalar,
     _safe_provider_error_detail,
     _validate_evaluator_policy,
     normalize_request_options,
+    multimodal_input,
+    required_input_modalities,
     request_options_fingerprint,
 )
 from .router import (
     DEFAULT_TARGETS, DurableRouter, RequestEnvelopeDriftWarning, RolePlan,
-    RoutedAnswer, select_role_plan,
+    RouteVersionMismatch, RoutedAnswer, select_role_plan,
 )
+
+
+def _evaluator_contract_hash(
+    evaluator: Mapping[str, Any], evaluator_model: str
+) -> str:
+    payload = {
+        "evaluator": dict(evaluator),
+        "evaluator_model": str(evaluator_model),
+        "contract_version": 1,
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
 from .dashboard import DEFAULT_DASHBOARD_API_URL, WorkspaceSync, load_dashboard_config
 
 
@@ -52,6 +70,8 @@ _NUMBER_WORDS = {
     "five": 5.0, "six": 6.0, "seven": 7.0, "eight": 8.0,
     "nine": 9.0, "ten": 10.0, "hundred": 100.0,
 }
+
+_MAX_SUITE_IMAGE_BYTES = 40 * 1024 * 1024
 
 
 def _infer_numeric_scale_contract(*values: str) -> tuple[float, float] | None:
@@ -325,6 +345,28 @@ class Suite:
         if not 1 <= int(self.target_max_tokens) <= 131072:
             raise ValueError("target_max_tokens must be between 1 and 131072.")
         normalize_request_options(self.request_options)
+        suite_modalities = {
+            modality
+            for example in self.examples
+            for turn in example.conversation()
+            for modality in required_input_modalities(turn.input)
+        }
+        embedded_image_bytes = sum(
+            _embedded_image_payload_bytes(part.get("image_url", {}).get("url"))
+            for example in self.examples
+            for turn in example.conversation()
+            for part in (turn.input if isinstance(turn.input, list) else [])
+            if isinstance(part, Mapping) and part.get("type") == "image_url"
+        )
+        if embedded_image_bytes > _MAX_SUITE_IMAGE_BYTES:
+            raise ValueError(
+                "An Evalt suite can contain at most 40 MiB of embedded image data."
+            )
+        if "image" in suite_modalities and self.optimize_prompt:
+            raise ValueError(
+                "Image-bearing suites currently require optimize_prompt=False so "
+                "prompt revisions cannot be chosen without seeing the labeled images."
+            )
         if self.max_p90_latency_seconds is not None and self.max_p90_latency_seconds <= 0:
             raise ValueError("max_p90_latency_seconds must be positive when provided.")
         if self.latency_value_usd_per_second < 0:
@@ -341,7 +383,7 @@ class Suite:
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "schema": "evalt-suite-v1",
+            "schema": "evalt-suite-v2",
             "name": self.name,
             "prompt": self.prompt,
             "examples": [asdict(example) for example in self.examples],
@@ -675,7 +717,7 @@ class Evalt:
         elif status == "synced":
             message = (
                 f"Evalt · {route} · DASHBOARD SYNCED · {workspace_id} · "
-                "open with: evalt dashboard"
+                f'open with: "{Path(sys.executable).resolve()}" -m evalt dashboard'
             )
         elif status == "failed":
             detail = str(getattr(self._dashboard_sync, "last_error", "") or "")
@@ -687,7 +729,8 @@ class Evalt:
         else:
             message = (
                 f"Evalt · {route} · LOCAL WORKSPACE ONLY · "
-                "run `evalt connect` to show this route at evalt.dev"
+                f'run `"{Path(sys.executable).resolve()}" -m evalt connect` '
+                "to show this route at evalt.dev"
             )
         self._print_progress_message(message)
 
@@ -1848,6 +1891,7 @@ class Evalt:
         input: Any | None = None,
         *,
         route: str = "default",
+        route_version: str | None = None,
         incumbent_model: str | None = None,
         price_usd: float | None = None,
         test_budget_usd: float | str = "auto",
@@ -1870,6 +1914,7 @@ class Evalt:
         auto_maintain: bool = True,
         task: str | None = None,
         first_run: str = "optimize",
+        reoptimize: bool = False,
         case_count: int = 25,
         optimization_rounds: int = 1,
         designer_model: str | None = None,
@@ -1878,6 +1923,11 @@ class Evalt:
         designer_request_timeout_seconds: float = 45,
     ) -> OptimizationResult | RoutedAnswer:
         if isinstance(suite_or_prompt, Suite):
+            if route_version is not None:
+                raise ValueError(
+                    "route_version is only used for production calls with a prompt "
+                    "and input, not explicit Suite optimization."
+                )
             if input is not None:
                 raise ValueError("input is not used when running an explicit Suite.")
             suite_or_prompt.validate()
@@ -1915,9 +1965,73 @@ class Evalt:
                     0,
                     "This suite was AI-generated and AI-judged; it is directional evidence, not a human-verified regression contract.",
                 )
+            if self._dashboard_sync is not None:
+                input_modalities = sorted({
+                    modality
+                    for example in suite_or_prompt.examples
+                    for turn in example.conversation()
+                    for modality in required_input_modalities(turn.input)
+                }) or ["text"]
+                winner = result.winner
+                self._dashboard_sync.publish_route({
+                    "route": suite_or_prompt.name,
+                    "selected_model": winner.model,
+                    "decision_reason": (
+                        "explicit_suite_qualified"
+                        if result.quality_gate_status == "QUALIFIED_ROUTE_SELECTED"
+                        else "explicit_suite_provisional"
+                    ),
+                    "evidence_provenance": suite_or_prompt.evidence_provenance,
+                    "target_accuracy": suite_or_prompt.quality_threshold,
+                    "objective": suite_or_prompt.objective,
+                    "test_budget_usd": suite_or_prompt.max_optimization_cost_usd,
+                    "optimize_prompt": suite_or_prompt.optimize_prompt,
+                    "target_max_tokens": suite_or_prompt.target_max_tokens,
+                    "input_modalities": input_modalities,
+                    "case_count": len(suite_or_prompt.examples),
+                    "candidate_models": list(suite_or_prompt.models),
+                    "last_test_summary": {
+                        "winner_model": winner.model,
+                        "holdout_pass_rate": winner.holdout_pass_rate,
+                        "final_test_scenarios": winner.holdout_unique_scenarios,
+                        "final_test_executions": winner.holdout_executions,
+                        "optimization_spend_usd": result.total_provider_spend_usd,
+                        "quality_gate_status": result.quality_gate_status,
+                        "final_test_evidence_status": winner.final_test_evidence_status,
+                        "target_accuracy_statistically_supported": winner.target_accuracy_statistically_supported,
+                        "input_modalities": input_modalities,
+                        "case_count": len(suite_or_prompt.examples),
+                        "candidate_models": list(suite_or_prompt.models),
+                        "suite_hash": result.regression_suite.get("suite_hash"),
+                        "evaluator_contract_hash": _evaluator_contract_hash(
+                            suite_or_prompt.evaluator,
+                            getattr(
+                                result, "evaluator_model",
+                                suite_or_prompt.evaluator_model,
+                            ),
+                        ),
+                        "evaluator_type": str(
+                            suite_or_prompt.evaluator.get("type") or "semantic"
+                        ),
+                    },
+                })
             return result
         if input is None:
             raise ValueError("input is required when executing a prompt through Evalt.")
+        pinned_package: Mapping[str, Any] | None = None
+        if route_version is not None:
+            if reoptimize:
+                raise ValueError(
+                    "route_version cannot be combined with reoptimize=True. "
+                    "Qualify deliberately, then deploy the new returned version."
+                )
+            # Fail before catalog discovery, suite design, maintenance, or any
+            # provider transport can spend money. The router repeats this check at
+            # the production boundary to close the concurrent-change window.
+            pinned_package = self.router.require_version(
+                route, route_version, prompt=suite_or_prompt
+            )
+        input_modalities = required_input_modalities(input)
         workflow_started = time.monotonic()
         first_route_optimized = False
         test_design_seconds = 0.0
@@ -2000,26 +2114,92 @@ class Evalt:
             if not 0 <= resolved_test_budget_usd <= float(max_test_budget_usd):
                 raise ValueError("test_budget_usd must be non-negative and no greater than max_test_budget_usd.")
             test_budget_policy = "explicit"
-        requested_models = tuple(models) if models is not None else DEFAULT_TARGETS
+        if pinned_package is not None:
+            target_accuracy = float(pinned_package["quality_threshold"])
+            objective = str(pinned_package["objective"])
+            optimize_prompt = bool(pinned_package["optimize_prompt"])
+            max_p90_latency_seconds = (
+                float(pinned_package["max_p90_latency_seconds"])
+                if pinned_package["max_p90_latency_seconds"] is not None
+                else None
+            )
+            latency_value_usd_per_second = float(
+                pinned_package["latency_value_usd_per_second"]
+            )
+            resolved_test_budget_usd = 0.0
+            test_budget_policy = (
+                "pinned production: no automatic qualification or maintenance spend"
+            )
+        requested_models = (
+            (str(pinned_package["selected_model"]),)
+            if pinned_package is not None
+            else tuple(models) if models is not None else DEFAULT_TARGETS
+        )
         catalog: list[Mapping[str, Any]] = []
-        if models is None and hasattr(self.client.transport, "model_catalog"):
+        if (
+            pinned_package is None
+            and models is None
+            and hasattr(self.client.transport, "model_catalog")
+        ):
             catalog = self.client.transport.model_catalog()
+            if "image" in input_modalities:
+                catalog = [
+                    item for item in catalog
+                    if "image" in {
+                        str(value)
+                        for value in item.get("input_modalities") or []
+                    }
+                ]
         role_plan = select_role_plan(
             catalog,
             maintenance_budget_usd=resolved_test_budget_usd,
             fallback_targets=requested_models,
         )
-        if models is None and role_plan.catalog_revision != "fallback":
+        if (
+            pinned_package is None
+            and models is None
+            and role_plan.catalog_revision != "fallback"
+        ):
             requested_models = role_plan.target_models
-        if incumbent_model:
+        if incumbent_model and pinned_package is None:
             requested_models = tuple(dict.fromkeys((incumbent_model, *requested_models)))
+        support_checker = getattr(self.client.transport, "configuration_support", None)
+        if (
+            pinned_package is None
+            and callable(support_checker)
+            and "image" in input_modalities
+        ):
+            supported_models: list[str] = []
+            for model in requested_models:
+                try:
+                    support = support_checker(
+                        model, required_modalities=input_modalities
+                    )
+                except TypeError:
+                    support = support_checker(model)
+                if support.get("supported"):
+                    supported_models.append(model)
+            requested_models = tuple(supported_models)
+            if not requested_models:
+                raise ProviderError(
+                    "No requested model has a current image-capable private route."
+                )
         initial_test_spend_usd = 0.0
         try:
             if (
                 first_run == "optimize"
                 and resolved_test_budget_usd > 0
-                and self.router.needs_initial_optimization(route, suite_or_prompt)
+                and (
+                    bool(reoptimize)
+                    or self.router.needs_initial_optimization(route, suite_or_prompt)
+                )
             ):
+                if "image" in input_modalities:
+                    raise ValueError(
+                        "Automatic first-route test design cannot invent image evidence. "
+                        "Run a human-approved multimodal Suite with optimize_prompt=False, "
+                        "or use first_run='bootstrap' without a saved accuracy claim."
+                    )
                 self._emit_progress({
                     "event": "initial_optimization_started",
                     "route": route,
@@ -2086,6 +2266,10 @@ class Evalt:
                         judge_calibration_checks=draft.judge_calibration_checks,
                         target_max_tokens=draft.target_max_tokens,
                         request_options=draft.request_options,
+                        objective=objective,
+                        max_p90_latency_seconds=max_p90_latency_seconds,
+                        latency_value_usd_per_second=latency_value_usd_per_second,
+                        optimize_prompt=bool(optimize_prompt),
                     )
                 except ValueError as error:
                     provider_error = ProviderError(str(error))
@@ -2108,6 +2292,7 @@ class Evalt:
             self._emit_progress({
                 "event": "production_call_started",
                 "route": route,
+                "route_version": route_version,
                 "target_accuracy": target_accuracy,
                 "test_budget_usd": resolved_test_budget_usd,
                 "test_budget_policy": test_budget_policy,
@@ -2116,6 +2301,7 @@ class Evalt:
             production_started = time.monotonic()
             answer = self.router.run(
                 route=route,
+                route_version=route_version,
                 prompt=suite_or_prompt,
                 input=input,
                 max_cost_per_run_usd=max_cost_per_run_usd,
@@ -2152,6 +2338,7 @@ class Evalt:
         self._emit_progress({
             "event": "production_call_completed",
             "route": route,
+            "route_version": answer.route_version,
             "model": answer.model,
             "provider_cost_usd": answer.provider_cost_usd,
             "price_policy": status["price_policy"],
@@ -2196,6 +2383,7 @@ class Evalt:
                 self._dashboard_sync.publish_route(self.router.status(route))
             if (
                 auto_maintain
+                and route_version is None
                 and receipt.get("is_new")
                 and resolved_test_budget_usd > 0
                 and receipt.get("maintenance_due")
@@ -2223,12 +2411,93 @@ class Evalt:
             raise ValueError("test_budget_usd is required for an explicit maintenance run.")
         return self.router.maintain(route, test_budget_usd=float(resolved), role_plan=role_plan, objective=objective, max_cost_per_run_usd=max_cost_per_run_usd, rounds=rounds, min_feedback=min_feedback)
 
+    def qualify_route(
+        self, suite: Suite, *, route: str | None = None
+    ) -> OptimizationResult:
+        """Run a human-approved Suite and install its qualified local package.
+
+        This is the explicit installation path for image and other multimodal
+        suites. Raw cases, labels, and image bytes stay out of route state and
+        dashboard sync; only the winning tested envelope is installed.
+        """
+
+        suite.validate()
+        route_name = str(route or suite.name).strip()
+        if not route_name:
+            raise ValueError("route must be a stable non-empty name.")
+        result = self.run(suite)
+        evaluator_model = str(
+            getattr(result, "evaluator_model", "") or suite.evaluator_model
+        )
+        catalog_revision = "explicit-suite-" + hashlib.sha256(json.dumps(
+            list(suite.models), sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")).hexdigest()[:16]
+        self.router.install_initial_result(
+            route=route_name,
+            prompt=suite.prompt,
+            models=suite.models,
+            quality_threshold=suite.quality_threshold,
+            catalog_revision=catalog_revision,
+            result=result,
+            examples=suite.examples,
+            evidence_provenance=suite.evidence_provenance,
+            total_workflow_spend_usd=result.total_provider_spend_usd,
+            designer_model=suite.optimizer_model,
+            evaluator_model=evaluator_model,
+            judge_calibration_checks=0,
+            target_max_tokens=suite.target_max_tokens,
+            request_options=suite.request_options,
+            objective=suite.objective,
+            max_p90_latency_seconds=suite.max_p90_latency_seconds,
+            latency_value_usd_per_second=suite.latency_value_usd_per_second,
+            optimize_prompt=suite.optimize_prompt,
+        )
+        if self._dashboard_sync is not None:
+            self._dashboard_sync.publish_route(self.router.status(route_name))
+            self.flush_dashboard(timeout_seconds=5.0)
+        return result
+
     def route_status(self, route: str, *, retest_after_calls: int = 500, min_feedback: int = 5) -> dict[str, Any]:
         status = self.router.status(route, retest_after_calls=retest_after_calls, min_feedback=min_feedback)
         if self._dashboard_sync is not None:
             self._dashboard_sync.publish_route(status)
             self.flush_dashboard(timeout_seconds=5.0)
         return status
+
+    def route_versions(self, route: str) -> list[dict[str, Any]]:
+        """List immutable qualified packages without making a provider call."""
+
+        return self.router.list_versions(route)
+
+    def annotate_route_version(
+        self,
+        route: str,
+        package_id: str,
+        *,
+        alias: str | None = None,
+        note: str | None = None,
+        expected_alias: str | None = None,
+    ) -> dict[str, Any]:
+        """Set private local version metadata without syncing or calling a provider."""
+
+        return self.router.annotate_version(
+            route,
+            package_id,
+            alias=alias,
+            note=note,
+            expected_alias=expected_alias,
+        )
+
+    def rollback_route(self, route: str, package_id: str) -> dict[str, Any]:
+        """Restore a qualified package by exact ID or local alias."""
+
+        result = self.router.rollback(route, package_id)
+        if self._dashboard_sync is not None:
+            self._dashboard_sync.publish_route(self.router.status(route))
+            result["dashboard_sync_succeeded"] = self.flush_dashboard(
+                timeout_seconds=5.0
+            )
+        return result
 
     def sync_existing_routes(self, timeout_seconds: float = 10.0) -> dict[str, Any]:
         """Publish current sanitized route summaries without making provider calls."""
@@ -2302,7 +2571,11 @@ def check_result(
     )
     if "selected" in winner and isinstance(winner["selected"], Mapping):
         winner = winner["selected"]
-    holdout = winner.get("holdout_pass_rate") or winner.get("pass_rate")
+    holdout = (
+        winner.get("holdout_pass_rate")
+        if winner.get("holdout_pass_rate") is not None
+        else winner.get("pass_rate")
+    )
     if holdout is None:
         holdout_record = winner.get("selectedHoldout") or winner.get("selected_holdout") or {}
         holdout = holdout_record.get("passRate") or holdout_record.get("pass_rate") or 0
@@ -2356,17 +2629,20 @@ __all__ = [
     "Evalt",
     "Example",
     "GateReport",
+    "ImageInput",
     "Judgment",
     "ModelResult",
     "OpenRouterTransport",
     "OptimizationResult",
     "ProviderError",
     "RequestEnvelopeDriftWarning",
+    "RouteVersionMismatch",
     "RolePlan",
     "RoutedAnswer",
     "Suite",
     "Turn",
     "check_result",
+    "multimodal_input",
     "select_role_plan",
     "_safe_provider_error_detail",
 ]

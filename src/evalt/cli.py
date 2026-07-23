@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 import argparse
+import certifi
+from dataclasses import replace
 import json
 from pathlib import Path
+import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -12,7 +16,12 @@ import webbrowser
 
 from .core import BudgetExceeded, Evalt, ProviderError, Suite, check_result
 from .migration import migrate_openai_results
-from .reporting import compare_results, render_comparison_html, write_reports
+from .reporting import (
+    check_regression,
+    compare_results,
+    render_comparison_html,
+    write_reports,
+)
 from .dashboard import (
     DEFAULT_DASHBOARD_API_URL,
     DEFAULT_DASHBOARD_APP_URL,
@@ -26,23 +35,97 @@ from .dashboard import (
 )
 
 
+HOSTED_SDK_VERSION = "0.10.28"
+HOSTED_WHEEL_URL = (
+    "https://evalt.onrender.com/python-sdk/dist/"
+    f"evalt-{HOSTED_SDK_VERSION}-py3-none-any.whl"
+)
+HOSTED_RELEASE_REQUIREMENTS_URL = "https://evalt.onrender.com/python-sdk/latest.txt"
+
+
 def _sdk_version() -> str:
     from . import __version__
     return __version__
 
 
-def _runtime_identity() -> dict[str, str]:
+def _runtime_identity() -> dict[str, object]:
     executable = str(Path(sys.executable).resolve())
+    installed_version = _sdk_version()
+    hosted_current = installed_version == HOSTED_SDK_VERSION
     return {
-        "sdk_version": _sdk_version(),
+        "sdk_version": installed_version,
+        "installed_sdk_version": installed_version,
+        "hosted_sdk_version": HOSTED_SDK_VERSION,
+        "hosted_wheel_url": HOSTED_WHEEL_URL,
+        "installed_matches_hosted": hosted_current,
         "python_executable": executable,
         "evalt_package": str(Path(__file__).resolve().parent),
+        "tls_ca_bundle": certifi.where(),
         "same_interpreter_command": f'"{executable}" -m evalt doctor',
+        "same_interpreter_install_command": (
+            f'"{executable}" -m pip install --upgrade '
+            f'-r {HOSTED_RELEASE_REQUIREMENTS_URL}'
+        ),
+        "upgrade_required": not hosted_current,
+        "installation_channel_note": (
+            "Use same_interpreter_install_command when versions differ. Bare pip may "
+            "select another Python installation, and the public PyPI release may trail "
+            "Evalt's exact hosted wheel. The stable latest.txt channel resolves to "
+            "one versioned wheel so this command does not go stale with the next release."
+        ),
+    }
+
+
+def _console_entrypoint_identity() -> dict[str, object]:
+    """Compare the PATH console shim with this interpreter without provider work."""
+
+    entrypoint = shutil.which("evalt")
+    if not entrypoint:
+        return {
+            "console_entrypoint": None,
+            "console_entrypoint_version": None,
+            "console_entrypoint_matches_sdk": None,
+            "installation_warning": None,
+        }
+    version = None
+    error = None
+    try:
+        completed = subprocess.run(
+            [entrypoint, "--version"],
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=5,
+        )
+        output = (completed.stdout or completed.stderr or "").strip()
+        version = output.split()[-1] if completed.returncode == 0 and output else None
+        if completed.returncode != 0:
+            error = f"console entrypoint exited {completed.returncode}"
+    except (OSError, subprocess.SubprocessError) as exc:
+        error = str(exc)[:180] or exc.__class__.__name__
+    matches = version == _sdk_version() if version else None
+    warning = None
+    if matches is False:
+        warning = (
+            f"The PATH evalt command reports {version}, but this Python imports "
+            f"evalt {_sdk_version()}. Use the quoted python_executable with -m evalt "
+            "for connect, doctor, dashboard, and runs."
+        )
+    elif error:
+        warning = (
+            "The PATH evalt command could not identify itself. Use the quoted "
+            "python_executable with -m evalt to avoid a stale console shim."
+        )
+    return {
+        "console_entrypoint": str(Path(entrypoint).resolve()),
+        "console_entrypoint_version": version,
+        "console_entrypoint_matches_sdk": matches,
+        "installation_warning": warning,
     }
 
 
 STARTER_SUITE = {
-    "schema": "evalt-suite-v1",
+    "schema": "evalt-suite-v2",
     "name": "support-routing",
     "prompt": "Classify the support message. Return one route label.",
     "examples": [
@@ -214,6 +297,62 @@ def parser() -> argparse.ArgumentParser:
     status.add_argument("--route", required=True)
     status.add_argument("--state", default=".evalt/evalt.db")
 
+    versions = commands.add_parser(
+        "versions",
+        help="List immutable qualified packages for one local route; no provider call.",
+    )
+    versions.add_argument("--route", required=True)
+    versions.add_argument("--state", default=".evalt/evalt.db")
+
+    annotate_version = commands.add_parser(
+        "annotate-version",
+        help="Name or describe one qualified route version locally; no provider call or dashboard sync.",
+    )
+    annotate_version.add_argument("--route", required=True)
+    annotate_version.add_argument(
+        "--version",
+        required=True,
+        dest="package_id",
+        help="Exact rv_ version ID from `evalt versions`.",
+    )
+    alias_action = annotate_version.add_mutually_exclusive_group()
+    alias_action.add_argument("--alias", help="Private local alias, such as known-good.")
+    alias_action.add_argument(
+        "--clear-alias",
+        action="store_true",
+        help="Remove the private local alias.",
+    )
+    note_action = annotate_version.add_mutually_exclusive_group()
+    note_action.add_argument("--note", help="Private local note (240 characters max).")
+    note_action.add_argument(
+        "--clear-note",
+        action="store_true",
+        help="Remove the private local note.",
+    )
+    annotate_version.add_argument(
+        "--expected-alias",
+        help="Only update if the current alias matches; use an empty value for no alias.",
+    )
+    annotate_version.add_argument("--state", default=".evalt/evalt.db")
+
+    rollback = commands.add_parser(
+        "rollback",
+        help="Atomically restore a qualified local route package; no provider call.",
+    )
+    rollback.add_argument("--route", required=True)
+    rollback.add_argument(
+        "--version",
+        required=True,
+        dest="package_id",
+        help="Exact rv_ version ID or unambiguous private local alias.",
+    )
+    rollback.add_argument("--state", default=".evalt/evalt.db")
+    rollback.add_argument(
+        "--yes",
+        action="store_true",
+        help="Confirm changing the locally serving package.",
+    )
+
     optimize = commands.add_parser("optimize", help="Run the suite under its hard provider-spend cap.")
     optimize.add_argument("suite")
     optimize.add_argument("--output", default="evalt-result.json")
@@ -245,6 +384,35 @@ def parser() -> argparse.ArgumentParser:
     check.add_argument("--min-pass-rate", type=float, default=0.95)
     check.add_argument("--max-cost-per-success", type=float)
     check.add_argument("--require-complete-coverage", action="store_true")
+    check.add_argument(
+        "--baseline",
+        help=(
+            "Earlier result from the same frozen suite. Rejects incompatible "
+            "contracts and regressions without provider calls."
+        ),
+    )
+    check.add_argument(
+        "--max-regressions",
+        type=int,
+        default=0,
+        help="Maximum previously passing final-test cases allowed to fail (default: 0).",
+    )
+    check.add_argument(
+        "--max-quality-drop-pp",
+        type=float,
+        default=0.0,
+        help="Maximum aggregate final-test quality drop in percentage points (default: 0).",
+    )
+    check.add_argument(
+        "--max-cost-increase-pct",
+        type=float,
+        help="Optional maximum production cost increase versus the baseline, in percent.",
+    )
+    check.add_argument(
+        "--max-p90-increase-ms",
+        type=float,
+        help="Optional maximum p90 latency increase versus the baseline, in milliseconds.",
+    )
     check.add_argument("--json", action="store_true", help="Print the gate report as JSON.")
 
     connect = commands.add_parser("connect", help="Connect local route metadata to a private hosted workspace.")
@@ -309,7 +477,12 @@ def main(argv: list[str] | None = None) -> int:
     for stream in (sys.stdout, sys.stderr):
         if hasattr(stream, "reconfigure"):
             stream.reconfigure(encoding="utf-8", errors="replace")
-    args = parser().parse_args(argv)
+    resolved_argv = list(sys.argv[1:] if argv is None else argv)
+    # People naturally try `evalt --status`. Keep the documented nested command,
+    # but make this safe shorthand diagnose the connected workspace too.
+    if resolved_argv and resolved_argv[0] == "--status":
+        resolved_argv = ["dashboard", "--status", *resolved_argv[1:]]
+    args = parser().parse_args(resolved_argv)
     try:
         if args.command == "connect":
             token = args.token or generate_workspace_token()
@@ -351,7 +524,10 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "dashboard":
             config = load_dashboard_config(args.state)
             if not config:
-                raise ValueError("No hosted workspace is connected. Run: evalt connect")
+                raise ValueError(
+                    "No hosted workspace is connected. Run: "
+                    f'"{Path(sys.executable).resolve()}" -m evalt connect'
+                )
             sync = None
             if args.sync_existing:
                 sync = Evalt(
@@ -385,6 +561,7 @@ def main(argv: list[str] | None = None) -> int:
                 )
             payload = {
                 **_runtime_identity(),
+                **_console_entrypoint_identity(),
                 "route_state": str(state),
                 "local_route_count": local_route_count,
                 "connected": bool(config),
@@ -395,13 +572,17 @@ def main(argv: list[str] | None = None) -> int:
             if config:
                 payload.update(inspect_workspace(config["workspace_token"], api_url=config["api_url"]))
                 payload["next"] = (
-                    "Run `evalt dashboard --sync-existing` to publish current route summaries."
+                    f'Run `"{Path(sys.executable).resolve()}" -m evalt dashboard '
+                    f'--state "{state}" --sync-existing` to publish current route summaries.'
                     if local_route_count and not payload.get("remote_route_count")
                     else "Local and hosted workspace diagnostics completed."
                 )
             else:
                 payload.update({"hosted_reachable": False, "remote_route_count": None, "hosted_error": None})
-                payload["next"] = "Run `evalt connect` to create or attach a private hosted workspace."
+                payload["next"] = (
+                    f'Run `"{Path(sys.executable).resolve()}" -m evalt connect` '
+                    "to create or attach a private hosted workspace."
+                )
             print(json.dumps(payload, indent=2))
             return 0
         if args.command == "disconnect":
@@ -521,6 +702,53 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "status":
             print(json.dumps(Evalt(transport=_OfflineTransport(), state_path=args.state).route_status(args.route), indent=2, ensure_ascii=False))
             return 0
+        if args.command == "versions":
+            evalt = Evalt(transport=_OfflineTransport(), state_path=args.state)
+            versions = evalt.route_versions(args.route)
+            print(json.dumps({
+                "route": args.route,
+                "qualified_package_count": len(versions),
+                "versions": versions,
+                "provider_call_started": False,
+            }, indent=2, ensure_ascii=False))
+            return 0
+        if args.command == "annotate-version":
+            alias = "" if args.clear_alias else args.alias
+            note = "" if args.clear_note else args.note
+            if alias is None and note is None:
+                raise ValueError(
+                    "Choose --alias, --clear-alias, --note, or --clear-note."
+                )
+            evalt = Evalt(transport=_OfflineTransport(), state_path=args.state)
+            version = evalt.annotate_route_version(
+                args.route,
+                args.package_id,
+                alias=alias,
+                note=note,
+                expected_alias=args.expected_alias,
+            )
+            print(json.dumps({
+                "annotated": True,
+                "route": args.route,
+                "version": version,
+                "provider_call_started": False,
+                "dashboard_sync_started": False,
+            }, indent=2, ensure_ascii=False))
+            return 0
+        if args.command == "rollback":
+            if not args.yes:
+                raise ValueError(
+                    "Rollback changes the locally serving package. Review `evalt "
+                    f"versions --route {args.route!r}` and repeat with --yes."
+                )
+            evalt = Evalt(transport=_OfflineTransport(), state_path=args.state)
+            result = evalt.rollback_route(args.route, args.package_id)
+            print(json.dumps({
+                "rolled_back": True,
+                "route": args.route,
+                **result,
+            }, indent=2, ensure_ascii=False))
+            return 0
         if args.command == "report":
             with Path(args.result).open(encoding="utf-8") as handle:
                 result_payload = json.load(handle)
@@ -569,22 +797,22 @@ def main(argv: list[str] | None = None) -> int:
                 if args.request_timeout is not None
                 else suite.request_timeout_seconds
             )
-            client = Evalt(request_timeout_seconds=request_timeout_seconds)
-            optimize_kwargs = suite.optimize_kwargs()
             if args.models:
-                optimize_kwargs["models"] = args.models
+                suite = replace(suite, models=tuple(args.models))
             if args.max_parallel_models is not None:
-                optimize_kwargs["max_parallel_models"] = args.max_parallel_models
+                suite = replace(suite, max_parallel_models=args.max_parallel_models)
             if args.max_parallel_scenarios is not None:
-                optimize_kwargs["max_parallel_scenarios"] = args.max_parallel_scenarios
+                suite = replace(suite, max_parallel_scenarios=args.max_parallel_scenarios)
             if args.fixed_prompt:
-                optimize_kwargs["optimize_prompt"] = False
-            progress = _CliProgress(len(optimize_kwargs.get("models") or []))
+                suite = replace(suite, optimize_prompt=False)
+            progress = _CliProgress(len(suite.models))
+            client = Evalt(
+                request_timeout_seconds=request_timeout_seconds,
+                progress_callback=progress,
+                show_progress=False,
+            )
             try:
-                result = client.client.optimize(
-                    **optimize_kwargs,
-                    progress_callback=progress,
-                )
+                result = client.run(suite)
             except (BudgetExceeded, ProviderError) as error:
                 failure = {
                     "schema": "evalt-run-failure-v1",
@@ -592,7 +820,7 @@ def main(argv: list[str] | None = None) -> int:
                     "error_type": type(error).__name__,
                     "error": str(error),
                     "suite": str(args.suite),
-                    "requested_models": list(optimize_kwargs.get("models") or []),
+                    "requested_models": list(suite.models),
                     "output": str(args.output),
                     "provider_spend_usd": None,
                     "provider_spend_note": (
@@ -625,19 +853,66 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(summary, indent=2, ensure_ascii=False))
             return 0
         with Path(args.result).open(encoding="utf-8") as handle:
-            report = check_result(
-                json.load(handle),
-                min_pass_rate=args.min_pass_rate,
-                max_cost_per_success_usd=args.max_cost_per_success,
-                require_complete_coverage=args.require_complete_coverage,
+            candidate_payload = json.load(handle)
+        if not args.baseline and (
+            args.max_regressions != 0
+            or args.max_quality_drop_pp != 0
+            or args.max_cost_increase_pct is not None
+            or args.max_p90_increase_ms is not None
+        ):
+            raise ValueError(
+                "Baseline regression options require --baseline BASELINE_RESULT."
             )
+        report = check_result(
+            candidate_payload,
+            min_pass_rate=args.min_pass_rate,
+            max_cost_per_success_usd=args.max_cost_per_success,
+            require_complete_coverage=args.require_complete_coverage,
+        )
+        baseline_report = None
+        if args.baseline:
+            with Path(args.baseline).open(encoding="utf-8") as handle:
+                baseline_payload = json.load(handle)
+            baseline_report = check_regression(
+                baseline_payload,
+                candidate_payload,
+                max_regressions=args.max_regressions,
+                max_quality_drop_percentage_points=args.max_quality_drop_pp,
+                max_cost_increase_percent=args.max_cost_increase_pct,
+                max_p90_increase_ms=args.max_p90_increase_ms,
+            )
+        failures = list(report.failures)
+        if baseline_report is not None:
+            failures.extend(baseline_report.failures)
+        passed = not failures
+        payload = {
+            "schema": "evalt-ci-gate-v2",
+            "passed": passed,
+            "failures": failures,
+            "provider_call_started": False,
+            "holdout_pass_rate": report.holdout_pass_rate,
+            "estimated_cost_per_successful_call_usd": (
+                report.estimated_cost_per_successful_call_usd
+            ),
+            "winner_scope": report.winner_scope,
+            "absolute_gate": report.to_dict(),
+            "baseline_gate": (
+                baseline_report.to_dict() if baseline_report is not None else None
+            ),
+        }
         if args.json:
-            print(json.dumps(report.to_dict(), indent=2))
-        elif report.passed:
-            print(f"PASS: holdout pass rate {report.holdout_pass_rate:.1%}")
+            print(json.dumps(payload, indent=2))
+        elif passed:
+            suffix = ""
+            if baseline_report is not None:
+                suffix = (
+                    f"; baseline {baseline_report.quality_delta_percentage_points:+.3f} pp, "
+                    f"{baseline_report.regressions} case regressions"
+                )
+            print(f"PASS: holdout pass rate {report.holdout_pass_rate:.1%}{suffix}")
         else:
-            print("FAIL: " + "; ".join(report.failures), file=sys.stderr)
-        return 0 if report.passed else 1
+            print("FAIL: " + "; ".join(failures), file=sys.stderr)
+        return 0 if passed else 1
     except (BudgetExceeded, ProviderError, ValueError, KeyError, OSError, json.JSONDecodeError) as error:
         print(f"evalt: {error}", file=sys.stderr)
         return 2

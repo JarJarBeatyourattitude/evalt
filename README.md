@@ -22,13 +22,20 @@ under those assumptions.
 ## Install
 
 ```bash
-pip install evalt
+python3 -m pip install --upgrade -r https://evalt.onrender.com/python-sdk/latest.txt
 ```
+
+Use the same interpreter for installation and every Evalt command. Bare `pip`
+can update a different Python, and PyPI may trail the exact hosted release. Run
+`python3 -m evalt doctor` to see the imported version, executable, hosted version,
+the exact hosted wheel URL, and a copyable corrective command without printing
+the workspace capability. The stable requirements URL contains one pinned wheel,
+so an already-installed CLI can recommend a release channel that does not go stale.
 
 Optionally connect local routes to the hosted workspace:
 
 ```bash
-evalt connect
+python3 -m evalt connect
 ```
 
 The command opens the private dashboard, stores its capability token once for the
@@ -43,15 +50,22 @@ local. Each invocation gets an opaque run ID, so repeated tournaments on one dur
 route have separate running, completed, or failed progress streams. Every visible run
 prints either `DASHBOARD SYNCED` or `DASHBOARD SYNC FAILED`. A newly optimized route
 also reports separate test-design, tournament, route-install, production-call,
-orchestration, and total timings so a slow first run has an inspectable cause. Use `evalt dashboard`
-to reopen it, `evalt dashboard --status` to compare the ID without opening a browser,
-and `evalt disconnect` to remove the local connection. If a route is missing, run
-`evalt doctor` to compare the package path, Python executable, safe workspace ID, and
-local/hosted route counts, then `evalt dashboard --sync-existing` to recover current
-route summaries without provider spend. `python3 -m evalt doctor` is the canonical
-same-interpreter diagnostic when a machine has more than one Python installation.
+orchestration, and total timings so a slow first run has an inspectable cause. Use
+`python3 -m evalt dashboard` to reopen it, `python3 -m evalt --status` to compare the
+ID without opening a browser, and `python3 -m evalt disconnect` to remove the local
+connection. If a route is missing, run `python3 -m evalt doctor` to compare the
+imported package, Python executable, PATH console shim, safe workspace ID, and
+local/hosted route counts, then `python3 -m evalt dashboard --sync-existing` to recover
+current route summaries without provider spend. The interpreter-bound form is the
+canonical path when a machine has more than one Python installation.
 Dashboard
 availability never affects a production call.
+
+Run comparisons include test-suite and evaluator-contract lineage. The dashboard says
+`Same`, `Changed`, or `Unknown` for each and refuses to label quality movement when a
+known contract changed. Suite contents, raw hashes, evaluator prompts, and evaluator
+credentials remain local. The SDK sends only workspace-keyed opaque identifiers, so
+the same local contract cannot be correlated across different workspaces.
 
 Migrating from OpenAI Evals result JSONL? Evalt can recover only the reviewable
 input/reference pairs, offline, and reports everything it cannot honestly reconstruct:
@@ -68,8 +82,8 @@ repository checkout:
 
 ```bash
 python -m venv .venv
-python -m pip install dist/evalt-0.10.16-py3-none-any.whl
-evalt --version
+python -m pip install dist/evalt-0.10.28-py3-none-any.whl
+python -m evalt --version
 ```
 
 `evalt` is the primary import and command. `modelsieve`, `last_good_prompt`, and `lgp`
@@ -122,6 +136,92 @@ future retests. Pass `first_run="bootstrap"` only when you explicitly want one u
 provider call with no tournament. The automatic first test and later retests never
 exceed `max_test_budget_usd` (USD 1 by default).
 
+To deliberately re-test an existing text route after changing its quality target,
+budget, latency ceiling, prompt policy, or candidate models, pass
+`reoptimize=True`. Evalt runs a new qualifying test and replaces the saved package only
+if the new result clears the frozen gates:
+
+```python
+answer = evalt.run(
+    prompt,
+    input,
+    task=task,
+    route="support-routing",
+    reoptimize=True,
+    target_accuracy=0.97,
+    test_budget_usd="auto",
+    max_test_budget_usd=1.25,
+    models=["openai/gpt-5.4-nano", "google/gemini-2.5-flash-lite"],
+)
+```
+
+Human-labeled image routes must re-run their approved `Suite`; Evalt never invents
+image evidence or pulls image bytes from the hosted dashboard. Install the qualified
+winner explicitly:
+
+```python
+result = evalt.qualify_route(approved_suite, route="image-condition")
+```
+
+The tested model, prompt, request envelope, evidence summary, and modality contract
+become an immutable local route package. Image bytes and image-bearing few-shot
+examples are never copied into SQLite or the dashboard.
+
+## Qualified route versions and rollback
+
+Every initial qualification, maintenance promotion, and rollback creates an immutable
+local package. Exploratory, failed, skipped, and bootstrap-only runs never become
+rollback targets.
+
+```bash
+python3 -m evalt versions --route support-routing
+python3 -m evalt annotate-version --route support-routing \
+  --version rv_0123456789abcdefabcd \
+  --alias known-good \
+  --note "Approved before the July catalog refresh."
+python3 -m evalt rollback --route support-routing --version known-good --yes
+```
+
+Rollback atomically restores the selected qualified package and records the decision
+without calling a provider. It preserves production call and feedback history and
+keeps current per-call spending controls in place. A later call with a different
+source prompt deliberately unqualifies the restored package instead of silently
+borrowing its evidence. The hosted dashboard can show bounded version metadata and
+copy these commands, but it cannot mutate the locally serving route.
+
+Aliases and notes are optional private operator metadata. They remain in the local
+route database, are excluded from dashboard synchronization and decision events, and
+never replace the canonical `rv_…` ID. Aliases are unique per route, lowercase, and
+accepted by rollback only; production `route_version=` pins still require the exact
+immutable ID. Use `--clear-alias` or `--clear-note` to remove either value.
+
+Pin deployed code to the exact package it was tested with:
+
+```python
+from evalt import Evalt, RouteVersionMismatch
+
+evalt = Evalt()
+version = evalt.route_status("support-routing")["current_package_id"]
+
+try:
+    answer = evalt.run(
+        prompt,
+        input,
+        route="support-routing",
+        route_version=version,
+    )
+except RouteVersionMismatch as error:
+    # No provider call started. Review the new current version or roll back.
+    print(error.current_package_id)
+    raise
+```
+
+The pin loads and serves the immutable package snapshot itself. A stale, missing,
+cross-route, bootstrap-only, unqualified, or damaged version fails before model spend.
+After qualification or rollback, read the new `current_package_id`, review it, and
+update the deployment deliberately. Omitting `route_version` preserves the existing
+automatic route behavior for scripts that do not need deployment pinning.
+
 ## Optional: review the AI-drafted test first
 
 For high-stakes or tightly specified work, return an unapproved draft before any
@@ -147,7 +247,7 @@ if input("Type APPROVE after reviewing every expected output: ").strip() != "APP
 
 # This call is the explicit approval boundary. Pass edited examples when needed.
 suite = draft.approve()
-result = evalt.run(suite)
+result = evalt.qualify_route(suite, route="support-routing")
 print(result.winner.model, result.winner.holdout_pass_rate)
 ```
 
@@ -262,8 +362,66 @@ omit `request_options` and `max_tokens` reuse the tested values. An explicit cha
 allowed, but emits `RequestEnvelopeDriftWarning`, records an audit event, and returns
 `answer.request_envelope_validated == False`. Set `strict_request_options=True` to stop
 before provider spend instead. Normalized tool responses are available as
-`answer.tool_calls`; multimodal content parts or complete user/tool/assistant message
-lists may be supplied as the production input.
+`answer.tool_calls`. Complete user/tool/assistant message lists may be supplied as the
+production input. Image input is a separately validated contract described below; it
+is no longer treated as an unqualified generic passthrough.
+
+### Image input
+
+Evalt supports image understanding through OpenRouter Chat Completions for local PNG,
+JPEG, WebP, and GIF files and public HTTPS image URLs whose path ends in one of those supported extensions. It does not claim support for
+the separate image-generation, PDF, audio, or video endpoints.
+
+You do not need AI to make the examples. Choose images whose answers you already
+know, write each expected label yourself, and review the set before running it.
+AI-generated or automatically inferred image labels do not count as approved ground
+truth.
+
+```python
+from evalt import Evalt, Example, ImageInput, Suite, multimodal_input
+
+examples = tuple(
+    Example(
+        multimodal_input("Return exactly one label: damaged or intact.", ImageInput.from_path(path)),
+        approved_output=label,
+        id=f"package-{index}",
+    )
+    for index, (path, label) in enumerate(approved_images, start=1)
+)
+
+suite = Suite(
+    name="package-condition",
+    prompt="Inspect the package image. Return exactly one label: damaged or intact.",
+    examples=examples,
+    models=("google/gemini-2.5-flash-lite", "openai/gpt-5.4-nano"),
+    evaluator={"type": "exact_text"},
+    optimize_prompt=False,
+    max_optimization_cost_usd=0.25,
+)
+
+result = Evalt().run(suite)
+print(result.winner.model, result.winner.holdout_pass_rate)
+```
+
+For a complete runnable version that reads a small human-labeled JSON manifest, see
+[`examples/image_suite.py`](examples/image_suite.py).
+
+`ImageInput.from_path(...)` validates the file structure, dimensions, checksums or
+container boundaries, and the 20 MiB per-image safety
+limit, then creates a data URL in memory without changing the original. Use
+`ImageInput.from_url(...)` for a public HTTPS URL without embedded credentials and with a `.png`, `.jpg`, `.jpeg`, `.webp`, or `.gif` path suffix.
+Embedded images are limited to 40 MiB per message and per suite, so malformed or
+resource-exhausting image work fails before any provider call.
+`multimodal_input(...)` puts the text instruction first, followed by the images.
+
+Image-bearing suites currently require `optimize_prompt=False`: Evalt compares models
+against the frozen prompt and customer-approved images instead of pretending an
+automatic text-only prompt writer saw the evidence. Text-only target models are omitted
+before provider spend. Automatic first-route design refuses image input; use an explicit
+approved suite, or `first_run="bootstrap"` for an unqualified one-off call. Raw images,
+filenames, paths, source URLs, and thumbnails never enter hosted dashboard metadata.
+Local call history stores only a bounded image descriptor, and image feedback is not
+used for maintenance unless it is supplied again in an explicit approved suite.
 
 Automatic first-route requests give each one-time AI suite-design request 45 seconds,
 then use a 120-second per-provider deadline for candidate and production responses. Set
@@ -398,7 +556,7 @@ later maintenance winner whose measured p90 misses it. OpenRouter's provider
 price/latency/throughput preferences help search, but cannot replace those frozen-run measurements. The default deadline
 is 600 seconds per response, and complex or long-context suites can raise it explicitly
 up to 7200 seconds with `request_timeout_seconds` in the suite, with
-`Evalt(request_timeout_seconds=...)`, or with `evalt optimize --request-timeout ...`.
+`Evalt(request_timeout_seconds=...)`, or with `python3 -m evalt optimize --request-timeout ...`.
 The deadline protects against a genuinely hung provider request; the provider spend cap
 remains the economic stop condition.
 
@@ -424,17 +582,17 @@ Set `"optimize_prompt": false` in a suite—or `optimize_prompt=False` on a dura
 `Evalt.run(...)` route—to hold the supplied prompt exactly fixed. That disables rewrites,
 few-shot selection, and cross-model prompt propagation while leaving model, reasoning,
 provider, validation, and final-test comparisons intact.
-The CLI equivalent is `evalt optimize evalt.json --fixed-prompt` (or
-`evalt run ... --fixed-prompt` for a durable production route).
+The CLI equivalent is `python3 -m evalt optimize evalt.json --fixed-prompt` (or
+`python3 -m evalt run ... --fixed-prompt` for a durable production route).
 
 ## Explicit optimization and CI
 
 ```bash
-evalt init evalt.json
-evalt validate evalt.json
+python3 -m evalt init evalt.json
+python3 -m evalt validate evalt.json
 export OPENROUTER_API_KEY="..."
-evalt optimize evalt.json --output evalt-result.json
-evalt check evalt-result.json --min-pass-rate 0.95
+python3 -m evalt optimize evalt.json --output evalt-result.json
+python3 -m evalt check evalt-result.json --min-pass-rate 0.95
 ```
 
 `init`, `validate`, and `check` are offline and make no provider calls. `optimize` uses the
@@ -456,7 +614,7 @@ uses a transparent 1.5× heuristic with at least $0.25 additional headroom;
 Use stricter CI gates when needed:
 
 ```bash
-evalt check evalt-result.json \
+python3 -m evalt check evalt-result.json \
   --min-pass-rate 0.95 \
   --max-cost-per-success 0.002 \
   --require-complete-coverage
@@ -465,10 +623,32 @@ evalt check evalt-result.json \
 The command exits `0` on pass, `1` when the measured result fails the gate, and `2` for an
 invalid file or runtime error.
 
+Protect a deployment from regressions against an earlier result from the identical
+frozen suite:
+
+```bash
+python3 -m evalt check candidate.json \
+  --baseline baseline.json \
+  --min-pass-rate 0.95 \
+  --max-regressions 0 \
+  --max-quality-drop-pp 0 \
+  --max-cost-increase-pct 10 \
+  --max-p90-increase-ms 250 \
+  --require-complete-coverage \
+  --json
+```
+
+The default baseline contract allows no newly failing frozen cases, no missing cases,
+and no aggregate quality drop. Different or missing suite hashes fail closed instead of
+producing a misleading score comparison. Cost and p90 limits are opt-in; when requested,
+both results must contain the corresponding measurement. The JSON report contains
+`absolute_gate` and `baseline_gate` decisions but no prompts, inputs, outputs, approved
+answers, or provider credentials.
+
 To inspect the CI contract without a provider call:
 
 ```bash
-evalt check examples/passing-result.json --min-pass-rate 0.95 --require-complete-coverage
+python3 -m evalt check examples/passing-result.json --min-pass-rate 0.95 --require-complete-coverage
 ```
 
 ## Explicit suite API
@@ -496,7 +676,7 @@ and offline-validatable before spend.
 
 ```json
 {
-  "schema": "evalt-suite-v1",
+  "schema": "evalt-suite-v2",
   "name": "support-routing",
   "prompt": "Classify the support message. Return one route label.",
   "examples": [

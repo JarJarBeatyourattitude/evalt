@@ -161,7 +161,7 @@ def migrate_openai_results(
         return MigrationResult(None, report)
 
     suite = {
-        "schema": "evalt-suite-v1",
+        "schema": "evalt-suite-v2",
         "name": name,
         "prompt": prompt.strip(),
         "examples": examples,
