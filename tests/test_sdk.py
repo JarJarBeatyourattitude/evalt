@@ -126,26 +126,47 @@ class DashboardBridgeTests(unittest.TestCase):
 
     def test_hosted_inspection_reports_only_reachability_and_route_count(self):
         token = generate_workspace_token()
-        response = mock.MagicMock()
-        response.__enter__.return_value = response
-        response.read.return_value = b'[{"route":"private-name"},{"route":"another"}]'
-        opened = mock.Mock(return_value=response)
+        identity = mock.MagicMock()
+        identity.__enter__.return_value = identity
+        identity.read.return_value = b'{"workspace_id":"ws_safe","role":"owner","permissions":["workspace:inspect","routes:list"]}'
+        routes = mock.MagicMock()
+        routes.__enter__.return_value = routes
+        routes.read.return_value = b'[{"route":"private-name"},{"route":"another"}]'
+        opened = mock.Mock(side_effect=[identity, routes])
         result = inspect_workspace(token, api_url="https://api.example", opener=opened)
         self.assertEqual(result, {
             "hosted_reachable": True,
+            "workspace_id": "ws_safe",
+            "workspace_role": "owner",
+            "workspace_permissions": ["workspace:inspect", "routes:list"],
+            "workspace_expires_at": None,
             "remote_route_count": 2,
             "hosted_error": None,
         })
-        request = opened.call_args.args[0]
+        request = opened.call_args_list[0].args[0]
         self.assertEqual(request.get_header("Authorization"), f"Bearer {token}")
         self.assertNotIn(token, json.dumps(result))
 
+    def test_publisher_capability_inspection_does_not_attempt_forbidden_route_reads(self):
+        token = f"evc_{'p' * 43}"
+        identity = mock.MagicMock()
+        identity.__enter__.return_value = identity
+        identity.read.return_value = b'{"workspace_id":"ws_shared","role":"publisher","permissions":["workspace:inspect","routes:publish"],"expires_at":"2026-08-22T18:00:00Z"}'
+        opened = mock.Mock(return_value=identity)
+        result = inspect_workspace(token, api_url="https://api.example", opener=opened)
+        self.assertTrue(result["hosted_reachable"])
+        self.assertEqual(result["workspace_id"], "ws_shared")
+        self.assertEqual(result["workspace_role"], "publisher")
+        self.assertIsNone(result["remote_route_count"])
+        self.assertEqual(opened.call_count, 1)
+        self.assertTrue(opened.call_args.args[0].full_url.endswith("/api/workspace/me"))
+
     def test_workspace_https_uses_a_verified_certifi_context(self):
         token = generate_workspace_token()
-        response = mock.MagicMock()
-        response.__enter__.return_value = response
-        response.read.return_value = b"[]"
-        opened = mock.Mock(return_value=response)
+        identity = mock.MagicMock()
+        identity.__enter__.return_value = identity
+        identity.read.return_value = b'{"workspace_id":"ws_safe","role":"viewer","permissions":["workspace:inspect"]}'
+        opened = mock.Mock(return_value=identity)
         result = inspect_workspace(token, api_url="https://api.example", opener=opened)
         self.assertTrue(result["hosted_reachable"])
         context = opened.call_args.kwargs["context"]
@@ -479,6 +500,35 @@ class DashboardBridgeTests(unittest.TestCase):
             )
             self.assertEqual(load_dashboard_config(state)["workspace_token"], token)
 
+    def test_connect_cli_accepts_delegated_access_and_opens_fragment_link(self):
+        with TemporaryDirectory() as directory:
+            state = Path(directory) / ".evalt" / "evalt.db"
+            token = f"evc_{'v' * 43}"
+            output = StringIO()
+            hosted = {
+                "hosted_reachable": True,
+                "workspace_id": "ws_shared",
+                "workspace_role": "viewer",
+                "workspace_permissions": ["workspace:inspect", "routes:list", "routes:read"],
+                "workspace_expires_at": "2026-08-22T18:00:00Z",
+                "remote_route_count": 2,
+                "hosted_error": None,
+            }
+            with mock.patch("evalt.cli.inspect_workspace", return_value=hosted), mock.patch(
+                "evalt.cli.webbrowser.open", return_value=True
+            ) as opened, redirect_stdout(output):
+                self.assertEqual(cli_main([
+                    "connect", token, "--state", str(state), "--no-sync-existing",
+                    "--api-url", "https://api.example", "--app-url", "https://app.example",
+                ]), 0)
+            payload = json.loads(output.getvalue())
+            self.assertEqual(payload["workspace_id"], "ws_shared")
+            self.assertEqual(payload["workspace_role"], "viewer")
+            self.assertEqual(payload["workspace_permissions"], hosted["workspace_permissions"])
+            opened.assert_called_once_with(f"https://app.example#access={token}")
+            self.assertNotIn(token, output.getvalue())
+            self.assertEqual(load_dashboard_config(state)["workspace_token"], token)
+
     def test_connect_recovers_existing_route_summaries_without_provider_calls(self):
         class CapturingSync:
             workspace_id = "ws_safe"
@@ -623,8 +673,8 @@ class DashboardBridgeTests(unittest.TestCase):
             self.assertEqual(cli_main(["doctor"]), 0)
         payload = json.loads(output.getvalue())
         self.assertEqual(payload["installed_sdk_version"], "0.10.19")
-        self.assertEqual(payload["hosted_sdk_version"], "0.10.32")
-        self.assertEqual(payload["hosted_wheel_url"], "https://evalt.onrender.com/python-sdk/dist/evalt-0.10.32-py3-none-any.whl")
+        self.assertEqual(payload["hosted_sdk_version"], "0.11.0")
+        self.assertEqual(payload["hosted_wheel_url"], "https://evalt.onrender.com/python-sdk/dist/evalt-0.11.0-py3-none-any.whl")
         self.assertTrue(payload["upgrade_required"])
         self.assertIn("-r https://evalt.onrender.com/python-sdk/latest.txt", payload["same_interpreter_install_command"])
         self.assertTrue(payload["same_interpreter_install_command"].startswith(f'"{payload["python_executable"]}" -m pip'))

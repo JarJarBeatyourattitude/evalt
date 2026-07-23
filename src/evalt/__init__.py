@@ -102,4 +102,4 @@ __all__ = [
     "route_health_event",
 ]
 
-__version__ = "0.10.32"
+__version__ = "0.11.0"

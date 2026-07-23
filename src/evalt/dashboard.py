@@ -23,7 +23,8 @@ import certifi
 
 DEFAULT_DASHBOARD_API_URL = "https://evalt.onrender.com"
 DEFAULT_DASHBOARD_APP_URL = "https://evalt.dev/app"
-_TOKEN_PREFIX = "evw_"
+_OWNER_TOKEN_PREFIX = "evw_"
+_DELEGATED_TOKEN_PREFIX = "evc_"
 _SENSITIVE_KEYS = {
     "prompt", "selected_prompt", "input", "output", "content", "messages", "cases",
     "examples", "api_key", "openrouter_api_key", "authorization", "request_options",
@@ -58,16 +59,20 @@ def _verified_urlopen(
 
 
 def generate_workspace_token() -> str:
-    return _TOKEN_PREFIX + secrets.token_urlsafe(32)
+    return _OWNER_TOKEN_PREFIX + secrets.token_urlsafe(32)
 
 
 def validate_workspace_token(token: str) -> str:
     token = str(token or "").strip()
-    if not token.startswith(_TOKEN_PREFIX) or len(token) < 44:
-        raise ValueError("Workspace token must be an Evalt token beginning with evw_.")
+    prefix = next(
+        (candidate for candidate in (_OWNER_TOKEN_PREFIX, _DELEGATED_TOKEN_PREFIX) if token.startswith(candidate)),
+        None,
+    )
+    if prefix is None or len(token) < 44:
+        raise ValueError("Workspace capability must begin with evw_ or evc_.")
     allowed = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_")
-    if any(character not in allowed for character in token[len(_TOKEN_PREFIX):]):
-        raise ValueError("Workspace token contains unsupported characters.")
+    if any(character not in allowed for character in token[len(prefix):]):
+        raise ValueError("Workspace capability contains unsupported characters.")
     return token
 
 
@@ -178,29 +183,51 @@ def inspect_workspace(
     """Check one hosted workspace without exposing its capability or route content."""
 
     validated = validate_workspace_token(token)
-    request = Request(
-        f"{str(api_url).rstrip('/')}/api/workspace/routes",
-        method="GET",
-        headers={"Authorization": f"Bearer {validated}", "Accept": "application/json"},
-    )
-    try:
+    base_url = str(api_url).rstrip("/")
+
+    def read(path: str) -> Any:
+        request = Request(
+            f"{base_url}{path}",
+            method="GET",
+            headers={"Authorization": f"Bearer {validated}", "Accept": "application/json"},
+        )
         with _verified_urlopen(
             request, timeout_seconds=timeout_seconds, opener=opener
         ) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-            if not isinstance(payload, list):
+            return json.loads(response.read().decode("utf-8"))
+
+    try:
+        identity = read("/api/workspace/me")
+        if not isinstance(identity, dict):
+            raise ValueError("hosted workspace returned an invalid access identity")
+        permissions = identity.get("permissions")
+        if not isinstance(permissions, list) or any(not isinstance(item, str) for item in permissions):
+            raise ValueError("hosted workspace returned invalid permissions")
+        remote_route_count = None
+        if "routes:list" in permissions:
+            routes = read("/api/workspace/routes")
+            if not isinstance(routes, list):
                 raise ValueError("hosted workspace returned an invalid route index")
-            return {
-                "hosted_reachable": True,
-                "remote_route_count": len(payload),
-                "hosted_error": None,
-            }
+            remote_route_count = len(routes)
+        return {
+            "hosted_reachable": True,
+            "workspace_id": str(identity.get("workspace_id") or workspace_fingerprint(validated)),
+            "workspace_role": str(identity.get("role") or "unknown"),
+            "workspace_permissions": permissions,
+            "workspace_expires_at": identity.get("expires_at"),
+            "remote_route_count": remote_route_count,
+            "hosted_error": None,
+        }
     except HTTPError as error:
         detail = f"hosted workspace returned HTTP {error.code}"
     except (URLError, OSError, TimeoutError, ValueError, json.JSONDecodeError) as error:
         detail = str(error)[:180] or error.__class__.__name__
     return {
         "hosted_reachable": False,
+        "workspace_id": workspace_fingerprint(validated),
+        "workspace_role": None,
+        "workspace_permissions": None,
+        "workspace_expires_at": None,
         "remote_route_count": None,
         "hosted_error": detail,
     }

@@ -54,7 +54,7 @@ from .webhooks import (
 )
 
 
-HOSTED_SDK_VERSION = "0.10.32"
+HOSTED_SDK_VERSION = "0.11.0"
 HOSTED_WHEEL_URL = (
     "https://evalt.onrender.com/python-sdk/dist/"
     f"evalt-{HOSTED_SDK_VERSION}-py3-none-any.whl"
@@ -728,7 +728,7 @@ def parser() -> argparse.ArgumentParser:
     check.add_argument("--json", action="store_true", help="Print the gate report as JSON.")
 
     connect = commands.add_parser("connect", help="Connect local route metadata to a private hosted workspace.")
-    connect.add_argument("token", nargs="?", help="Existing evw_ workspace token; omitted creates one.")
+    connect.add_argument("token", nargs="?", help="Existing evw_ owner or evc_ delegated capability; omitted creates an owner workspace.")
     connect.add_argument("--state", help="Scope the connection to one route database; omitted saves it for all local projects.")
     connect.add_argument("--api-url", default=DEFAULT_DASHBOARD_API_URL)
     connect.add_argument("--app-url", default=DEFAULT_DASHBOARD_APP_URL)
@@ -814,7 +814,8 @@ def main(argv: list[str] | None = None) -> int:
             path = save_dashboard_config(
                 token, state_path=args.state, api_url=args.api_url, app_url=args.app_url
             )
-            dashboard_url = f"{str(args.app_url).rstrip('/')}#workspace={token}"
+            fragment = "access" if token.startswith("evc_") else "workspace"
+            dashboard_url = f"{str(args.app_url).rstrip('/')}#{fragment}={token}"
             opened = False if args.no_open else bool(webbrowser.open(dashboard_url))
             sync = {
                 "local_route_count": 0,
@@ -861,7 +862,8 @@ def main(argv: list[str] | None = None) -> int:
                     dashboard_token=config["workspace_token"],
                     dashboard_api_url=config["api_url"],
                 ).sync_existing_routes()
-            opened = False if args.status else bool(webbrowser.open(f"{config['app_url']}#workspace={config['workspace_token']}"))
+            fragment = "access" if config["workspace_token"].startswith("evc_") else "workspace"
+            opened = False if args.status else bool(webbrowser.open(f"{config['app_url']}#{fragment}={config['workspace_token']}"))
             payload = {
                 "connected": True,
                 "workspace_id": workspace_fingerprint(config["workspace_token"]),

@@ -22,15 +22,21 @@ under those assumptions.
 ## Install
 
 ```bash
-python3 -m pip install --upgrade -r https://evalt.onrender.com/python-sdk/latest.txt
+python3 -m pip install evalt==0.10.23
 ```
 
 Use the same interpreter for installation and every Evalt command. Bare `pip`
-can update a different Python, and PyPI may trail the exact hosted release. Run
-`python3 -m evalt doctor` to see the imported version, executable, hosted version,
-the exact hosted wheel URL, and a copyable corrective command without printing
-the workspace capability. The stable requirements URL contains one pinned wheel,
-so an already-installed CLI can recommend a release channel that does not go stale.
+can update a different Python. The PyPI release is the stable default: pin it and
+trial it on a noncritical route. The exact hosted wheel may lead PyPI and is an edge
+channel for reviewing newer features:
+
+```bash
+python3 -m pip install --upgrade -r https://evalt.onrender.com/python-sdk/latest.txt
+```
+
+Run `python3 -m evalt doctor` to see the imported version, executable, hosted version,
+exact hosted wheel URL, and a copyable corrective command without printing the
+workspace capability.
 
 Optionally connect local routes to the hosted workspace:
 
@@ -60,6 +66,23 @@ current route summaries without provider spend. The interpreter-bound form is th
 canonical path when a machine has more than one Python installation.
 Dashboard
 availability never affects a production call.
+
+The generated `evw_...` capability is the owner key. Keep it out of CI and shared
+channels. In **Workspace access**, an owner can create a named capability that expires
+in 1–365 days:
+
+- **Viewer** lists and reads synchronized routes.
+- **Publisher** writes aggregate route progress from the SDK or CI but cannot read,
+  delete, or manage access.
+- **Editor** reads and publishes routes but cannot delete or manage access.
+
+Delegated capabilities begin with `evc_`. A browser share link keeps that capability
+after `#access=`, then removes it from the visible URL after saving it locally. Evalt
+shows each delegated secret only once, stores only a one-way digest, limits a workspace
+to 20 active capabilities, and rejects an expired or revoked capability on its next
+request. `python3 -m evalt connect evc_...` accepts Publisher and Editor capabilities;
+`doctor`, `dashboard --status`, and `connect` report the effective role and permissions
+without printing the secret. Existing owner workspaces remain compatible.
 
 ## Private local evidence library
 
@@ -128,7 +151,7 @@ repository checkout:
 
 ```bash
 python -m venv .venv
-python -m pip install dist/evalt-0.10.32-py3-none-any.whl
+python -m pip install dist/evalt-0.11.0-py3-none-any.whl
 python -m evalt --version
 ```
 
