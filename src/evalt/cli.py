@@ -23,6 +23,7 @@ from .core import (
     check_result,
 )
 from .migration import migrate_openai_results
+from .library import EvidenceLibrary, resolve_evidence_reference
 from .reporting import (
     check_regression,
     compare_results,
@@ -42,7 +43,7 @@ from .dashboard import (
 )
 
 
-HOSTED_SDK_VERSION = "0.10.29"
+HOSTED_SDK_VERSION = "0.10.30"
 HOSTED_WHEEL_URL = (
     "https://evalt.onrender.com/python-sdk/dist/"
     f"evalt-{HOSTED_SDK_VERSION}-py3-none-any.whl"
@@ -261,6 +262,50 @@ def parser() -> argparse.ArgumentParser:
 
     validate = commands.add_parser("validate", help="Validate a suite offline; no API key or spend.")
     validate.add_argument("suite")
+    validate.add_argument(
+        "--library-root",
+        help="Private local evidence-library directory used by @name references.",
+    )
+
+    library = commands.add_parser(
+        "library",
+        help="Name, find, verify, and export private local suites and results.",
+    )
+    library_commands = library.add_subparsers(dest="library_command", required=True)
+    library_add = library_commands.add_parser(
+        "add", help="Import one validated suite or result into immutable local storage."
+    )
+    library_add.add_argument("source")
+    library_add.add_argument("--name", required=True)
+    library_add.add_argument("--tag", action="append", dest="tags")
+    library_add.add_argument("--kind", choices=("auto", "suite", "result"), default="auto")
+    library_add.add_argument("--root", help="Private library directory; defaults to .evalt/library.")
+    library_list = library_commands.add_parser(
+        "list", help="List local evidence metadata without printing customer content."
+    )
+    library_list.add_argument("--kind", choices=("suite", "result"))
+    library_list.add_argument("--tag")
+    library_list.add_argument("--query")
+    library_list.add_argument("--root")
+    library_show = library_commands.add_parser(
+        "show", help="Verify one object and show bounded local metadata."
+    )
+    library_show.add_argument("name")
+    library_show.add_argument("--kind", choices=("suite", "result"))
+    library_show.add_argument("--root")
+    library_resolve = library_commands.add_parser(
+        "resolve", help="Verify one object and print its private content-addressed path."
+    )
+    library_resolve.add_argument("name")
+    library_resolve.add_argument("--kind", choices=("suite", "result"))
+    library_resolve.add_argument("--root")
+    library_export = library_commands.add_parser(
+        "export", help="Export the exact verified bytes of one local evidence object."
+    )
+    library_export.add_argument("name")
+    library_export.add_argument("--output", required=True)
+    library_export.add_argument("--force", action="store_true")
+    library_export.add_argument("--root")
 
     migrate = commands.add_parser(
         "import-openai-results",
@@ -362,6 +407,10 @@ def parser() -> argparse.ArgumentParser:
 
     optimize = commands.add_parser("optimize", help="Run the suite under its hard provider-spend cap.")
     optimize.add_argument("suite")
+    optimize.add_argument(
+        "--library-root",
+        help="Private local evidence-library directory used by @name references.",
+    )
     optimize.add_argument("--output", default="evalt-result.json")
     optimize.add_argument("--model", action="append", dest="models", help="Override the suite candidate list; repeat for each model/reasoning configuration.")
     optimize.add_argument("--max-parallel-models", type=int, help="Override parallel model lanes for this run.")
@@ -379,6 +428,10 @@ def parser() -> argparse.ArgumentParser:
         ),
     )
     monitor.add_argument("baseline", help="Earlier exported Evalt result.")
+    monitor.add_argument(
+        "--library-root",
+        help="Private local evidence-library directory used by @name references.",
+    )
     monitor.add_argument(
         "--route",
         help=(
@@ -421,6 +474,10 @@ def parser() -> argparse.ArgumentParser:
 
     report = commands.add_parser("report", help="Render saved JSON as HTML and/or JUnit; no provider call.")
     report.add_argument("result", help="Saved Evalt result JSON.")
+    report.add_argument(
+        "--library-root",
+        help="Private local evidence-library directory used by @name references.",
+    )
     report.add_argument("--html", help="Self-contained HTML output path.")
     report.add_argument("--junit", help="JUnit XML output path.")
     report.add_argument("--title", default="Evalt evaluation report")
@@ -430,12 +487,20 @@ def parser() -> argparse.ArgumentParser:
     )
     compare.add_argument("baseline", help="Earlier saved Evalt result JSON.")
     compare.add_argument("candidate", help="Candidate saved Evalt result JSON.")
+    compare.add_argument(
+        "--library-root",
+        help="Private local evidence-library directory used by @name references.",
+    )
     compare.add_argument("--output", help="Also write the structured comparison JSON.")
     compare.add_argument("--html", help="Also write a self-contained HTML comparison.")
     compare.add_argument("--title", default="Evalt comparison")
 
     check = commands.add_parser("check", help="Gate an exported result for CI; no provider call.")
     check.add_argument("result")
+    check.add_argument(
+        "--library-root",
+        help="Private local evidence-library directory used by @name references.",
+    )
     check.add_argument("--min-pass-rate", type=float, default=0.95)
     check.add_argument("--max-cost-per-success", type=float)
     check.add_argument("--require-complete-coverage", action="store_true")
@@ -495,6 +560,19 @@ def _write_starter(path: Path, *, force: bool) -> None:
     if path.exists() and not force:
         raise FileExistsError(f"{path} already exists; pass --force to replace it.")
     path.write_text(json.dumps(STARTER_SUITE, indent=2) + "\n", encoding="utf-8")
+
+
+def _evidence_path(
+    value: str,
+    args: argparse.Namespace,
+    *,
+    expected_kind: str,
+) -> Path:
+    return resolve_evidence_reference(
+        value,
+        root=getattr(args, "library_root", None),
+        expected_kind=expected_kind,
+    )
 
 
 def _summary(result, path: str) -> dict[str, object]:
@@ -658,7 +736,8 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 0
         if args.command == "validate":
-            suite = Suite.load(args.suite)
+            suite_path = _evidence_path(args.suite, args, expected_kind="suite")
+            suite = Suite.load(suite_path)
             print(json.dumps({
                 "valid": True,
                 "name": suite.name,
@@ -672,6 +751,73 @@ def main(argv: list[str] | None = None) -> int:
                 "provider_call_started": False,
             }, indent=2))
             return 0
+        if args.command == "library":
+            evidence_library = EvidenceLibrary(args.root)
+            if args.library_command == "add":
+                entry = evidence_library.add(
+                    args.source,
+                    name=args.name,
+                    tags=args.tags,
+                    kind=args.kind,
+                )
+                print(json.dumps({
+                    "added": True,
+                    "entry": entry.to_dict(),
+                    "library": str(evidence_library.root),
+                    "provider_call_started": False,
+                    "dashboard_sync_started": False,
+                    "privacy": (
+                        "The object, name, tags, path, hash, and content remain local."
+                    ),
+                }, indent=2, ensure_ascii=False))
+                return 0
+            if args.library_command == "list":
+                entries = evidence_library.list(
+                    kind=args.kind,
+                    tag=args.tag,
+                    query=args.query,
+                )
+                print(json.dumps({
+                    "count": len(entries),
+                    "entries": [entry.to_dict() for entry in entries],
+                    "library": str(evidence_library.root),
+                    "provider_call_started": False,
+                    "dashboard_sync_started": False,
+                }, indent=2, ensure_ascii=False))
+                return 0
+            if args.library_command == "show":
+                entry = evidence_library.entry(args.name, expected_kind=args.kind)
+                print(json.dumps({
+                    "entry": entry.to_dict(),
+                    "verified": True,
+                    "provider_call_started": False,
+                    "dashboard_sync_started": False,
+                    "content_printed": False,
+                }, indent=2, ensure_ascii=False))
+                return 0
+            if args.library_command == "resolve":
+                resolved = evidence_library.resolve(
+                    args.name, expected_kind=args.kind
+                )
+                print(str(resolved))
+                return 0
+            if args.library_command == "export":
+                target = evidence_library.export(
+                    args.name, args.output, force=args.force
+                )
+                entry = evidence_library.entry(args.name)
+                print(json.dumps({
+                    "exported": True,
+                    "name": entry.name,
+                    "kind": entry.kind,
+                    "sha256": entry.sha256,
+                    "bytes": entry.bytes,
+                    "output": str(target),
+                    "provider_call_started": False,
+                    "dashboard_sync_started": False,
+                }, indent=2))
+                return 0
+            raise ValueError("Unknown Evalt library command.")
         if args.command == "import-openai-results":
             prompt = args.prompt
             if args.prompt_file:
@@ -805,7 +951,8 @@ def main(argv: list[str] | None = None) -> int:
             }, indent=2, ensure_ascii=False))
             return 0
         if args.command == "report":
-            with Path(args.result).open(encoding="utf-8") as handle:
+            result_path = _evidence_path(args.result, args, expected_kind="result")
+            with result_path.open(encoding="utf-8") as handle:
                 result_payload = json.load(handle)
             written = write_reports(
                 result_payload,
@@ -816,9 +963,15 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps({"provider_call_started": False, "reports": written}, indent=2))
             return 0
         if args.command == "compare":
-            with Path(args.baseline).open(encoding="utf-8") as handle:
+            baseline_path = _evidence_path(
+                args.baseline, args, expected_kind="result"
+            )
+            candidate_path = _evidence_path(
+                args.candidate, args, expected_kind="result"
+            )
+            with baseline_path.open(encoding="utf-8") as handle:
                 baseline_payload = json.load(handle)
-            with Path(args.candidate).open(encoding="utf-8") as handle:
+            with candidate_path.open(encoding="utf-8") as handle:
                 candidate_payload = json.load(handle)
             comparison = compare_results(baseline_payload, candidate_payload)
             written: dict[str, str] = {}
@@ -856,7 +1009,15 @@ def main(argv: list[str] | None = None) -> int:
                 or float(args.max_cost_usd) <= 0
             ):
                 raise ValueError("--max-cost-usd must be a positive finite number.")
-            with Path(args.baseline).open(encoding="utf-8") as handle:
+            baseline_path = _evidence_path(
+                args.baseline, args, expected_kind="result"
+            )
+            suite_path = (
+                _evidence_path(args.suite, args, expected_kind="suite")
+                if args.suite
+                else None
+            )
+            with baseline_path.open(encoding="utf-8") as handle:
                 baseline_payload = json.load(handle)
             frozen_suite = baseline_payload.get("regression_suite")
             if not isinstance(frozen_suite, dict):
@@ -882,7 +1043,7 @@ def main(argv: list[str] | None = None) -> int:
                 monitored = monitor_client.monitor(
                     baseline_payload,
                     max_cost_usd=args.max_cost_usd,
-                    source_suite=(Suite.load(args.suite) if args.suite else None),
+                    source_suite=(Suite.load(suite_path) if suite_path else None),
                     route=args.route,
                     max_regressions=args.max_regressions,
                     max_quality_drop_percentage_points=args.max_quality_drop_pp,
@@ -972,7 +1133,8 @@ def main(argv: list[str] | None = None) -> int:
             }, indent=2))
             return 0 if monitored.passed else 1
         if args.command == "optimize":
-            suite = Suite.load(args.suite)
+            suite_path = _evidence_path(args.suite, args, expected_kind="suite")
+            suite = Suite.load(suite_path)
             request_timeout_seconds = (
                 args.request_timeout
                 if args.request_timeout is not None
@@ -1033,7 +1195,8 @@ def main(argv: list[str] | None = None) -> int:
                 summary["reports"] = reports
             print(json.dumps(summary, indent=2, ensure_ascii=False))
             return 0
-        with Path(args.result).open(encoding="utf-8") as handle:
+        result_path = _evidence_path(args.result, args, expected_kind="result")
+        with result_path.open(encoding="utf-8") as handle:
             candidate_payload = json.load(handle)
         if not args.baseline and (
             args.max_regressions != 0
@@ -1052,7 +1215,10 @@ def main(argv: list[str] | None = None) -> int:
         )
         baseline_report = None
         if args.baseline:
-            with Path(args.baseline).open(encoding="utf-8") as handle:
+            baseline_path = _evidence_path(
+                args.baseline, args, expected_kind="result"
+            )
+            with baseline_path.open(encoding="utf-8") as handle:
                 baseline_payload = json.load(handle)
             baseline_report = check_regression(
                 baseline_payload,

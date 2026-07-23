@@ -32,6 +32,7 @@ from .reporting import (
     render_junit_report,
     write_reports,
 )
+from .library import EvidenceLibrary, LibraryEntry, resolve_evidence_reference
 
 __all__ = [
     "BudgetExceeded",
@@ -62,6 +63,9 @@ __all__ = [
     "render_html_report",
     "render_junit_report",
     "write_reports",
+    "EvidenceLibrary",
+    "LibraryEntry",
+    "resolve_evidence_reference",
 ]
 
-__version__ = "0.10.29"
+__version__ = "0.10.30"

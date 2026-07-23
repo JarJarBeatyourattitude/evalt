@@ -61,6 +61,52 @@ canonical path when a machine has more than one Python installation.
 Dashboard
 availability never affects a production call.
 
+## Private local evidence library
+
+Give reviewed suites and frozen results immutable local names so scripts, CI jobs, and
+route-health checks do not depend on changeable file paths:
+
+```bash
+evalt library add evalt.json \
+  --name support-v1 \
+  --tag production
+
+evalt library add evalt-result.json \
+  --name support-baseline-v1 \
+  --tag baseline
+
+evalt validate @support-v1
+evalt check @support-baseline-v1 --min-pass-rate 0.95
+evalt monitor @support-baseline-v1 \
+  --route support-routing \
+  --max-cost-usd 0.10
+```
+
+`evalt library add` validates the input as an Evalt suite or exported result and stores
+its exact original UTF-8 JSON bytes under a SHA-256 content address. A name is immutable:
+different content or tags require a new name such as `support-v2`. `library list`
+filters safe metadata with `--kind`, `--tag`, and `--query`; `library show` verifies an
+object without printing customer content; `library resolve` prints its verified local
+path; and `library export` recovers the exact bytes without overwriting a different
+file unless `--force` is explicit.
+
+`@name` is supported by `validate`, `optimize`, `monitor`, `report`, `compare`, and
+`check`. The default catalog is `.evalt/library`; use `--library-root path` on those
+commands or set `EVALT_LIBRARY_HOME` for a different location. Image monitoring can
+use both a named result and named reviewed suite:
+
+```bash
+evalt monitor @support-image-baseline-v1 \
+  --suite @support-images-v1 \
+  --max-cost-usd 0.10
+```
+
+The library is offline. Names, tags, paths, hashes, source files, suites, results,
+prompts, inputs, images, cases, outputs, and approved answers are never sent to the
+hosted workspace. The index contains bounded metadata only and is integrity-checked,
+but the library is not a backup; include important local evidence in the project's
+encrypted backup policy or export an exact copy.
+
 Run comparisons include test-suite and evaluator-contract lineage. The dashboard says
 `Same`, `Changed`, or `Unknown` for each and refuses to label quality movement when a
 known contract changed. Suite contents, raw hashes, evaluator prompts, and evaluator
@@ -82,7 +128,7 @@ repository checkout:
 
 ```bash
 python -m venv .venv
-python -m pip install dist/evalt-0.10.29-py3-none-any.whl
+python -m pip install dist/evalt-0.10.30-py3-none-any.whl
 python -m evalt --version
 ```
 
