@@ -14,7 +14,14 @@ import threading
 import time
 import webbrowser
 
-from .core import BudgetExceeded, Evalt, ProviderError, Suite, check_result
+from .core import (
+    BudgetExceeded,
+    Evalt,
+    ProviderError,
+    Suite,
+    _regression_contract_hash,
+    check_result,
+)
 from .migration import migrate_openai_results
 from .reporting import (
     check_regression,
@@ -35,7 +42,7 @@ from .dashboard import (
 )
 
 
-HOSTED_SDK_VERSION = "0.10.28"
+HOSTED_SDK_VERSION = "0.10.29"
 HOSTED_WHEEL_URL = (
     "https://evalt.onrender.com/python-sdk/dist/"
     f"evalt-{HOSTED_SDK_VERSION}-py3-none-any.whl"
@@ -363,6 +370,54 @@ def parser() -> argparse.ArgumentParser:
     optimize.add_argument("--fixed-prompt", action="store_true", help="Override the suite and compare routes without modifying its prompt.")
     optimize.add_argument("--html-report", help="Also write a self-contained offline HTML report.")
     optimize.add_argument("--junit-report", help="Also write case-level JUnit XML for CI.")
+
+    monitor = commands.add_parser(
+        "monitor",
+        help=(
+            "Recheck one exact frozen winner under an explicit provider-spend cap; "
+            "never searches or changes a route."
+        ),
+    )
+    monitor.add_argument("baseline", help="Earlier exported Evalt result.")
+    monitor.add_argument(
+        "--route",
+        help=(
+            "Optional connected route name. Syncs only the aggregate monitor verdict "
+            "and deltas; full results remain local."
+        ),
+    )
+    monitor.add_argument(
+        "--suite",
+        help=(
+            "Original reviewed suite, required for image baselines because result "
+            "receipts intentionally omit image bytes and signed URLs."
+        ),
+    )
+    monitor.add_argument(
+        "--max-cost-usd",
+        type=float,
+        required=True,
+        help="Mandatory hard cap for this recheck; no automatic spend.",
+    )
+    monitor.add_argument("--output", default="evalt-monitor-result.json")
+    monitor.add_argument(
+        "--history",
+        help=(
+            "Optional local JSONL history containing aggregate metrics only; "
+            "never prompts, cases, images, or outputs."
+        ),
+    )
+    monitor.add_argument("--max-regressions", type=int, default=0)
+    monitor.add_argument("--max-quality-drop-pp", type=float, default=0.0)
+    monitor.add_argument("--max-cost-increase-pct", type=float)
+    monitor.add_argument("--max-p90-increase-ms", type=float)
+    monitor.add_argument("--max-parallel-scenarios", type=int, default=32)
+    monitor.add_argument(
+        "--request-timeout",
+        type=float,
+        default=600,
+        help="Per-response timeout in seconds (default: 600; maximum: 7200).",
+    )
 
     report = commands.add_parser("report", help="Render saved JSON as HTML and/or JUnit; no provider call.")
     report.add_argument("result", help="Saved Evalt result JSON.")
@@ -790,6 +845,132 @@ def main(argv: list[str] | None = None) -> int:
             }
             print(json.dumps(payload, indent=2, ensure_ascii=False))
             return 0
+        if args.command == "monitor":
+            if not 0 < float(args.request_timeout) <= 7200:
+                raise ValueError(
+                    "--request-timeout must be greater than zero and no more than 7200."
+                )
+            if (
+                not isinstance(args.max_cost_usd, (int, float))
+                or not float("-inf") < float(args.max_cost_usd) < float("inf")
+                or float(args.max_cost_usd) <= 0
+            ):
+                raise ValueError("--max-cost-usd must be a positive finite number.")
+            with Path(args.baseline).open(encoding="utf-8") as handle:
+                baseline_payload = json.load(handle)
+            frozen_suite = baseline_payload.get("regression_suite")
+            if not isinstance(frozen_suite, dict):
+                raise ValueError(
+                    "The baseline does not contain an Evalt regression_suite contract."
+                )
+            frozen_hash = str(frozen_suite.get("suite_hash") or "")
+            if (
+                len(frozen_hash) != 64
+                or any(character not in "0123456789abcdef" for character in frozen_hash)
+                or frozen_hash != _regression_contract_hash(frozen_suite)
+            ):
+                raise ValueError(
+                    "The baseline regression suite was modified after qualification; "
+                    "monitoring stopped before any provider call."
+                )
+            output_path = Path(args.output)
+            monitor_client = Evalt(
+                request_timeout_seconds=float(args.request_timeout),
+                show_progress=False,
+            )
+            try:
+                monitored = monitor_client.monitor(
+                    baseline_payload,
+                    max_cost_usd=args.max_cost_usd,
+                    source_suite=(Suite.load(args.suite) if args.suite else None),
+                    route=args.route,
+                    max_regressions=args.max_regressions,
+                    max_quality_drop_percentage_points=args.max_quality_drop_pp,
+                    max_cost_increase_percent=args.max_cost_increase_pct,
+                    max_p90_increase_ms=args.max_p90_increase_ms,
+                    max_parallel_scenarios=args.max_parallel_scenarios,
+                )
+            except (BudgetExceeded, ProviderError) as error:
+                failure = {
+                    "schema": "evalt-monitor-failure-v1",
+                    "status": "ERROR",
+                    "error_type": type(error).__name__,
+                    "error": str(error),
+                    "baseline": str(args.baseline),
+                    "output": str(output_path),
+                    "provider_call_started": True,
+                    "provider_spend_usd": None,
+                    "route_mutated": False,
+                    "dashboard_sync_started": False,
+                    "provider_spend_note": (
+                        "A failed provider response may still be billable. Audit the "
+                        "provider account; Evalt does not invent a zero-cost receipt."
+                    ),
+                }
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                output_path.write_text(
+                    json.dumps(failure, indent=2, ensure_ascii=False) + "\n",
+                    encoding="utf-8",
+                )
+                print(json.dumps(failure, ensure_ascii=False), file=sys.stderr)
+                return 2
+            except KeyboardInterrupt:
+                failure = {
+                    "schema": "evalt-monitor-failure-v1",
+                    "status": "CANCELLED",
+                    "error_type": "KeyboardInterrupt",
+                    "error": "The recheck was interrupted.",
+                    "baseline": str(args.baseline),
+                    "output": str(output_path),
+                    "provider_call_started": True,
+                    "provider_spend_usd": None,
+                    "route_mutated": False,
+                    "dashboard_sync_started": False,
+                    "provider_spend_note": (
+                        "In-flight provider calls may still be billable. Audit the "
+                        "provider account before retrying."
+                    ),
+                }
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                output_path.write_text(
+                    json.dumps(failure, indent=2, ensure_ascii=False) + "\n",
+                    encoding="utf-8",
+                )
+                print(json.dumps(failure, ensure_ascii=False), file=sys.stderr)
+                return 130
+            monitored.save(output_path)
+            if args.history:
+                history_path = Path(args.history)
+                history_path.parent.mkdir(parents=True, exist_ok=True)
+                with history_path.open("a", encoding="utf-8", newline="\n") as handle:
+                    handle.write(
+                        json.dumps(
+                            monitored.history_record(),
+                            separators=(",", ":"),
+                            ensure_ascii=False,
+                        )
+                        + "\n"
+                    )
+            print(json.dumps({
+                "schema": "evalt-monitor-summary-v1",
+                "status": monitored.status,
+                "passed": monitored.passed,
+                "selected_model": monitored.candidate.winner.model,
+                "holdout_pass_rate": monitored.candidate.winner.holdout_pass_rate,
+                "provider_spend_usd": monitored.provider_spend_usd,
+                "output": str(output_path),
+                "history": str(args.history) if args.history else None,
+                "route_mutated": False,
+                "dashboard_sync_started": monitored.dashboard_sync_started,
+                "dashboard_sync_succeeded": monitored.dashboard_sync_succeeded,
+                "next": (
+                    "No regression detected."
+                    if monitored.passed
+                    else "Keep the serving route unchanged; inspect this local result "
+                    "and compare the regressed final-test cases."
+                ),
+            }, indent=2))
+            return 0 if monitored.passed else 1
         if args.command == "optimize":
             suite = Suite.load(args.suite)
             request_timeout_seconds = (

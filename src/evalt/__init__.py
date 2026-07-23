@@ -9,6 +9,7 @@ from .core import (
     GateReport,
     ImageInput,
     ModelResult,
+    MonitorResult,
     OptimizationResult,
     ProviderError,
     RequestEnvelopeDriftWarning,
@@ -41,6 +42,7 @@ __all__ = [
     "GateReport",
     "ImageInput",
     "ModelResult",
+    "MonitorResult",
     "OptimizationResult",
     "ProviderError",
     "RequestEnvelopeDriftWarning",
@@ -62,4 +64,4 @@ __all__ = [
     "write_reports",
 ]
 
-__version__ = "0.10.28"
+__version__ = "0.10.29"

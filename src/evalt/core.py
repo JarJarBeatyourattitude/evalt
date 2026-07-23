@@ -8,10 +8,12 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from dataclasses import asdict, dataclass, field, replace
+from datetime import datetime, timezone
 from functools import wraps
 import copy
 import hashlib
 import json
+import math
 from pathlib import Path
 import re
 import secrets
@@ -38,7 +40,15 @@ from last_good_prompt.core import (
     _Budget,
     _embedded_image_payload_bytes,
     _extract_single_numeric_scalar,
+    _final_test_evidence,
+    _pass_rate,
+    _percentile,
+    _safe_example_payload,
     _safe_provider_error_detail,
+    _scenario_pass_rate,
+    _scenario_pass_rates_by_difficulty,
+    _split_examples,
+    _validate_difficulty_thresholds,
     _validate_evaluator_policy,
     normalize_request_options,
     multimodal_input,
@@ -72,6 +82,13 @@ _NUMBER_WORDS = {
 }
 
 _MAX_SUITE_IMAGE_BYTES = 40 * 1024 * 1024
+
+_POST_HASH_REGRESSION_METADATA = {
+    "designer_spend_usd",
+    "evidence_provenance",
+    "tournament_spend_usd",
+    "workflow_budget_usd",
+}
 
 
 def _infer_numeric_scale_contract(*values: str) -> tuple[float, float] | None:
@@ -635,6 +652,103 @@ class SuiteDraft:
         )
         suite.validate()
         return suite
+
+
+def _regression_contract_hash(suite: Mapping[str, Any]) -> str:
+    """Recompute the immutable suite contract while ignoring later annotations."""
+
+    payload = {
+        key: value
+        for key, value in suite.items()
+        if key != "suite_hash" and key not in _POST_HASH_REGRESSION_METADATA
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+@dataclass(frozen=True)
+class MonitorResult:
+    """One explicit, non-mutating recheck of a frozen regression contract."""
+
+    status: str
+    candidate: OptimizationResult
+    absolute_gate: "GateReport"
+    regression_gate: Mapping[str, Any]
+    started_at: str
+    finished_at: str
+    elapsed_seconds: float
+    route: str | None = None
+    dashboard_sync_started: bool = False
+    dashboard_sync_succeeded: bool | None = None
+
+    @property
+    def passed(self) -> bool:
+        return self.status == "HEALTHY"
+
+    @property
+    def provider_spend_usd(self) -> float:
+        return float(self.candidate.total_provider_spend_usd)
+
+    def to_dict(self) -> dict[str, Any]:
+        # Keep the normal result fields at the top level so `evalt check`,
+        # `evalt compare`, and report renderers can consume a monitor output
+        # directly. The monitor envelope adds lifecycle and gate evidence.
+        payload = self.candidate.to_dict()
+        payload.update({
+            "schema": "evalt-monitor-result-v1",
+            "monitor_status": self.status,
+            "passed": self.passed,
+            "provider_call_started": True,
+            "provider_spend_usd": self.provider_spend_usd,
+            "started_at": self.started_at,
+            "finished_at": self.finished_at,
+            "elapsed_seconds": round(float(self.elapsed_seconds), 6),
+            "absolute_gate": self.absolute_gate.to_dict(),
+            "baseline_gate": dict(self.regression_gate),
+            "route": self.route,
+            "route_mutated": False,
+            "dashboard_sync_started": self.dashboard_sync_started,
+            "dashboard_sync_succeeded": self.dashboard_sync_succeeded,
+            "privacy": {
+                "full_result": "local only",
+                "history": "aggregate metrics only",
+            },
+        })
+        return payload
+
+    def history_record(self) -> dict[str, Any]:
+        gate = dict(self.regression_gate)
+        winner = self.candidate.winner
+        return {
+            "schema": "evalt-monitor-history-v1",
+            "finished_at": self.finished_at,
+            "status": self.status,
+            "route": self.route,
+            "suite_hash": self.candidate.regression_suite.get("suite_hash"),
+            "selected_model": winner.model,
+            "holdout_pass_rate": winner.holdout_pass_rate,
+            "quality_delta_percentage_points": gate.get(
+                "quality_delta_percentage_points"
+            ),
+            "regressions": gate.get("regressions"),
+            "missing_cases": gate.get("missing_cases"),
+            "estimated_cost_per_successful_call_usd": (
+                winner.estimated_cost_per_successful_call_usd
+            ),
+            "cost_increase_percent": gate.get("cost_increase_percent"),
+            "target_latency_p90_ms": winner.target_latency_p90_ms,
+            "p90_increase_ms": gate.get("p90_increase_ms"),
+            "provider_spend_usd": self.provider_spend_usd,
+        }
+
+    def save(self, path: str | Path) -> None:
+        target = Path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(
+            json.dumps(self.to_dict(), indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
 
 
 class Evalt:
@@ -2528,6 +2642,521 @@ class Evalt:
         """Wait briefly for explicitly enabled dashboard metadata sync."""
         return True if self._dashboard_sync is None else self._dashboard_sync.flush(timeout_seconds)
 
+    def monitor(
+        self,
+        baseline_result: Mapping[str, Any],
+        *,
+        max_cost_usd: float,
+        source_suite: Suite | Mapping[str, Any] | None = None,
+        route: str | None = None,
+        max_regressions: int = 0,
+        max_quality_drop_percentage_points: float = 0.0,
+        max_cost_increase_percent: float | None = None,
+        max_p90_increase_ms: float | None = None,
+        max_parallel_scenarios: int = 32,
+    ) -> MonitorResult:
+        """Recheck one frozen winner without searching or mutating a route.
+
+        ``max_cost_usd`` is deliberately mandatory. Contract validation completes
+        before the budget or transport is used, so malformed or tampered baselines
+        cannot initiate a provider request.
+        """
+
+        try:
+            explicit_cap = float(max_cost_usd)
+        except (TypeError, ValueError) as error:
+            raise ValueError("max_cost_usd must be a positive finite number.") from error
+        if not math.isfinite(explicit_cap) or explicit_cap <= 0:
+            raise ValueError("max_cost_usd must be a positive finite number.")
+        if not isinstance(baseline_result, Mapping):
+            raise ValueError("baseline_result must be an exported Evalt result mapping.")
+        route_name = str(route).strip() if route is not None else None
+        if route is not None and not re.fullmatch(
+            r"[A-Za-z0-9][A-Za-z0-9._-]{0,79}", route_name or ""
+        ):
+            raise ValueError(
+                "route must start with a letter or number and contain at most 80 "
+                "letters, numbers, dots, underscores, or hyphens."
+            )
+        if not 1 <= int(max_parallel_scenarios) <= 128:
+            raise ValueError(
+                "max_parallel_scenarios must be between one and one hundred twenty-eight."
+            )
+
+        suite_value = baseline_result.get("regression_suite")
+        if not isinstance(suite_value, Mapping):
+            raise ValueError(
+                "The baseline does not contain an Evalt regression_suite contract."
+            )
+        suite = copy.deepcopy(dict(suite_value))
+        if suite.get("schema") != "evalt-regression-suite-v1":
+            raise ValueError(
+                "The baseline regression suite schema is unsupported; rerun the "
+                "suite with a current Evalt release."
+            )
+        stored_hash = str(suite.get("suite_hash") or "")
+        if not re.fullmatch(r"[0-9a-f]{64}", stored_hash):
+            raise ValueError("The baseline regression suite has no valid suite_hash.")
+        computed_hash = _regression_contract_hash(suite)
+        if not secrets.compare_digest(stored_hash, computed_hash):
+            raise ValueError(
+                "The baseline regression suite was modified after qualification; "
+                "monitoring stopped before any provider call."
+            )
+
+        required_fields = {
+            "starting_prompt",
+            "winning_prompt",
+            "examples",
+            "selected_model",
+            "evaluator_model",
+            "evaluator",
+            "quality_threshold",
+            "holdout_repeats",
+        }
+        missing_fields = sorted(
+            field_name for field_name in required_fields if suite.get(field_name) is None
+        )
+        if missing_fields:
+            raise ValueError(
+                "The frozen regression contract is incomplete: "
+                + ", ".join(missing_fields)
+            )
+
+        starting_prompt = str(suite["starting_prompt"]).strip()
+        winning_prompt = str(suite["winning_prompt"]).strip()
+        selected_model = str(suite["selected_model"]).strip()
+        evaluator_model = str(suite["evaluator_model"]).strip()
+        if not starting_prompt or not winning_prompt or not selected_model or not evaluator_model:
+            raise ValueError(
+                "The frozen prompt, selected model, and evaluator model must be non-empty."
+            )
+        frozen_example_values = list(suite["examples"])
+        requires_source_suite = any(
+            isinstance(value, Mapping)
+            and value.get("input_replayable") is False
+            for value in frozen_example_values
+        )
+        if source_suite is None and requires_source_suite:
+            raise ValueError(
+                "This image-bearing baseline intentionally omits image bytes and "
+                "source URLs. Supply the original reviewed Suite with source_suite= "
+                "(CLI: --suite SUITE.json); monitoring stopped before any provider call."
+            )
+        if source_suite is not None:
+            reviewed_suite = (
+                source_suite
+                if isinstance(source_suite, Suite)
+                else Suite.from_dict(source_suite)
+            )
+            reviewed_suite.validate()
+            if reviewed_suite.prompt != starting_prompt:
+                raise ValueError(
+                    "The supplied source suite prompt does not match the frozen contract."
+                )
+            if selected_model not in reviewed_suite.models:
+                raise ValueError(
+                    "The frozen selected model is absent from the supplied source suite."
+                )
+            source_contract_fields = {
+                "evaluator_model": reviewed_suite.evaluator_model,
+                "evaluator": dict(reviewed_suite.evaluator),
+                "difficulty_thresholds": dict(reviewed_suite.difficulty_thresholds),
+                "quality_threshold": reviewed_suite.quality_threshold,
+                "holdout_repeats": reviewed_suite.holdout_repeats,
+                "target_max_tokens": reviewed_suite.target_max_tokens,
+                "request_options": normalize_request_options(
+                    reviewed_suite.request_options
+                ),
+            }
+            for field_name, source_value in source_contract_fields.items():
+                frozen_value = suite.get(field_name)
+                if field_name in {"evaluator", "difficulty_thresholds", "request_options"}:
+                    frozen_value = dict(frozen_value or {})
+                if source_value != frozen_value:
+                    raise ValueError(
+                        f"The supplied source suite {field_name} does not match "
+                        "the frozen contract."
+                    )
+            safe_source_examples = [
+                _safe_example_payload(example)
+                for example in reviewed_suite.examples
+            ]
+            if safe_source_examples != frozen_example_values:
+                raise ValueError(
+                    "The supplied source suite cases do not match the frozen "
+                    "privacy-safe descriptors and approved outputs."
+                )
+            for example in reviewed_suite.examples:
+                for turn in example.conversation():
+                    for part in (
+                        turn.input
+                        if isinstance(turn.input, (list, tuple))
+                        else []
+                    ):
+                        if (
+                            isinstance(part, Mapping)
+                            and part.get("type") == "image_url"
+                            and not str(
+                                (part.get("image_url") or {}).get("url") or ""
+                            ).startswith("data:")
+                        ):
+                            raise ValueError(
+                                "Recurring image monitoring requires embedded local "
+                                "image fixtures. HTTPS images can change without the "
+                                "frozen suite hash changing."
+                            )
+            examples = list(reviewed_suite.examples)
+        else:
+            try:
+                examples = [
+                    Example.from_value(value, index)
+                    for index, value in enumerate(frozen_example_values)
+                ]
+            except (TypeError, ValueError) as error:
+                raise ValueError(
+                    "The baseline regression suite contains invalid examples."
+                ) from error
+        if len(examples) < 3:
+            raise ValueError(
+                "The frozen regression suite needs at least three approved examples."
+            )
+        train, _dev, holdout = _split_examples(examples, starting_prompt)
+        expected_holdout_count = int(
+            suite.get("holdout_unique_scenarios") or len(holdout)
+        )
+        if expected_holdout_count != len(holdout):
+            raise ValueError(
+                "The frozen final-test split no longer matches its recorded scenario count."
+            )
+        repeats = int(suite["holdout_repeats"])
+        if not 1 <= repeats <= 5:
+            raise ValueError("The frozen holdout_repeats value must be between one and five.")
+
+        baseline_winner = baseline_result.get("winner")
+        if not isinstance(baseline_winner, Mapping):
+            raise ValueError("The baseline result has no measured winner.")
+        if str(baseline_winner.get("model") or "") != selected_model:
+            raise ValueError(
+                "The baseline winner model does not match the frozen regression contract."
+            )
+        if str(baseline_winner.get("selected_prompt") or "") != winning_prompt:
+            raise ValueError(
+                "The baseline winner prompt does not match the frozen regression contract."
+            )
+        baseline_final_case_ids = {
+            str(item.get("example_id") or "")
+            for item in baseline_winner.get("cases") or []
+            if isinstance(item, Mapping)
+            and str(item.get("split")) in {"holdout", "final_test", "test"}
+        }
+        expected_final_case_ids = {
+            (
+                f"{example.id}:turn-{turn_index + 1}"
+                + (
+                    f":repeat-{repeat_index + 1}"
+                    if repeats > 1
+                    else ""
+                )
+            )
+            for example in holdout
+            for repeat_index in range(repeats)
+            for turn_index, _turn in enumerate(example.conversation())
+        }
+        if baseline_final_case_ids != expected_final_case_ids:
+            raise ValueError(
+                "The baseline does not contain every frozen final-test execution; "
+                "monitoring requires a complete measured baseline."
+            )
+
+        few_shot_ids = [
+            str(value)
+            for value in (suite.get("winning_few_shot_example_ids") or [])
+        ]
+        train_ids = {item.id for item in train}
+        if not set(few_shot_ids) <= train_ids:
+            raise ValueError(
+                "The frozen few-shot package contains an example outside the training split."
+            )
+        provenance = suite.get("winning_few_shot_provenance") or []
+        provenance_ids = {
+            str(item.get("example_id"))
+            for item in provenance
+            if isinstance(item, Mapping)
+            and item.get("source_split") == "train"
+            and item.get("customer_approved") is True
+        }
+        if set(few_shot_ids) != provenance_ids:
+            raise ValueError(
+                "The frozen few-shot package lacks matching customer-approved training provenance."
+            )
+        baseline_few_shot_ids = [
+            str(value)
+            for value in (baseline_winner.get("few_shot_example_ids") or [])
+        ]
+        if baseline_few_shot_ids != few_shot_ids:
+            raise ValueError(
+                "The baseline winner few-shot package does not match the frozen contract."
+            )
+
+        evaluator = _validate_evaluator_policy(dict(suite["evaluator"]))
+        difficulty_thresholds = _validate_difficulty_thresholds(
+            suite.get("difficulty_thresholds")
+        )
+        request_options = normalize_request_options(suite.get("request_options"))
+        options_hash = str(suite.get("request_options_sha256") or "")
+        if (
+            not re.fullmatch(r"[0-9a-f]{64}", options_hash)
+            or options_hash != request_options_fingerprint(request_options)
+        ):
+            raise ValueError(
+                "The frozen request options do not match their recorded fingerprint."
+            )
+        target_max_tokens = suite.get("target_max_tokens")
+        if target_max_tokens is not None:
+            target_max_tokens = int(target_max_tokens)
+            if not 1 <= target_max_tokens <= 131072:
+                raise ValueError(
+                    "The frozen target_max_tokens value must be between one and 131072."
+                )
+        quality_threshold = float(suite["quality_threshold"])
+        if not 0 < quality_threshold <= 1:
+            raise ValueError(
+                "The frozen quality_threshold must be greater than zero and at most one."
+            )
+
+        started_monotonic = time.monotonic()
+        started_at = datetime.now(timezone.utc).isoformat()
+        budget = _Budget(explicit_cap)
+        measured_cases = self.client._run_cases(
+            winning_prompt,
+            "monitor",
+            holdout,
+            "holdout",
+            selected_model,
+            evaluator_model,
+            budget,
+            train,
+            few_shot_ids,
+            repeats,
+            evaluator=evaluator,
+            max_parallel_scenarios=int(max_parallel_scenarios),
+            target_max_tokens=target_max_tokens,
+            request_options=request_options,
+        )
+        holdout_execution_rate = _pass_rate(measured_cases)
+        holdout_rate = _scenario_pass_rate(measured_cases)
+        holdout_by_difficulty = _scenario_pass_rates_by_difficulty(measured_cases)
+        passed_difficulty_floors = all(
+            difficulty in holdout_by_difficulty
+            and holdout_by_difficulty[difficulty] >= floor
+            for difficulty, floor in difficulty_thresholds.items()
+        )
+        final_evidence = _final_test_evidence(
+            measured_cases, target_accuracy=quality_threshold
+        )
+        measured_costs = sorted(
+            item.target_cost_usd
+            for item in measured_cases
+            if item.target_cost_usd > 0
+        )
+        if measured_costs:
+            production_cost = measured_costs[
+                max(
+                    0,
+                    min(
+                        len(measured_costs) - 1,
+                        math.ceil(len(measured_costs) * 0.90) - 1,
+                    ),
+                )
+            ]
+        else:
+            production_cost = float(
+                baseline_winner.get("estimated_production_cost_per_call_usd") or 0
+            )
+        measured_latencies = sorted(
+            item.target_latency_ms
+            for item in measured_cases
+            if item.target_latency_ms > 0
+        )
+        latency_p50 = (
+            round(_percentile(measured_latencies, 0.50))
+            if measured_latencies
+            else 0
+        )
+        latency_p90 = (
+            round(_percentile(measured_latencies, 0.90))
+            if measured_latencies
+            else 0
+        )
+        cost_per_success = production_cost / max(holdout_rate, 0.01)
+        winner = ModelResult(
+            model=selected_model,
+            selected_prompt=winning_prompt,
+            baseline_pass_rate=float(
+                baseline_winner.get("selected_pass_rate")
+                if baseline_winner.get("selected_pass_rate") is not None
+                else holdout_rate
+            ),
+            selected_pass_rate=round(holdout_rate, 6),
+            holdout_pass_rate=round(holdout_rate, 6),
+            baseline_holdout_pass_rate=float(
+                baseline_winner.get("holdout_pass_rate")
+                if baseline_winner.get("holdout_pass_rate") is not None
+                else 0
+            ),
+            estimated_production_cost_per_call_usd=round(production_cost, 10),
+            estimated_cost_per_successful_call_usd=round(cost_per_success, 10),
+            optimization_spend_usd=round(budget.spent_usd, 10),
+            passed_quality_floor=(
+                holdout_rate >= quality_threshold and passed_difficulty_floors
+            ),
+            target_latency_p50_ms=latency_p50,
+            target_latency_p90_ms=latency_p90,
+            passed_latency_ceiling=True,
+            holdout_unique_scenarios=len(holdout),
+            holdout_executions=len(measured_cases),
+            holdout_execution_pass_rate=round(holdout_execution_rate, 6),
+            baseline_holdout_execution_pass_rate=float(
+                baseline_winner.get("holdout_execution_pass_rate")
+                if baseline_winner.get("holdout_execution_pass_rate") is not None
+                else 0
+            ),
+            holdout_pass_rates_by_difficulty=holdout_by_difficulty,
+            passed_difficulty_floors=passed_difficulty_floors,
+            prompt_origin="frozen_monitor",
+            prompt_candidates_tested=1,
+            prompt_rewrites_tested=0,
+            selected_prompt_changed=False,
+            few_shot_example_ids=few_shot_ids,
+            few_shot_provenance=[dict(item) for item in provenance],
+            cases=measured_cases,
+            final_test_evidence_status=final_evidence["status"],
+            final_test_confidence_level=final_evidence["confidence_level"],
+            final_test_accuracy_lower_bound=final_evidence["accuracy_lower_bound"],
+            target_accuracy_statistically_supported=final_evidence[
+                "target_supported"
+            ],
+            minimum_zero_failure_scenarios=final_evidence[
+                "minimum_zero_failure_scenarios"
+            ],
+        )
+        warnings: list[str] = []
+        if len(holdout) < 5:
+            warnings.append(
+                f"Only {len(holdout)} distinct final-test scenario(s): this "
+                "monitor is exploratory and not a reliability claim."
+            )
+        candidate = OptimizationResult(
+            objective="frozen_route_monitor",
+            quality_threshold=quality_threshold,
+            exploratory=len(holdout) < 5,
+            winner=winner,
+            models=[winner],
+            total_provider_spend_usd=round(budget.spent_usd, 10),
+            warnings=warnings,
+            quality_frontier=[{
+                "model": selected_model,
+                "holdout_pass_rate": winner.holdout_pass_rate,
+                "estimated_cost_per_successful_call_usd": (
+                    winner.estimated_cost_per_successful_call_usd
+                ),
+                "target_latency_p90_ms": winner.target_latency_p90_ms,
+            }],
+            diminishing_returns={
+                "monitor_only": True,
+                "higher_cost_models_without_material_gain": [],
+            },
+            regression_suite=suite,
+            elapsed_seconds=round(time.monotonic() - started_monotonic, 6),
+            comparison_integrity={
+                "single_frozen_run": True,
+                "suite_hash": stored_hash,
+                "route_mutated": False,
+                "prompt_search_started": False,
+                "model_search_started": False,
+                "final_test_only": True,
+            },
+            winner_scope="Exact frozen configuration only",
+            quality_gate_status=(
+                "QUALIFIED_ROUTE_RECONFIRMED"
+                if winner.passed_quality_floor
+                else "FROZEN_ROUTE_REGRESSED"
+            ),
+        )
+        from .reporting import check_regression
+
+        candidate_payload = candidate.to_dict()
+        absolute_failures: list[str] = []
+        if holdout_rate < quality_threshold:
+            absolute_failures.append(
+                f"holdout pass rate {holdout_rate:.3f} is below required "
+                f"{quality_threshold:.3f}"
+            )
+        if not passed_difficulty_floors:
+            absolute_failures.append(
+                "one or more frozen difficulty-specific quality floors were missed"
+            )
+        absolute_gate = GateReport(
+            passed=not absolute_failures,
+            failures=tuple(absolute_failures),
+            holdout_pass_rate=holdout_rate,
+            estimated_cost_per_successful_call_usd=cost_per_success,
+            winner_scope="Exact frozen configuration only",
+        )
+        regression_gate = check_regression(
+            baseline_result,
+            candidate_payload,
+            max_regressions=max_regressions,
+            max_quality_drop_percentage_points=(
+                max_quality_drop_percentage_points
+            ),
+            max_cost_increase_percent=max_cost_increase_percent,
+            max_p90_increase_ms=max_p90_increase_ms,
+        )
+        finished_at = datetime.now(timezone.utc).isoformat()
+        status = (
+            "HEALTHY"
+            if absolute_gate.passed and regression_gate.passed
+            else "REGRESSION"
+        )
+        dashboard_sync_started = False
+        dashboard_sync_succeeded: bool | None = None
+        if route_name and self._dashboard_sync is not None:
+            dashboard_sync_started = True
+            self._dashboard_sync.publish_event({
+                "event": "route_health_checked",
+                "route": route_name,
+                "status": status,
+                "holdout_pass_rate": winner.holdout_pass_rate,
+                "quality_delta_percentage_points": (
+                    regression_gate.quality_delta_percentage_points
+                ),
+                "regressions": regression_gate.regressions,
+                "missing_cases": regression_gate.missing_cases,
+                "cost_increase_percent": regression_gate.cost_increase_percent,
+                "p90_increase_ms": regression_gate.p90_increase_ms,
+                "provider_spend_usd": round(budget.spent_usd, 10),
+                "target_latency_p90_ms": winner.target_latency_p90_ms,
+                "final_test_scenarios": winner.holdout_unique_scenarios,
+                "final_test_executions": winner.holdout_executions,
+            })
+            dashboard_sync_succeeded = self._dashboard_sync.flush(
+                timeout_seconds=8.0
+            )
+        return MonitorResult(
+            status=status,
+            candidate=candidate,
+            absolute_gate=absolute_gate,
+            regression_gate=regression_gate.to_dict(),
+            started_at=started_at,
+            finished_at=finished_at,
+            elapsed_seconds=time.monotonic() - started_monotonic,
+            route=route_name,
+            dashboard_sync_started=dashboard_sync_started,
+            dashboard_sync_succeeded=dashboard_sync_succeeded,
+        )
+
     def draft(
         self,
         *,
@@ -2632,6 +3261,7 @@ __all__ = [
     "ImageInput",
     "Judgment",
     "ModelResult",
+    "MonitorResult",
     "OpenRouterTransport",
     "OptimizationResult",
     "ProviderError",

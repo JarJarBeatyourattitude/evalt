@@ -82,7 +82,7 @@ repository checkout:
 
 ```bash
 python -m venv .venv
-python -m pip install dist/evalt-0.10.28-py3-none-any.whl
+python -m pip install dist/evalt-0.10.29-py3-none-any.whl
 python -m evalt --version
 ```
 
@@ -649,6 +649,49 @@ To inspect the CI contract without a provider call:
 
 ```bash
 python3 -m evalt check examples/passing-result.json --min-pass-rate 0.95 --require-complete-coverage
+```
+
+## Frozen route health
+
+Recheck the exact selected configuration without starting another search or changing
+the route:
+
+```bash
+python3 -m evalt monitor evalt-baseline.json \
+  --route support-routing \
+  --max-cost-usd 0.10 \
+  --max-regressions 0 \
+  --max-quality-drop-pp 0 \
+  --max-cost-increase-pct 15 \
+  --max-p90-increase-ms 250 \
+  --output evalt-monitor-result.json \
+  --history .evalt/monitor-history.jsonl
+```
+
+The positive spend cap is mandatory. Evalt verifies the frozen suite hash, selected
+prompt/model/few-shot package, evaluator, request options, final-test split, and complete
+baseline before the first provider call. It returns `0` for `HEALTHY`, `1` for a measured
+`REGRESSION`, and `2` for an invalid contract, exhausted budget, provider failure, or
+runtime error. The full result remains compatible with `check`, `compare`, HTML, and
+JUnit reporting. History contains aggregate deltas only.
+
+Pass `--route` to synchronize only the verdict and aggregate quality, case, cost,
+latency, and spend values to an already connected dashboard. Prompts, inputs, approved
+answers, outputs, and judge reasons remain local. For image baselines, add
+`--suite reviewed-image-suite.json`; exported results intentionally omit raw image data,
+and recurring checks reject mutable HTTPS fixtures in favor of embedded local fixtures.
+
+The SDK surface is the same:
+
+```python
+from evalt import Evalt
+
+health = Evalt().monitor(
+    baseline_result,
+    route="support-routing",
+    max_cost_usd=0.10,
+)
+print(health.status)  # HEALTHY or REGRESSION
 ```
 
 ## Explicit suite API

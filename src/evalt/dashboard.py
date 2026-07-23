@@ -254,6 +254,8 @@ def sanitize_progress_event(event: Mapping[str, Any]) -> dict[str, Any]:
         "final_test_evidence_status", "final_test_confidence_level",
         "final_test_accuracy_lower_bound", "target_accuracy_statistically_supported",
         "minimum_zero_failure_scenarios",
+        "quality_delta_percentage_points", "regressions", "missing_cases",
+        "cost_increase_percent", "p90_increase_ms", "provider_spend_usd",
     }
     safe = {
         key: (
